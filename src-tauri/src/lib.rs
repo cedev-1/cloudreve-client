@@ -241,6 +241,8 @@ pub fn run() {
             commands::get_auto_start_enabled,
             commands::set_auto_start,
             commands::set_notify_credential_expired,
+            commands::close_window,
+            commands::open_folder_and_close_window,
             commands::set_notify_file_conflict,
             commands::set_fast_popup_launch,
             commands::get_general_settings,

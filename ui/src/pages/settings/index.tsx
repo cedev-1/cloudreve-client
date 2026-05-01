@@ -1,11 +1,14 @@
 import {
   Box,
+  IconButton,
   List,
   ListItemButton,
   ListItemIcon,
   ListItemText,
 } from "@mui/material";
+import { CloseRounded } from "@mui/icons-material";
 import { useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { useTranslation } from "react-i18next";
 import CloudreveLogo from "../../common/CloudreveLogo";
 import DrivesSection from "./DrivesSection";
@@ -109,14 +112,27 @@ export default function Settings() {
           flexDirection: "column",
         }}
       >
-        {/* Drag region for window */}
+        {/* Drag region + close button */}
         <Box
-          data-tauri-drag-region
           sx={{
-            height: 32,
+            height: 40,
             flexShrink: 0,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "flex-end",
+            px: 1,
+            position: "relative",
           }}
-        />
+        >
+          <Box data-tauri-drag-region sx={{ position: "absolute", inset: 0 }} />
+          <IconButton
+            size="small"
+            onClick={() => invoke("close_window", { label: "settings" })}
+            sx={{ color: "text.secondary", position: "relative", zIndex: 1 }}
+          >
+            <CloseRounded fontSize="small" />
+          </IconButton>
+        </Box>
         {/* Content */}
         <Box sx={{ flex: 1, overflow: "auto", px: 3, pb: 3,pt:1 }}>
           {renderContent()}

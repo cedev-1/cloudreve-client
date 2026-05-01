@@ -181,6 +181,10 @@ pub fn show_main_window_center(app: &AppHandle) {
 
 fn show_main_window_at_position(app: &AppHandle, position: Position) {
     if let Some(window) = app.get_webview_window("main_popup") {
+        if window.is_visible().unwrap_or(false) {
+            let _ = window.hide();
+            return;
+        }
         let _ = window.move_window(position);
         let _ = window.show();
         let _ = window.unminimize();
@@ -358,6 +362,21 @@ pub async fn set_auto_start(app: AppHandle, enabled: bool) -> CommandResult<bool
 #[tauri::command]
 pub async fn set_notify_credential_expired(enabled: bool) -> CommandResult<()> {
     ConfigManager::get().set_notify_credential_expired(enabled).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn close_window(app: AppHandle, label: String) {
+    if let Some(window) = app.get_webview_window(&label) {
+        let _ = window.close();
+    }
+}
+
+#[tauri::command]
+pub async fn open_folder_and_close_window(app: AppHandle, path: String, label: String) {
+    showfile::show_path_in_file_manager(&path);
+    if let Some(window) = app.get_webview_window(&label) {
+        let _ = window.close();
+    }
 }
 
 #[tauri::command]

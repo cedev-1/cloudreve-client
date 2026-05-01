@@ -1,5 +1,5 @@
 import { Alert, Box, Button, CircularProgress, Container, InputAdornment, Snackbar, Typography } from "@mui/material";
-import { openUrl, openPath } from "@tauri-apps/plugin-opener";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { invoke } from '@tauri-apps/api/core';
 import confetti from "canvas-confetti";
@@ -8,7 +8,6 @@ import { useTranslation } from "react-i18next";
 import { useParams } from "react-router-dom";
 import defaultLogo from "../assets/cloudreve.svg";
 import { FilledTextField } from "../common/StyledComponent";
-import { useIsWindows10 } from "../hooks/useIsWindows10";
 import { fetchSiteIcon, isValidUrl } from "../utils/manifest";
 import { generatePKCEPair, randomCryptoString } from "../utils/pkce";
 import {
@@ -18,7 +17,6 @@ import {
   type TokenResponse,
 } from "../utils/siteValidation";
 import { listen } from '@tauri-apps/api/event';
-import { getCurrentWindow } from '@tauri-apps/api/window';
 import { CALLBACK_PATH, CLIENT_ID, SCOPES } from "../utils/constants";
 
 type PageState = "url_input" | "waiting" | "final_setup" | "setting_up" | "success";
@@ -87,7 +85,6 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
   const { driveId, siteUrl: encodedSiteUrl, driveName: driveNameQuery } = useParams<{ driveId?: string; siteUrl?: string, driveName: string }>();
   const isReauthorize = mode === "reauthorize" && driveId && encodedSiteUrl;
   const decodedSiteUrl = encodedSiteUrl ? decodeURIComponent(encodedSiteUrl) : "";
-  const isWindows10 = useIsWindows10();
 
   const [siteUrl, setSiteUrl] = useState(isReauthorize ? decodedSiteUrl : "");
   const [loading, setLoading] = useState(false);
@@ -359,13 +356,11 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
   }
 
   const handleOpenDriveAndClose = async () => {
-    const pathToOpen = localPath.endsWith('/') || localPath.endsWith('\\') ? localPath : localPath + '/';
-    await openPath(pathToOpen);
-    await getCurrentWindow().close();
+    await invoke("open_folder_and_close_window", { path: localPath, label: "add-drive" });
   }
 
   return (
-    <Container maxWidth="sm" sx={{ backgroundColor: isWindows10 ? "#fff" : undefined, minHeight: "100vh" }}>
+    <Container maxWidth="sm" sx={{ bgcolor: "background.paper", minHeight: "100vh" }}>
       <Box
         sx={{
           minHeight: "100vh",
@@ -432,7 +427,7 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
                     variant="contained"
                     size="large"
                     fullWidth
-                    onClick={() => getCurrentWindow().close()}
+                    onClick={() => invoke("close_window", { label: "add-drive" })}
                   >
                     {t("addDrive.close")}
                   </Button>
