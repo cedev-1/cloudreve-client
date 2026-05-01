@@ -65,6 +65,7 @@ jobs:
             pkg-config
 
       - name: Install frontend dependencies
+        working-directory: ui
         run: yarn install
 
       - name: Build Tauri app
