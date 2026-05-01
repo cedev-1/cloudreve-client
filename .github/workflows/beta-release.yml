@@ -12,11 +12,10 @@ on:
         required: true
         default: 'v0.1.0-beta.1'
 
-permissions:
-  contents: write
-
 jobs:
   build:
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -72,11 +71,11 @@ jobs:
         run: yarn install
 
       - name: Build Tauri app
-        uses: tauri-apps/tauri-action@v0.6.2
+        uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ github.ref_name }}
+          tagName: ${{ github.event.inputs.version || github.ref_name }}
           releaseName: 'Cloudreve Desktop ${{ github.ref_name }}'
           releaseBody: |
             ## ⚠️ Beta Release
