@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cloudreve-api",
+    "crates/cloudreve-sync",
+    "src-tauri",
+]
