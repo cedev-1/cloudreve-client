@@ -274,11 +274,12 @@ fn show_drive_window_internal(app: &AppHandle, title: &str, url_path: &str) {
         .visible(false)
         .effects(effects)
         .decorations(false)
-        .minimizable(false)
-        .hidden_title(true);
+        .minimizable(false);
 
     #[cfg(target_os = "macos")]
-    let builder = builder.title_bar_style(TitleBarStyle::Overlay);
+    let builder = builder
+        .hidden_title(true)
+        .title_bar_style(TitleBarStyle::Overlay);
 
     match builder.build() {
         Ok(window) => {
@@ -314,11 +315,12 @@ pub fn show_settings_window_impl(app: &AppHandle) {
         .visible(false)
         .resizable(true)
         .decorations(false)
-        .minimizable(true)
-        .hidden_title(true);
+        .minimizable(true);
 
     #[cfg(target_os = "macos")]
-    let builder = builder.title_bar_style(TitleBarStyle::Overlay);
+    let builder = builder
+        .hidden_title(true)
+        .title_bar_style(TitleBarStyle::Overlay);
 
     match builder.build() {
         Ok(window) => {
