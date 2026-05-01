@@ -1,0 +1,98 @@
+name: Beta Release
+
+on:
+  push:
+    tags:
+      - 'v*-beta*'
+      - 'v*-alpha*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g. v0.1.0-beta.1)'
+        required: true
+        default: 'v0.1.0-beta.1'
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest   # Apple Silicon (arm64)
+            args: '--target aarch64-apple-darwin'
+            target: aarch64-apple-darwin
+          - platform: macos-13       # Intel (x86_64)
+            args: '--target x86_64-apple-darwin'
+            target: x86_64-apple-darwin
+          - platform: ubuntu-22.04   # Linux x86_64
+            args: ''
+            target: ''
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Install Node.js
+        uses: actions/setup-node@v6.4.0
+        with:
+          node-version: '20'
+
+      - name: Install Yarn
+        run: npm install -g yarn
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2.9.1
+        with:
+          workspaces: '. -> target'
+
+      - name: Install Linux system dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libssl-dev \
+            pkg-config
+
+      - name: Install frontend dependencies
+        run: yarn install
+
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0.6.2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'Cloudreve Desktop ${{ github.ref_name }}'
+          releaseBody: |
+            ## ⚠️ Beta Release
+
+            This is a beta release — expect bugs and missing features.
+
+            ### Installation (macOS)
+            1. Download the `.dmg` for your architecture (Apple Silicon → `aarch64`, Intel → `x86_64`)
+            2. Open the `.dmg` and drag Cloudreve to Applications
+            3. **First launch**: right-click → Open → Open (required because the app is not signed)
+               Or run: `xattr -cr /Applications/Cloudreve.app`
+
+            ### Installation (Linux)
+            - `.AppImage`: make executable and run (`chmod +x *.AppImage && ./Cloudreve*.AppImage`)
+            - `.deb`: `sudo dpkg -i *.deb`
+
+            ### Known limitations
+            - Deletions are local only (not propagated to server or vice versa)
+            - No conflict resolution
+            - macOS app is unsigned (Gatekeeper warning on first launch)
+          releaseDraft: false
+          prerelease: true
+          args: ${{ matrix.args }}
