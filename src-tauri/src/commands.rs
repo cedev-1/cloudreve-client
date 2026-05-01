@@ -3,6 +3,7 @@ use chrono::{Duration, Utc};
 use cloudreve_sync::{
     config::LogLevel, ConfigManager, Credentials, DriveConfig, DriveInfo, StatusSummary,
 };
+#[cfg(target_os = "macos")]
 use tauri::TitleBarStyle;
 use tauri::{
     utils::{config::WindowEffectsConfig, WindowEffect},
@@ -274,8 +275,10 @@ fn show_drive_window_internal(app: &AppHandle, title: &str, url_path: &str) {
         .effects(effects)
         .decorations(false)
         .minimizable(false)
-        .title_bar_style(TitleBarStyle::Overlay)
         .hidden_title(true);
+
+    #[cfg(target_os = "macos")]
+    let builder = builder.title_bar_style(TitleBarStyle::Overlay);
 
     match builder.build() {
         Ok(window) => {
@@ -312,8 +315,10 @@ pub fn show_settings_window_impl(app: &AppHandle) {
         .resizable(true)
         .decorations(false)
         .minimizable(true)
-        .title_bar_style(TitleBarStyle::Overlay)
         .hidden_title(true);
+
+    #[cfg(target_os = "macos")]
+    let builder = builder.title_bar_style(TitleBarStyle::Overlay);
 
     match builder.build() {
         Ok(window) => {
