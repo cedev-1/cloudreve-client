@@ -12,6 +12,9 @@ on:
         required: true
         default: 'v0.1.0-beta.1'
 
+permissions:
+  contents: write
+
 jobs:
   build:
     strategy:
