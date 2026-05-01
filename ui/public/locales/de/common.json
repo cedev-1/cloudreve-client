@@ -13,7 +13,7 @@
     "finalSetupDescription": "Wählen Sie einen lokalen Ordner aus, in dem Ihr Cloud-Laufwerk eingebunden wird.",
     "localPath": "Lokaler Pfad",
     "localDriveName": "Mount-Name",
-    "localPathPlaceholder": "C:\\CloudDrive",
+    "localPathPlaceholder": "/Users/username/CloudDrive",
     "browse": "Durchsuchen",
     "selectFolder": "Ordner auswählen",
     "folderNotEmpty": "Der ausgewählte Ordner ist nicht leer. Bitte wählen Sie einen leeren Ordner.",

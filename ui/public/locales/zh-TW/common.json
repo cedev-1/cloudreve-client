@@ -13,7 +13,7 @@
     "finalSetupDescription": "選擇一個本機資料夾作為雲端硬碟的掛載位置。",
     "localPath": "本機路徑",
     "localDriveName": "掛載名稱",
-    "localPathPlaceholder": "C:\\CloudDrive",
+    "localPathPlaceholder": "/Users/username/CloudDrive",
     "browse": "瀏覽",
     "selectFolder": "選擇資料夾",
     "folderNotEmpty": "所選資料夾不為空，請選擇一個空資料夾。",

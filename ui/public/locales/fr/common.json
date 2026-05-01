@@ -13,7 +13,7 @@
     "finalSetupDescription": "Choisissez un dossier local où votre disque cloud sera monté.",
     "localPath": "Chemin local",
     "localDriveName": "Nom du montage",
-    "localPathPlaceholder": "C:\\CloudDrive",
+    "localPathPlaceholder": "/Users/username/CloudDrive",
     "browse": "Parcourir",
     "selectFolder": "Sélectionner un dossier",
     "folderNotEmpty": "Le dossier sélectionné n'est pas vide. Veuillez choisir un dossier vide.",

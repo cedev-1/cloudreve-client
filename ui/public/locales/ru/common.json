@@ -13,7 +13,7 @@
     "finalSetupDescription": "Выберите локальную папку для монтирования облачного диска.",
     "localPath": "Локальный путь",
     "localDriveName": "Имя монтирования",
-    "localPathPlaceholder": "C:\\CloudDrive",
+    "localPathPlaceholder": "/Users/username/CloudDrive",
     "browse": "Обзор",
     "selectFolder": "Выбрать папку",
     "folderNotEmpty": "Выбранная папка не пуста. Пожалуйста, выберите пустую папку.",

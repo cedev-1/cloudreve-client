@@ -13,7 +13,7 @@
     "finalSetupDescription": "选择一个本地文件夹作为网盘的挂载位置。",
     "localPath": "本地路径",
     "localDriveName": "挂载名称",
-    "localPathPlaceholder": "C:\\CloudDrive",
+    "localPathPlaceholder": "/Users/username/CloudDrive",
     "browse": "浏览",
     "selectFolder": "选择文件夹",
     "folderNotEmpty": "所选文件夹不为空，请选择一个空文件夹。",

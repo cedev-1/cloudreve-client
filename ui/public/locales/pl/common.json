@@ -13,7 +13,7 @@
     "finalSetupDescription": "Wybierz folder lokalny, w którym zostanie zamontowany dysk chmurowy.",
     "localPath": "Ścieżka lokalna",
     "localDriveName": "Nazwa montowania",
-    "localPathPlaceholder": "C:\\CloudDrive",
+    "localPathPlaceholder": "/Users/username/CloudDrive",
     "browse": "Przeglądaj",
     "selectFolder": "Wybierz folder",
     "folderNotEmpty": "Wybrany folder nie jest pusty. Proszę wybrać pusty folder.",

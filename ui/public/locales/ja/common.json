@@ -13,7 +13,7 @@
     "finalSetupDescription": "クラウドドライブをマウントするローカルフォルダを選択してください。",
     "localPath": "ローカルパス",
     "localDriveName": "マウント名",
-    "localPathPlaceholder": "C:\\CloudDrive",
+    "localPathPlaceholder": "/Users/username/CloudDrive",
     "browse": "参照",
     "selectFolder": "フォルダを選択",
     "folderNotEmpty": "選択したフォルダは空ではありません。空のフォルダを選択してください。",

@@ -13,7 +13,7 @@
     "finalSetupDescription": "Elija una carpeta local donde se montará su unidad en la nube.",
     "localPath": "Ruta local",
     "localDriveName": "Nombre del montaje",
-    "localPathPlaceholder": "C:\\CloudDrive",
+    "localPathPlaceholder": "/Users/username/CloudDrive",
     "browse": "Examinar",
     "selectFolder": "Seleccionar carpeta",
     "folderNotEmpty": "La carpeta seleccionada no está vacía. Por favor, elija una carpeta vacía.",

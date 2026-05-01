@@ -13,7 +13,7 @@
     "finalSetupDescription": "Choose a local folder where your cloud drive will be mounted.",
     "localPath": "Local Path",
     "localDriveName": "Mount Name",
-    "localPathPlaceholder": "C:\\CloudDrive",
+    "localPathPlaceholder": "/Users/username/CloudDrive",
     "browse": "Browse",
     "selectFolder": "Select Folder",
     "folderNotEmpty": "The selected folder is not empty. Please choose an empty folder.",
