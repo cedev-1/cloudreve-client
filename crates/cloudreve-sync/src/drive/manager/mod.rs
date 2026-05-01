@@ -610,14 +610,4 @@ impl DriveManager {
         }
     }
 
-    /// Get the count of active tasks for a drive
-    fn get_active_task_count(&self, drive_id: &str) -> usize {
-        match self.inventory.query_recent_tasks(Some(drive_id)) {
-            Ok(tasks) => tasks.active.len(),
-            Err(e) => {
-                tracing::warn!(target: "drive::manager", drive_id = %drive_id, error = %e, "Failed to query recent tasks");
-                0
-            }
-        }
-    }
 }

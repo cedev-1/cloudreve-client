@@ -6,7 +6,7 @@ use cloudreve_api::{
 };
 use std::{
     collections::HashMap,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Arc,
     time::Duration,
 };
@@ -62,7 +62,7 @@ impl Mount {
         tracing::info!(target: "drive::remote_events", "Listening to remote events");
         let mut backoff = BackoffState::new();
 
-        let sync_path = {
+        let _sync_path = {
             let config = s.config.read().await;
             config.sync_path.clone()
         };

@@ -13,13 +13,12 @@ use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, ne
 use std::time::Duration;
 use std::{
     collections::HashMap,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Arc,
 };
 use tokio::spawn;
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::task::JoinHandle;
-use url::Url;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DriveConfig {

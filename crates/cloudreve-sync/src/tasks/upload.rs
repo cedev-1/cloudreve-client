@@ -17,7 +17,7 @@ use cloudreve_api::{
 };
 use dashmap::DashMap;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use super::types::TaskProgress;

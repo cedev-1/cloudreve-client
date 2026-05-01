@@ -1,11 +1,11 @@
 use crate::drive::mounts::Mount;
 use crate::drive::utils::remote_path_to_local_relative_path;
-use crate::inventory::{FileMetadata, MetadataEntry};
-use crate::tasks::{TaskKind, TaskPayload};
+use crate::inventory::MetadataEntry;
+use crate::tasks::TaskPayload;
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::DateTime;
 use cloudreve_api::{
-    api::explorer::{ExplorerApi, ExplorerApiExt},
+    api::explorer::ExplorerApiExt,
     models::{
         explorer::{FileResponse, ListFileService, file_type},
         uri::CrUri,
@@ -45,7 +45,7 @@ impl GroupedFsEvents {
 
 /// Reduce a list of debounced FS events into changed/deleted path sets
 pub fn group_fs_events(events: Vec<DebouncedEvent>) -> GroupedFsEvents {
-    use notify_debouncer_full::notify::event::{EventKind, RemoveKind};
+    use notify_debouncer_full::notify::event::EventKind;
     let mut changed = HashSet::new();
     let mut deleted = HashSet::new();
 
