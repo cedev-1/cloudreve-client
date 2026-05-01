@@ -3,9 +3,8 @@ use crate::drive::utils::remote_path_to_local_relative_path;
 use crate::inventory::MetadataEntry;
 use crate::tasks::TaskPayload;
 use anyhow::{Context, Result};
-use chrono::DateTime;
 use cloudreve_api::{
-    api::explorer::ExplorerApiExt,
+    api::explorer::ExplorerApi,
     models::{
         explorer::{FileResponse, ListFileService, file_type},
         uri::CrUri,
