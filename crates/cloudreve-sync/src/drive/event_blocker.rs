@@ -4,6 +4,7 @@ use std::{
     collections::HashMap,
     path::PathBuf,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 /// A key for identifying blocked events, consisting of a normalized EventKind and a path.
@@ -46,6 +47,49 @@ impl From<&EventKind> for NormalizedEventKind {
     }
 }
 
+/// A block entry that supports both count-based and time-based blocking.
+#[derive(Debug)]
+struct BlockEntry {
+    /// Remaining count for count-based blocking (0 means exhausted).
+    count: usize,
+    /// Optional deadline: while `Instant::now() < deadline`, the event is blocked
+    /// regardless of `count`.
+    deadline: Option<Instant>,
+}
+
+impl BlockEntry {
+    fn count(n: usize) -> Self {
+        Self { count: n, deadline: None }
+    }
+
+    /// Returns true and consumes one block slot if this entry should block.
+    fn try_block(&mut self) -> bool {
+        // Time-based: block while within the window (no decrement needed).
+        if let Some(deadline) = self.deadline {
+            if Instant::now() < deadline {
+                return true;
+            }
+            // Expired — fall through to count check.
+            self.deadline = None;
+        }
+        // Count-based.
+        if self.count > 0 {
+            self.count -= 1;
+            return true;
+        }
+        false
+    }
+
+    /// Returns true if this entry has no blocking power left and can be removed.
+    fn is_exhausted(&self) -> bool {
+        self.count == 0
+            && self
+                .deadline
+                .map(|d| Instant::now() >= d)
+                .unwrap_or(true)
+    }
+}
+
 /// EventBlocker is used to filter out filesystem events that have already been
 /// processed through other means (e.g., rename operations).
 ///
@@ -54,9 +98,7 @@ impl From<&EventKind> for NormalizedEventKind {
 /// blocked to avoid duplicate processing.
 #[derive(Debug, Clone, Default)]
 pub struct EventBlocker {
-    /// Map of blocked event keys to their remaining block count.
-    /// When count reaches 0, the entry is removed.
-    blocked: Arc<Mutex<HashMap<BlockKey, usize>>>,
+    blocked: Arc<Mutex<HashMap<BlockKey, BlockEntry>>>,
 }
 
 impl EventBlocker {
@@ -67,23 +109,36 @@ impl EventBlocker {
         }
     }
 
-    /// Registers an event stub to be blocked.
+    /// Block events of `kind` for `path` for `duration` after this call.
     ///
-    /// The event will be blocked `count` times before being allowed through.
-    /// If an entry already exists for this kind/path combination, the count is added.
-    ///
-    /// # Arguments
-    /// * `kind` - The EventKind to block
-    /// * `path` - The file path to block
-    /// * `count` - Number of times to block this event (defaults to 1 if not specified)
+    /// Any FS event matching this kind+path that arrives before the deadline is
+    /// silently dropped. This is more robust than count-based blocking because the
+    /// OS (especially macOS FSEvents) may emit an unpredictable number of events
+    /// per file operation.
+    pub fn register_for_duration(&self, kind: &EventKind, path: PathBuf, duration: Duration) {
+        let key = BlockKey {
+            kind: NormalizedEventKind::from(kind),
+            path,
+        };
+        let mut blocked = self.blocked.lock().unwrap();
+        let entry = blocked.entry(key).or_insert_with(|| BlockEntry::count(0));
+        // Extend the deadline if one already exists.
+        let new_deadline = Instant::now() + duration;
+        entry.deadline = Some(match entry.deadline {
+            Some(existing) if existing > new_deadline => existing,
+            _ => new_deadline,
+        });
+    }
+
+    /// Registers an event stub to be blocked `count` times (count-based).
     pub fn register(&self, kind: &EventKind, path: PathBuf, count: usize) {
         let key = BlockKey {
             kind: NormalizedEventKind::from(kind),
             path,
         };
-
         let mut blocked = self.blocked.lock().unwrap();
-        *blocked.entry(key).or_insert(0) += count;
+        let entry = blocked.entry(key).or_insert_with(|| BlockEntry::count(0));
+        entry.count += count;
     }
 
     /// Convenience method to register an event to be blocked once.
@@ -91,14 +146,8 @@ impl EventBlocker {
         self.register(kind, path, 1);
     }
 
-    /// Checks if an event should be blocked and decrements the counter if so.
-    ///
-    /// # Arguments
-    /// * `kind` - The EventKind of the event
-    /// * `path` - The file path of the event
-    ///
-    /// # Returns
-    /// `true` if the event should be blocked (was pre-registered), `false` otherwise
+    /// Checks if an event should be blocked. Consumes one count slot or checks the
+    /// time-based deadline. Removes exhausted entries automatically.
     pub fn should_block(&self, kind: &EventKind, path: &PathBuf) -> bool {
         let key = BlockKey {
             kind: NormalizedEventKind::from(kind),
@@ -107,12 +156,8 @@ impl EventBlocker {
 
         let mut blocked = self.blocked.lock().unwrap();
 
-        if let Some(count) = blocked.get_mut(&key) {
-            if *count > 0 {
-                *count -= 1;
-                if *count == 0 {
-                    blocked.remove(&key);
-                }
+        if let Some(entry) = blocked.get_mut(&key) {
+            if entry.try_block() {
                 tracing::debug!(
                     target: "drive::event_blocker",
                     kind = ?kind,
@@ -120,6 +165,10 @@ impl EventBlocker {
                     "Blocked pre-registered event"
                 );
                 return true;
+            }
+            // Entry exhausted — remove it.
+            if entry.is_exhausted() {
+                blocked.remove(&key);
             }
         }
 
