@@ -390,6 +390,36 @@ impl Client {
         format!("{}{}{}", self.config.base_url, API_PREFIX, path)
     }
 
+    /// Rewrite a URL's origin (scheme + host + port) to match this client's base URL.
+    ///
+    /// The Cloudreve server may return download/content URLs using its internally configured
+    /// `SiteURL` (e.g. `http://localhost:5212`), which is wrong when the client is connected
+    /// to a remote instance. This method replaces the origin in `url` with the origin of
+    /// `config.base_url` so the request goes to the correct host.
+    pub fn rewrite_url_origin(&self, url: &str) -> String {
+        let base = &self.config.base_url;
+
+        // Extract origin from base_url: everything up to (but not including) the first '/'
+        // after "scheme://host[:port]". If no path '/' exists, the whole string is the origin.
+        let base_origin_end = base
+            .find("://")
+            .and_then(|idx| {
+                base[idx + 3..].find('/').map(|slash| idx + 3 + slash)
+            })
+            .unwrap_or(base.len());
+        let base_origin = &base[..base_origin_end];
+
+        // Extract origin from the URL to rewrite.
+        let url_origin_end = url
+            .find("://")
+            .and_then(|idx| {
+                url[idx + 3..].find('/').map(|slash| idx + 3 + slash)
+            })
+            .unwrap_or(url.len());
+
+        format!("{}{}", base_origin, &url[url_origin_end..])
+    }
+
     /// Internal send method that handles the actual HTTP request
     async fn send_internal<T, R>(
         &self,
