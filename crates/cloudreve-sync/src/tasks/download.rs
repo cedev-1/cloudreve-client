@@ -210,6 +210,18 @@ impl<'a> DownloadTask<'a> {
             .await
             .context("failed to get remote file info")?;
 
+        // If the local inventory already tracks this exact remote entity (same etag),
+        // the file is already in sync — skip the download to avoid a needless
+        // re-download that would generate FS events and trigger a re-upload loop.
+        if let Some(ref meta) = self.inventory_meta {
+            if let Some(ref remote_etag) = file_info.primary_entity {
+                if !meta.etag.is_empty() && meta.etag == *remote_etag {
+                    debug!(target: "tasks::download", task_id = %self.task.task_id, path = %local_path.display(), "Local file already matches remote etag, skipping download");
+                    return Ok(());
+                }
+            }
+        }
+
         let file_size = file_info.size as u64;
         self.remote_file_info = Some(file_info);
 
@@ -221,7 +233,13 @@ impl<'a> DownloadTask<'a> {
         }
 
         let url_res = self.cr_client.get_file_url(&request).await.context("failed to get download URL")?;
-        let download_url = url_res.urls.first().context("no download URL")?.url.clone();
+        let download_url = {
+            let raw = url_res.urls.first().context("no download URL")?.url.clone();
+            // The server may return a URL with its internally configured SiteURL as the origin
+            // (e.g. http://localhost:5212/...) even when the client is talking to a remote host.
+            // Rewrite the origin to match the base_url this client is connected to.
+            self.cr_client.rewrite_url_origin(&raw)
+        };
 
         debug!(target: "tasks::download", task_id = %self.task.task_id, url = %download_url, size = file_size, "Got download URL");
 
@@ -244,9 +262,12 @@ impl<'a> DownloadTask<'a> {
         match result {
             Ok(()) => {
                 reporter.on_progress(&tracker.create_update());
-                // Block the FS events this rename will trigger so we don't re-upload the file
-                self.event_blocker.register(&EventKind::Create(CreateKind::Any), local_path.clone(), 1);
-                self.event_blocker.register(&EventKind::Modify(ModifyKind::Any), local_path.clone(), 1);
+                // Block FS events the rename will generate so we don't re-upload the file.
+                // macOS FSEvents can emit an unpredictable number of Create/Modify events
+                // per rename, so we use a time-based block (5 s) instead of a fixed count.
+                let block_duration = Duration::from_secs(5);
+                self.event_blocker.register_for_duration(&EventKind::Create(CreateKind::Any), local_path.clone(), block_duration);
+                self.event_blocker.register_for_duration(&EventKind::Modify(ModifyKind::Any), local_path.clone(), block_duration);
                 // Atomic move temp → final path
                 std::fs::rename(&temp_path, &local_path).context("failed to move downloaded file")?;
                 info!(target: "tasks::download", task_id = %self.task.task_id, path = %local_path.display(), "Download complete");
