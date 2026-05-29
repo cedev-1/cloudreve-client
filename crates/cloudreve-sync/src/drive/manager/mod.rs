@@ -172,6 +172,11 @@ impl DriveManager {
             }
         }
 
+        // Ensure sse_client_id is set (for configs migrated from before this field existed)
+        if config.sse_client_id.is_empty() {
+            config.sse_client_id = uuid::Uuid::new_v4().to_string();
+        }
+
         let mut write_guard = self.drives.write().await;
         let mut mount = Mount::new(
             config.clone(),
@@ -190,6 +195,7 @@ impl DriveManager {
             .spawn_remote_event_processor(mount_arc.clone())
             .await;
         mount_arc.spawn_props_refresh_task().await;
+        mount_arc.spawn_periodic_sync().await;
         let id = mount_arc.id.clone();
         let command_tx = mount_arc.command_tx.clone();
         write_guard.insert(id.clone(), mount_arc);
@@ -420,30 +426,64 @@ impl DriveManager {
         mount.update_ignore_patterns(patterns).await
     }
 
-    /// Enable/disable a drive
+    /// Placeholder: Enable/disable a drive
     pub async fn set_drive_enabled(&self, _id: &str, _enabled: bool) -> Result<()> {
         Err(anyhow::anyhow!("Not implemented"))
     }
 
-    /// Placeholder: Start syncing a drive
-    pub async fn start_sync(&self, _id: &str) -> Result<()> {
-        Err(anyhow::anyhow!("Not implemented"))
+    /// Start syncing a drive: send a FullSync command to the mount.
+    pub async fn start_sync(&self, id: &str) -> Result<()> {
+        let read_guard = self.drives.read().await;
+        let mount = read_guard
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("Drive not found: {}", id))?;
+
+        if let Err(e) = mount.command_tx.send(MountCommand::FullSync) {
+            anyhow::bail!("Failed to send FullSync command: {}", e);
+        }
+
+        tracing::info!(target: "drive::manager", drive_id = %id, "FullSync triggered");
+        Ok(())
     }
 
-    /// Placeholder: Stop syncing a drive
-    pub async fn stop_sync(&self, _id: &str) -> Result<()> {
-        Err(anyhow::anyhow!("Not implemented"))
+    /// Stop syncing a drive: shut down its background tasks.
+    pub async fn stop_sync(&self, id: &str) -> Result<()> {
+        let read_guard = self.drives.read().await;
+        let mount = read_guard
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("Drive not found: {}", id))?;
+
+        mount.shutdown().await;
+        tracing::info!(target: "drive::manager", drive_id = %id, "Sync stopped");
+        Ok(())
     }
 
-    /// Placeholder: Get sync status for a drive
+    /// Get sync status for a drive.
     pub async fn get_sync_status(&self, id: &str) -> Result<serde_json::Value> {
-        // TODO: Implement actual status retrieval
-        tracing::debug!(target: "drive::sync", drive_id = %id, "Getting sync status");
+        let read_guard = self.drives.read().await;
+        let mount = read_guard
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("Drive not found: {}", id))?;
+
+        let flags = mount.get_status_flags().await;
+        let inflight = mount.task_queue.inflight_count();
+
+        let status = if flags.is_credential_expired() {
+            "credential_expired"
+        } else if inflight > 0 {
+            "syncing"
+        } else if flags.is_event_push_subscribed() {
+            "in_sync"
+        } else {
+            "idle"
+        };
+
         Ok(serde_json::json!({
             "drive_id": id,
-            "status": "idle",
-            "last_sync": null,
-            "files_synced": 0,
+            "status": status,
+            "event_push_subscribed": flags.is_event_push_subscribed(),
+            "credential_expired": flags.is_credential_expired(),
+            "inflight_tasks": inflight,
         }))
     }
 

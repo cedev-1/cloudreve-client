@@ -197,6 +197,10 @@ impl TaskQueue {
         }
     }
 
+    pub fn inflight_count(&self) -> usize {
+        self.inflight.load(Ordering::SeqCst)
+    }
+
     pub async fn shutdown(&self) {
         if self.shutting_down.swap(true, Ordering::SeqCst) {
             return;
