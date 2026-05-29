@@ -306,7 +306,6 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
   const handleFinish = async (e: React.FormEvent) => {
     e.preventDefault();
     setPageState("setting_up");
-    // TODO: Call backend to complete drive setup
 
     let tokens: TokenResponse;
     try {
