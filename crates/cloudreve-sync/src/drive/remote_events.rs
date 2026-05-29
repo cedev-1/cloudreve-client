@@ -113,15 +113,21 @@ impl Mount {
         };
 
         let mut subscription = match self.cr_client.subscribe_file_events(&remote_base).await {
-            Ok(sub) => sub,
-            Err(e) => return ListenResult::Error(e.into()),
+            Ok(sub) => {
+                tracing::info!(target: "drive::remote_events", id = %self.id, remote_base = %remote_base, "SSE subscription established successfully");
+                sub
+            }
+            Err(e) => {
+                tracing::warn!(target: "drive::remote_events", id = %self.id, remote_base = %remote_base, error = %e, "SSE subscription failed");
+                return ListenResult::Error(e.into());
+            }
         };
 
         loop {
             match subscription.next_event().await {
                 Ok(Some(event)) => match event {
                     FileEvent::Event(events) => {
-                        tracing::trace!(target: "drive::remote_events", "Handling file events batch");
+                        tracing::info!(target: "drive::remote_events", id = %self.id, count = events.len(), "Received remote file events");
                         if let Err(e) = self.handle_file_events(sync_path.clone(), events).await {
                             tracing::error!(target: "drive::remote_events", error = ?e, "Failed to handle file events");
                         }
