@@ -792,7 +792,7 @@ version = "0.1.0"
 dependencies = [
  "aes",
  "anyhow",
- "base64 0.21.7",
+ "base64 0.22.1",
  "bytes",
  "chrono",
  "cloudreve-api",
@@ -814,7 +814,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "tokio-util",
