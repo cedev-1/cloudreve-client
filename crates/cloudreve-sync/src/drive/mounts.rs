@@ -38,6 +38,11 @@ pub struct DriveConfig {
     #[serde(default)]
     pub ignore_patterns: Vec<String>,
 
+    /// Stable UUID used as SSE client identifier for event subscription.
+    /// Persisted so the server can resume event buffering across reconnects.
+    #[serde(default)]
+    pub sse_client_id: String,
+
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
 }
@@ -111,6 +116,7 @@ pub struct Mount {
     command_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<MountCommand>>>>,
     processor_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     props_refresh_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    periodic_sync_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     remote_event_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     manager_command_tx: mpsc::UnboundedSender<ManagerCommand>,
     fs_watcher: Mutex<Option<FsWatcher>>,
@@ -133,7 +139,7 @@ impl Mount {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
 
         let client_config = ClientConfig::new(config.instance_url.clone())
-            .with_client_id(config.id.clone())
+            .with_client_id(config.sse_client_id.clone())
             .with_user_agent(crate::USER_AGENT);
         let mut cr_client = Client::new(client_config);
         let _ = cr_client
@@ -188,6 +194,7 @@ impl Mount {
             command_rx: Arc::new(Mutex::new(Some(command_rx))),
             processor_handle: Arc::new(Mutex::new(None)),
             props_refresh_handle: Arc::new(Mutex::new(None)),
+            periodic_sync_handle: Arc::new(Mutex::new(None)),
             remote_event_handle: Arc::new(Mutex::new(None)),
             manager_command_tx,
             fs_watcher: Mutex::new(None),
@@ -350,6 +357,24 @@ impl Mount {
                     if ignored {
                         continue;
                     }
+                    // Check inventory DB to avoid re-uploading files we just downloaded.
+                    // If the local file size matches the DB entry, the file hasn't been
+                    // modified locally — it was likely written by a download task.
+                    if let Ok(local_meta) = std::fs::metadata(&path) {
+                        let local_size = local_meta.len() as i64;
+                        if let Some(path_str) = path.to_str() {
+                            if let Ok(Some(db_entry)) = self.inventory.query_by_path(path_str) {
+                                if db_entry.size == local_size {
+                                    tracing::debug!(
+                                        target: "drive::mounts",
+                                        path = %path.display(),
+                                        "Skipping upload: file matches inventory (likely just downloaded)"
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                     tracing::debug!(target: "drive::mounts", path = %path.display(), "Enqueuing upload for local change");
                     self.task_queue.enqueue(TaskPayload::upload(path)).await?;
                 }
@@ -405,6 +430,21 @@ impl Mount {
             }
         });
         *self.props_refresh_handle.lock().await = Some(handle);
+    }
+
+    /// Spawn a periodic full sync every 5 minutes to catch changes
+    /// missed by the event stream (remote) or fs watcher (local).
+    pub async fn spawn_periodic_sync(self: &Arc<Self>) {
+        let command_tx = self.command_tx.clone();
+        let id = self.id.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(300)).await;
+                tracing::debug!(target: "drive::mounts", id = %id, "Periodic full sync triggered");
+                let _ = command_tx.send(MountCommand::FullSync);
+            }
+        });
+        *self.periodic_sync_handle.lock().await = Some(handle);
     }
 
     async fn refresh_drive_props(&self) -> Result<()> {
@@ -485,9 +525,10 @@ impl Mount {
         Ok(())
     }
 
-    /// Generate a thumbnail for the given file (stub — returns error on non-Windows).
-    pub async fn generate_thumbnail(&self, _path: PathBuf) -> Result<Vec<u8>> {
-        anyhow::bail!("Thumbnail generation not supported on this platform")
+    /// Generate a thumbnail for the given file.
+    /// Returns None on platforms where thumbnail generation is not supported.
+    pub async fn generate_thumbnail(&self, _path: PathBuf) -> Result<Option<Vec<u8>>> {
+        Ok(None)
     }
 }
 

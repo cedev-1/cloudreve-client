@@ -95,6 +95,7 @@ pub async fn add_drive(
     }
 
     let drive_id = Uuid::new_v4().to_string();
+    let sse_client_id = Uuid::new_v4().to_string();
     let drive_config = DriveConfig {
         id: drive_id,
         name: config.drive_name,
@@ -107,6 +108,7 @@ pub async fn add_drive(
         enabled: true,
         user_id: config.user_id,
         ignore_patterns: Vec::new(),
+        sse_client_id,
         extra: Default::default(),
     };
 
