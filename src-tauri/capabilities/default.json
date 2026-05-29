@@ -19,6 +19,7 @@
       "allow": [{ "url": "http://**" }, { "url": "https://**" }]
     },
     "dialog:default",
+    "core:window:allow-close",
     "os:default",
     "notification:default",
     "autostart:default",
