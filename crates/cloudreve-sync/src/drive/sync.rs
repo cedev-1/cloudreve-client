@@ -1,6 +1,6 @@
 use crate::drive::mounts::Mount;
 use crate::drive::utils::remote_path_to_local_relative_path;
-use crate::inventory::MetadataEntry;
+use crate::inventory::{MetadataEntry, FileMetadata};
 use crate::tasks::TaskPayload;
 use anyhow::{Context, Result};
 use cloudreve_api::{
@@ -121,6 +121,16 @@ pub async fn full_sync(mount: &Mount, local_root: &PathBuf, remote_path: &str) -
                 .map(|r| r.to_path_buf())
         })
         .collect();
+    let db_map: HashMap<PathBuf, &FileMetadata> = db_entries
+        .iter()
+        .filter(|e| !e.is_folder)
+        .filter_map(|e| {
+            PathBuf::from(&e.local_path)
+                .strip_prefix(local_root)
+                .ok()
+                .map(|r| (r.to_path_buf(), e))
+        })
+        .collect();
 
     // 4. Union of all known paths
     let all_paths: HashSet<PathBuf> = remote_map
@@ -184,8 +194,39 @@ pub async fn full_sync(mount: &Mount, local_root: &PathBuf, remote_path: &str) -
                     let _ = mount.inventory.upsert(&entry);
                 }
             }
-            // Already tracked and present everywhere → SSE handles live changes
-            (true, true, true) | (false, false, false) => {}
+            // Already tracked and present everywhere → check for modifications
+            (true, true, true) => {
+                if let (Some(db_entry), Some(rf)) = (db_map.get(rel), remote_map.get(rel)) {
+                    // Check if remote was modified (etag changed)
+                    let remote_etag = rf.primary_entity.clone().unwrap_or_default();
+                    if !remote_etag.is_empty() && !db_entry.etag.is_empty() && remote_etag != db_entry.etag {
+                        tracing::info!(
+                            target: "drive::sync",
+                            path = %rel.display(),
+                            db_etag = %db_entry.etag,
+                            remote_etag = %remote_etag,
+                            "Remote file modified since last sync, downloading"
+                        );
+                        mount.task_queue.enqueue(
+                            TaskPayload::download(local_path).with_totals(0, rf.size)
+                        ).await?;
+                    } else if let Ok(meta) = std::fs::metadata(&local_path) {
+                        // Check if local file was modified (size changed)
+                        let local_size = meta.len() as i64;
+                        if local_size != db_entry.size {
+                            tracing::info!(
+                                target: "drive::sync",
+                                path = %rel.display(),
+                                db_size = db_entry.size,
+                                local_size = local_size,
+                                "Local file modified since last sync, uploading"
+                            );
+                            mount.task_queue.enqueue(TaskPayload::upload(local_path)).await?;
+                        }
+                    }
+                }
+            }
+            (false, false, false) => {}
         }
     }
 
