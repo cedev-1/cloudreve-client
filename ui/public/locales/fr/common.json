@@ -99,7 +99,16 @@
   "about": {
     "homepage": "Page d'accueil",
     "preview": "Aperçu",
-    "reportIssue": "Signaler un problème"
+    "reportIssue": "Signaler un problème",
+    "checkForUpdates": "Vérifier les mises à jour",
+    "checking": "Vérification...",
+    "updateAvailable": "Mise à jour disponible : v{{version}}",
+    "downloading": "Téléchargement... {{progress}}%",
+    "installing": "Installation...",
+    "upToDate": "Vous êtes à jour !",
+    "updateFailed": "Échec de la vérification",
+    "restartNow": "Redémarrer",
+    "restartLater": "Plus tard"
   },
   "timeAgo": {
     "justNow": "À l'instant",

@@ -99,7 +99,16 @@
   "about": {
     "homepage": "Homepage",
     "preview": "Preview",
-    "reportIssue": "Report Issue"
+    "reportIssue": "Report Issue",
+    "checkForUpdates": "Check for updates",
+    "checking": "Checking...",
+    "updateAvailable": "Update available: v{{version}}",
+    "downloading": "Downloading... {{progress}}%",
+    "installing": "Installing...",
+    "upToDate": "You're up to date!",
+    "updateFailed": "Update check failed",
+    "restartNow": "Restart now",
+    "restartLater": "Later"
   },
   "timeAgo": {
     "justNow": "Just now",

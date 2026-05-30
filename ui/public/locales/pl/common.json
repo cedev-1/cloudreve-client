@@ -82,7 +82,7 @@
     "openSite": "Otwórz witrynę",
     "reauthorize": "Ponownie autoryzuj",
     "deleteDrive": "Usuń",
-    "deleteDriveConfirm": "Czy na pewno chcesz usunąć „{{name}}"?",
+    "deleteDriveConfirm": "Czy na pewno chcesz usunąć \u201e{{name}}\u201d?",
     "ignorePatterns": "Wzorce wykluczeń",
     "ignorePatternsTitle": "Edytuj wzorce wykluczeń",
     "ignorePatternsDescription": "Wprowadź wzorce w stylu gitignore, po jednym w wierszu. Pasujące pliki nie będą synchronizowane.",
@@ -99,7 +99,16 @@
   "about": {
     "homepage": "Strona główna",
     "preview": "Wersja podglądowa",
-    "reportIssue": "Zgłoś problem"
+    "reportIssue": "Zgłoś problem",
+    "checkForUpdates": "Sprawdź aktualizacje",
+    "checking": "Sprawdzanie...",
+    "updateAvailable": "Dostępna aktualizacja: v{{version}}",
+    "downloading": "Pobieranie... {{progress}}%",
+    "installing": "Instalowanie...",
+    "upToDate": "Masz najnowszą wersję!",
+    "updateFailed": "Sprawdzanie aktualizacji nie powiodło się",
+    "restartNow": "Uruchom ponownie",
+    "restartLater": "Później"
   },
   "timeAgo": {
     "justNow": "Przed chwilą",

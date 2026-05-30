@@ -99,7 +99,16 @@
   "about": {
     "homepage": "ホームページ",
     "preview": "プレビュー",
-    "reportIssue": "問題を報告"
+    "reportIssue": "問題を報告",
+    "checkForUpdates": "アップデートを確認",
+    "checking": "確認中...",
+    "updateAvailable": "アップデートあり: v{{version}}",
+    "downloading": "ダウンロード中... {{progress}}%",
+    "installing": "インストール中...",
+    "upToDate": "最新の状態です！",
+    "updateFailed": "アップデートの確認に失敗しました",
+    "restartNow": "今すぐ再起動",
+    "restartLater": "後で"
   },
   "timeAgo": {
     "justNow": "たった今",

@@ -99,7 +99,16 @@
   "about": {
     "homepage": "主页",
     "preview": "预览版",
-    "reportIssue": "报告问题"
+    "reportIssue": "报告问题",
+    "checkForUpdates": "检查更新",
+    "checking": "正在检查...",
+    "updateAvailable": "有可用更新：v{{version}}",
+    "downloading": "正在下载... {{progress}}%",
+    "installing": "正在安装...",
+    "upToDate": "已是最新版本！",
+    "updateFailed": "检查更新失败",
+    "restartNow": "立即重启",
+    "restartLater": "稍后"
   },
   "timeAgo": {
     "justNow": "刚刚",

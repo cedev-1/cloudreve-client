@@ -99,7 +99,16 @@
   "about": {
     "homepage": "首頁",
     "preview": "預覽版",
-    "reportIssue": "回報問題"
+    "reportIssue": "回報問題",
+    "checkForUpdates": "檢查更新",
+    "checking": "正在檢查...",
+    "updateAvailable": "有可用更新：v{{version}}",
+    "downloading": "正在下載... {{progress}}%",
+    "installing": "正在安裝...",
+    "upToDate": "已是最新版本！",
+    "updateFailed": "檢查更新失敗",
+    "restartNow": "立即重新啟動",
+    "restartLater": "稍後"
   },
   "timeAgo": {
     "justNow": "剛才",

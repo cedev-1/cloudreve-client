@@ -99,7 +99,16 @@
   "about": {
     "homepage": "Домашняя страница",
     "preview": "Предварительная версия",
-    "reportIssue": "Сообщить о проблеме"
+    "reportIssue": "Сообщить о проблеме",
+    "checkForUpdates": "Проверить обновления",
+    "checking": "Проверка...",
+    "updateAvailable": "Доступно обновление: v{{version}}",
+    "downloading": "Загрузка... {{progress}}%",
+    "installing": "Установка...",
+    "upToDate": "У вас последняя версия!",
+    "updateFailed": "Не удалось проверить обновления",
+    "restartNow": "Перезапустить сейчас",
+    "restartLater": "Позже"
   },
   "timeAgo": {
     "justNow": "Только что",

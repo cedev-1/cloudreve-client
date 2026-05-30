@@ -99,7 +99,16 @@
   "about": {
     "homepage": "Startseite",
     "preview": "Vorschau",
-    "reportIssue": "Problem melden"
+    "reportIssue": "Problem melden",
+    "checkForUpdates": "Nach Updates suchen",
+    "checking": "Überprüfung...",
+    "updateAvailable": "Update verfügbar: v{{version}}",
+    "downloading": "Herunterladen... {{progress}}%",
+    "installing": "Installieren...",
+    "upToDate": "Sie sind auf dem neuesten Stand!",
+    "updateFailed": "Update-Prüfung fehlgeschlagen",
+    "restartNow": "Jetzt neu starten",
+    "restartLater": "Später"
   },
   "timeAgo": {
     "justNow": "Gerade eben",
