@@ -1,4 +1,5 @@
-import { Alert, Box, Button, CircularProgress, Container, InputAdornment, Snackbar, Typography } from "@mui/material";
+import { Alert, Box, Button, CircularProgress, Container, IconButton, InputAdornment, Snackbar, Typography } from "@mui/material";
+import CloseIcon from "@mui/icons-material/Close";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { invoke } from '@tauri-apps/api/core';
@@ -359,7 +360,20 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
   }
 
   return (
-    <Container maxWidth="sm" sx={{ bgcolor: "background.paper", minHeight: "100vh" }}>
+    <Container maxWidth="sm" sx={{ bgcolor: "background.paper", minHeight: "100vh", position: "relative" }}>
+      <IconButton
+        onClick={() => invoke("close_window", { label: "add-drive" })}
+        sx={{
+          position: "absolute",
+          top: 8,
+          right: 8,
+          zIndex: 10,
+          color: "text.secondary",
+        }}
+        size="small"
+      >
+        <CloseIcon fontSize="small" />
+      </IconButton>
       <Box
         sx={{
           minHeight: "100vh",
