@@ -24,6 +24,8 @@
     "notification:default",
     "autostart:default",
     "deep-link:default",
-    "positioner:default"
+    "positioner:default",
+    "updater:default",
+    "process:allow-restart"
   ]
 }
