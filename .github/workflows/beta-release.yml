@@ -39,7 +39,7 @@ jobs:
         with:
           tag_name: ${{ github.event.inputs.version || github.ref_name }}
           name: 'Cloudreve Desktop ${{ github.event.inputs.version || github.ref_name }}'
-          prerelease: true
+          prerelease: false
           draft: false
           body: |
             ## ⚠️ Beta Release
@@ -113,6 +113,12 @@ jobs:
             patchelf \
             libssl-dev \
             pkg-config
+
+      - name: Set app version from tag
+        run: |
+          VERSION="${{ github.event.inputs.version || github.ref_name }}"
+          VERSION="${VERSION#v}"
+          jq --arg v "$VERSION" '.version = $v' src-tauri/tauri.conf.json > tmp.json && mv tmp.json src-tauri/tauri.conf.json
 
       - name: Install frontend dependencies
         working-directory: ui
