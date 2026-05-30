@@ -1,7 +1,7 @@
 # Cloudreve MacOS & Linux Desktop Client
 
 > [!IMPORTANT]
-> For the moment it's a beta version : [v0.1.0-beta.1](https://github.com/cedev-1/cloudreve-client/releases/tag/v0.1.0-beta.1)
+> For the moment it's a beta version : [v0.1.0-beta.5](https://github.com/cedev-1/cloudreve-client/releases/tag/v0.1.0-beta.5)
 
 Desktop sync client for [Cloudreve](https://cloudreve.org) - fork from [cloudreve windows client](https://github.com/cloudreve/desktop).
 
