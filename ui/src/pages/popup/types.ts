@@ -27,6 +27,7 @@ export interface TaskRecord {
   total_bytes: number;
   processed_bytes: number;
   error?: string;
+  custom_state?: Record<string, unknown>;
   created_at: number;
   updated_at: number;
 }

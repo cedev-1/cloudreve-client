@@ -182,6 +182,7 @@ impl DriveManager {
             config.clone(),
             self.inventory.clone(),
             self.command_tx.clone(),
+            self.event_broadcaster.clone(),
         )
         .await;
         if let Err(e) = mount.start().await {

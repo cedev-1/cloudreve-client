@@ -46,7 +46,9 @@
     "syncingStatus": "Synchronizacja {{count}} plik(ów)...",
     "upToDate": "Twoje pliki są aktualne.",
     "waiting": "Oczekiwanie...",
-    "processing": "Przetwarzanie..."
+    "processing": "Przetwarzanie...",
+    "offline": "Offline — oczekujące zmiany zostaną zsynchronizowane po ponownym połączeniu",
+    "waitingConnection": "Oczekiwanie na połączenie..."
   },
   "settings": {
     "title": "Ustawienia",

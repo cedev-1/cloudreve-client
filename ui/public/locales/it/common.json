@@ -46,7 +46,9 @@
     "syncingStatus": "Sincronizzazione di {{count}} file...",
     "upToDate": "I tuoi file sono aggiornati.",
     "waiting": "In attesa...",
-    "processing": "Elaborazione..."
+    "processing": "Elaborazione...",
+    "offline": "Offline — le modifiche in sospeso verranno sincronizzate alla riconnessione",
+    "waitingConnection": "In attesa di connessione..."
   },
   "settings": {
     "title": "Impostazioni",

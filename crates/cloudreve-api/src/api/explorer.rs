@@ -826,7 +826,7 @@ impl FileEventsApi for Client {
         let token = self.get_access_token().await?;
 
         let response = self
-            .http_client
+            .sse_client
             .get(&url)
             .header(
                 format!("{}Client-Id", CR_HEADER_PREFIX),

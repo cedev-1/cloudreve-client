@@ -46,7 +46,9 @@
     "syncingStatus": "Syncing {{count}} file(s)...",
     "upToDate": "Your files are up to date.",
     "waiting": "Waiting...",
-    "processing": "Processing..."
+    "processing": "Processing...",
+    "offline": "Offline — pending changes will sync when reconnected",
+    "waitingConnection": "Waiting for connection..."
   },
   "settings": {
     "title": "Settings",

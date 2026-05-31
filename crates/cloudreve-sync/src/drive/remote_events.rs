@@ -115,10 +115,14 @@ impl Mount {
         let mut subscription = match self.cr_client.subscribe_file_events(&remote_base).await {
             Ok(sub) => {
                 tracing::info!(target: "drive::remote_events", id = %self.id, remote_base = %remote_base, "SSE subscription established successfully");
+                self.event_broadcaster.connection_status_changed(true);
+                self.set_event_push_subscribed(true).await;
                 sub
             }
             Err(e) => {
                 tracing::warn!(target: "drive::remote_events", id = %self.id, remote_base = %remote_base, error = %e, "SSE subscription failed");
+                self.event_broadcaster.connection_status_changed(false);
+                self.set_event_push_subscribed(false).await;
                 return ListenResult::Error(e.into());
             }
         };
@@ -134,10 +138,17 @@ impl Mount {
                     }
                     FileEvent::Resumed => {
                         self.set_event_push_subscribed(true).await;
-                        tracing::debug!(target: "drive::remote_events", "Subscription resumed");
+                        if let Err(e) = self.task_queue.re_enqueue_offline_tasks() {
+                            tracing::warn!(target: "drive::remote_events", error = %e, "Failed to re-enqueue offline tasks on resume");
+                        }
+                        tracing::info!(target: "drive::remote_events", "Subscription resumed, triggering full sync");
+                        let _ = self.command_tx.send(MountCommand::FullSync);
                     }
                     FileEvent::Subscribed => {
                         self.set_event_push_subscribed(true).await;
+                        if let Err(e) = self.task_queue.re_enqueue_offline_tasks() {
+                            tracing::warn!(target: "drive::remote_events", error = %e, "Failed to re-enqueue offline tasks on subscribe");
+                        }
                         tracing::info!(target: "drive::remote_events", "New subscription, triggering full sync");
                         let _ = self.command_tx.send(MountCommand::FullSync);
                     }
@@ -146,15 +157,18 @@ impl Mount {
                     }
                     FileEvent::ReconnectRequired => {
                         self.set_event_push_subscribed(false).await;
+                        self.event_broadcaster.connection_status_changed(false);
                         return ListenResult::ReconnectRequired;
                     }
                 },
                 Ok(None) => {
                     self.set_event_push_subscribed(false).await;
+                    self.event_broadcaster.connection_status_changed(false);
                     return ListenResult::StreamEnded;
                 }
                 Err(e) => {
                     self.set_event_push_subscribed(false).await;
+                    self.event_broadcaster.connection_status_changed(false);
                     return ListenResult::Error(e.into());
                 }
             }

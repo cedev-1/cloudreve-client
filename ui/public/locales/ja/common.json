@@ -46,7 +46,9 @@
     "syncingStatus": "{{count}} 個のファイルを同期中...",
     "upToDate": "ファイルは最新です。",
     "waiting": "待機中...",
-    "processing": "処理中..."
+    "processing": "処理中...",
+    "offline": "オフライン — 保留中の変更は再接続時に同期されます",
+    "waitingConnection": "接続待機中..."
   },
   "settings": {
     "title": "設定",

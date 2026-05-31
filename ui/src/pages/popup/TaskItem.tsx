@@ -12,6 +12,7 @@ import {
   Error as ErrorIcon,
   CloudUpload as UploadIcon,
   CloudDownload as DownloadIcon,
+  CloudOff as CloudOffIcon,
 } from "@mui/icons-material";
 import { invoke } from "@tauri-apps/api/core";
 import TimeAgo from "react-timeago";
@@ -34,6 +35,7 @@ export default function TaskItem({ task, isActive = false }: TaskItemProps) {
   const fileName = getFileName(task.local_path);
   const parentFolderName = getParentFolderName(task.local_path);
   const isFailed = task.status === "Failed";
+  const isOfflineWaiting = !!(task.custom_state as Record<string, unknown> | undefined)?.["offline_waiting"];
 
   const timeAgoFormatter = (
     value: number,
@@ -54,6 +56,9 @@ export default function TaskItem({ task, isActive = false }: TaskItemProps) {
   };
 
   const getStatusBadge = () => {
+    if (isActive && isOfflineWaiting) {
+      return <CloudOffIcon sx={{ fontSize: 14 }} color="warning" />;
+    }
     if (isActive) {
       return isUpload ? (
         <UploadIcon sx={{ fontSize: 14 }} color="primary" />
@@ -73,6 +78,9 @@ export default function TaskItem({ task, isActive = false }: TaskItemProps) {
   };
 
   const getSecondaryText = () => {
+    if (isActive && isOfflineWaiting) {
+      return t("popup.waitingConnection", "Waiting for connection...");
+    }
     if (isActive && liveProgress) {
       const processed = formatBytes(liveProgress.processed_bytes ?? 0);
       const total = formatBytes(liveProgress.total_bytes ?? 0);

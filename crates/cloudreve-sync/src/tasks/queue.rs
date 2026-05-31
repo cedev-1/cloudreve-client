@@ -29,6 +29,24 @@ impl Default for TaskQueueConfig {
     }
 }
 
+const MAX_NETWORK_RETRIES: u32 = 5;
+
+fn is_network_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause.downcast_ref::<reqwest::Error>().is_some()
+            || cause.downcast_ref::<std::io::Error>().is_some_and(|e| {
+                matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionRefused
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::NotConnected
+                )
+            })
+    })
+}
+
 pub struct TaskQueue {
     pub drive_id: String,
     pub cr_client: Arc<Client>,
@@ -220,6 +238,67 @@ impl TaskQueue {
         self.task_handles.clear();
         self.task_paths.clear();
         self.progress.clear();
+    }
+
+    /// Re-enqueue all pending tasks that are waiting for network reconnection.
+    /// Clears the `offline_waiting` flag and dispatches them for execution.
+    /// Called when the SSE connection is restored.
+    pub fn re_enqueue_offline_tasks(&self) -> Result<usize> {
+        let records = self.inventory.list_tasks(
+            Some(&self.drive_id),
+            Some(&[TaskStatus::Pending]),
+        )?;
+
+        let mut count = 0;
+        for record in records {
+            let is_offline = record.custom_state
+                .as_ref()
+                .and_then(|s| s.get("offline_waiting"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            if !is_offline {
+                continue;
+            }
+
+            info!(
+                target: "tasks::queue",
+                drive = %self.drive_id,
+                task_id = %record.id,
+                path = %record.local_path,
+                "Re-enqueuing offline-waiting task"
+            );
+
+            let _ = self.inventory.update_task(
+                &record.id,
+                TaskUpdate {
+                    custom_state: Some(None),
+                    ..Default::default()
+                },
+            );
+
+            let payload = match Self::payload_from_record(&record) {
+                Ok(p) => p,
+                Err(err) => {
+                    warn!(target: "tasks::queue", task_id = %record.id, error = %err, "Failed to build payload");
+                    continue;
+                }
+            };
+
+            let _ = self.dispatch_task(record.id.clone(), payload);
+            count += 1;
+        }
+
+        if count > 0 {
+            info!(
+                target: "tasks::queue",
+                drive = %self.drive_id,
+                count = count,
+                "Re-enqueued offline-waiting tasks"
+            );
+        }
+
+        Ok(count)
     }
 
     /// Cancel all tasks for a given path or its descendants.
@@ -473,6 +552,46 @@ impl TaskQueue {
                     error = ?err,
                     "Task execution failed"
                 );
+
+                if is_network_error(&err) {
+                    let retry_count = task.payload.custom_state
+                        .as_ref()
+                        .and_then(|s| s.get("network_retries"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32;
+
+                    if retry_count < MAX_NETWORK_RETRIES {
+                        warn!(
+                            target: "tasks::queue",
+                            drive = %self.drive_id,
+                            task_id = %task.task_id,
+                            retry = retry_count + 1,
+                            "Network error, marking task as offline-waiting"
+                        );
+                        if let Err(update_err) = self.inventory.update_task(
+                            &task.task_id,
+                            TaskUpdate {
+                                status: Some(TaskStatus::Pending),
+                                custom_state: Some(Some(serde_json::json!({
+                                    "network_retries": retry_count + 1,
+                                    "offline_waiting": true
+                                }))),
+                                ..Default::default()
+                            },
+                        ) {
+                            warn!(
+                                target: "tasks::queue",
+                                drive = %self.drive_id,
+                                task_id = %task.task_id,
+                                error = %update_err,
+                                "Failed to persist pending state for retry"
+                            );
+                        }
+                        self.cleanup_task_entry(&task.task_id).await;
+                        return;
+                    }
+                }
+
                 if let Err(update_err) = self.inventory.update_task(
                     &task.task_id,
                     TaskUpdate {

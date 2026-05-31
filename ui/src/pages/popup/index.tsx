@@ -9,9 +9,11 @@ import {
   Folder as FolderIcon,
   CheckCircle as CheckCircleIcon,
   Refresh as RefreshIcon,
+  CloudOff as CloudOffIcon,
 } from "@mui/icons-material";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useTranslation } from "react-i18next";
 import Settings from "../../common/icons/Settings";
@@ -25,7 +27,18 @@ export default function Popup() {
   const [summary, setSummary] = useState<StatusSummary | null>(null);
   const [selectedDrive, setSelectedDrive] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [connected, setConnected] = useState(true);
   const isFetchingRef = useRef(false);
+
+  // Listen for connection status changes
+  useEffect(() => {
+    const unlisten = listen<{ type: string; data: { connected: boolean } }>("ConnectionStatusChanged", (event) => {
+      setConnected(event.payload.data?.connected ?? true);
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
 
   // Close window on blur (when it loses focus)
   useEffect(() => {
@@ -252,30 +265,40 @@ export default function Popup() {
           gap: 1,
         }}
       >
-        {hasActiveTasks ? (
-          <RefreshIcon
-            sx={{
-              fontSize: 18,
-              color: "primary.main",
-              animation: "spin 1s linear infinite",
-              "@keyframes spin": {
-                "0%": { transform: "rotate(0deg)" },
-                "100%": { transform: "rotate(360deg)" },
-              },
-            }}
-          />
-        ) : (
-          <CheckCircleIcon
-            sx={{ fontSize: 18, color: "success.main" }}
-          />
-        )}
-        <Typography variant="caption" color="text.secondary">
-          {hasActiveTasks
-            ? t("popup.syncingStatus", "Syncing {{count}} file(s)...", {
+        {!connected ? (
+          <>
+            <CloudOffIcon sx={{ fontSize: 18, color: "warning.main" }} />
+            <Typography variant="caption" color="text.secondary">
+              {t("popup.offline", "Offline — pending changes will sync when reconnected")}
+            </Typography>
+          </>
+        ) : hasActiveTasks ? (
+          <>
+            <RefreshIcon
+              sx={{
+                fontSize: 18,
+                color: "primary.main",
+                animation: "spin 1s linear infinite",
+                "@keyframes spin": {
+                  "0%": { transform: "rotate(0deg)" },
+                  "100%": { transform: "rotate(360deg)" },
+                },
+              }}
+            />
+            <Typography variant="caption" color="text.secondary">
+              {t("popup.syncingStatus", "Syncing {{count}} file(s)...", {
                 count: summary?.active_tasks.length ?? 0,
-              })
-            : t("popup.upToDate", "Your files are up to date")}
-        </Typography>
+              })}
+            </Typography>
+          </>
+        ) : (
+          <>
+            <CheckCircleIcon sx={{ fontSize: 18, color: "success.main" }} />
+            <Typography variant="caption" color="text.secondary">
+              {t("popup.upToDate", "Your files are up to date")}
+            </Typography>
+          </>
+        )}
       </Box>
     </Box>
   );

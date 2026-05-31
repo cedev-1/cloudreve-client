@@ -46,7 +46,9 @@
     "syncingStatus": "Sincronizando {{count}} archivo(s)...",
     "upToDate": "Sus archivos están actualizados.",
     "waiting": "Esperando...",
-    "processing": "Procesando..."
+    "processing": "Procesando...",
+    "offline": "Sin conexión — los cambios pendientes se sincronizarán al reconectar",
+    "waitingConnection": "Esperando conexión..."
   },
   "settings": {
     "title": "Configuración",

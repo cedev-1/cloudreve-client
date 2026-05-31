@@ -142,6 +142,7 @@ pub type OnCredentialInvalid =
 pub struct Client {
     pub(crate) config: ClientConfig,
     pub(crate) http_client: HttpClient,
+    pub(crate) sse_client: HttpClient,
     pub(crate) tokens: Arc<RwLock<TokenStore>>,
     pub(crate) purchase_ticket: Arc<RwLock<Option<String>>>,
     on_credential_refreshed: Option<OnCredentialRefreshed>,
@@ -152,7 +153,8 @@ impl Client {
     /// Create a new API client
     pub fn new(config: ClientConfig) -> Self {
         let mut builder = HttpClient::builder()
-            .connect_timeout(std::time::Duration::from_secs(config.timeout_seconds));
+            .connect_timeout(std::time::Duration::from_secs(config.timeout_seconds))
+            .read_timeout(std::time::Duration::from_secs(30));
 
         if let Some(ref user_agent) = config.user_agent {
             builder = builder.user_agent(user_agent);
@@ -160,9 +162,19 @@ impl Client {
 
         let http_client = builder.build().expect("Failed to create HTTP client");
 
+        let mut sse_builder = HttpClient::builder()
+            .connect_timeout(std::time::Duration::from_secs(config.timeout_seconds));
+
+        if let Some(ref user_agent) = config.user_agent {
+            sse_builder = sse_builder.user_agent(user_agent);
+        }
+
+        let sse_client = sse_builder.build().expect("Failed to create SSE client");
+
         Self {
             config,
             http_client,
+            sse_client,
             tokens: Arc::new(RwLock::new(TokenStore::new())),
             purchase_ticket: Arc::new(RwLock::new(None)),
             on_credential_refreshed: None,
