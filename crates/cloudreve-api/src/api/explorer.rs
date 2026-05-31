@@ -796,14 +796,17 @@ pub trait FileEventsApi {
     /// ```no_run
     /// use cloudreve_api::{Client, ClientConfig};
     /// use cloudreve_api::api::explorer::FileEventsApi;
+    /// use cloudreve_api::models::explorer::FileEvent;
     ///
     /// async fn watch_events(client: &Client) -> Result<(), Box<dyn std::error::Error>> {
     ///     let mut subscription = client.subscribe_file_events("cloudreve://my-drive/").await?;
     ///
     ///     while let Some(event) = subscription.next_event().await? {
     ///         match event {
-    ///             cloudreve_api::models::explorer::FileEvent::Event(data) => {
-    ///                 println!("File event: {:?} on {}", data.event_type, data.from);
+    ///             FileEvent::Event(data) => {
+    ///                 for item in &data {
+    ///                     println!("File event: {:?} on {}", item.event_type, item.from);
+    ///                 }
     ///             }
     ///             _ => {}
     ///         }
