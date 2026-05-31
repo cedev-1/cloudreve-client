@@ -53,6 +53,16 @@
     "drives": "网盘",
     "general": "通用",
     "about": "关于",
+    "profile": "个人资料",
+    "profileNoDrive": "尚未配置网盘。添加一个网盘以查看您的个人资料。",
+    "profileGroup": "用户组",
+    "profileSince": "注册时间",
+    "profileStatus": {
+      "active": "正常",
+      "inactive": "未激活",
+      "manual_banned": "已封禁",
+      "sys_banned": "已封禁"
+    },
     "loading": "加载中...",
     "noDrives": "尚未配置网盘。添加一个网盘以开始使用。",
     "launchSettings": "启动",

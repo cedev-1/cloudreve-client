@@ -53,6 +53,16 @@
     "drives": "Drives",
     "general": "General",
     "about": "About",
+    "profile": "Profile",
+    "profileNoDrive": "No drives configured. Add a drive to view your profile.",
+    "profileGroup": "Group",
+    "profileSince": "Member since",
+    "profileStatus": {
+      "active": "Active",
+      "inactive": "Inactive",
+      "manual_banned": "Banned",
+      "sys_banned": "Banned"
+    },
     "loading": "Loading...",
     "noDrives": "No drives configured. Add a drive to get started.",
     "launchSettings": "Launch",

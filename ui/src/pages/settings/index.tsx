@@ -10,15 +10,17 @@ import { CloseRounded } from "@mui/icons-material";
 import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useTranslation } from "react-i18next";
+import { PersonOutline } from "@mui/icons-material";
 import CloudreveLogo from "../../common/CloudreveLogo";
 import DrivesSection from "./DrivesSection";
 import GeneralSection from "./GeneralSection";
+import ProfileSection from "./ProfileSection";
 import AboutSection from "./AboutSection";
 import HardDrive from "../../common/icons/HardDrive";
 import { default as SettingsIcon } from "../../common/icons/Settings";
 import Info from "../../common/icons/Info";
 
-type SettingsSection = "drives" | "general" | "about";
+type SettingsSection = "drives" | "general" | "profile" | "about";
 
 export default function Settings() {
   const { t } = useTranslation();
@@ -27,6 +29,7 @@ export default function Settings() {
   const sections = [
     { id: "drives" as const, icon: <HardDrive />, label: t("settings.drives") },
     { id: "general" as const, icon: <SettingsIcon />, label: t("settings.general") },
+    { id: "profile" as const, icon: <PersonOutline />, label: t("settings.profile") },
     { id: "about" as const, icon: <Info />, label: t("settings.about") },
   ];
 
@@ -36,6 +39,8 @@ export default function Settings() {
         return <DrivesSection />;
       case "general":
         return <GeneralSection />;
+      case "profile":
+        return <ProfileSection />;
       case "about":
         return <AboutSection />;
       default:

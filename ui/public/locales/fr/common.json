@@ -53,6 +53,16 @@
     "drives": "Disques",
     "general": "Général",
     "about": "À propos",
+    "profile": "Profil",
+    "profileNoDrive": "Aucun disque configuré. Ajoutez un disque pour voir votre profil.",
+    "profileGroup": "Groupe",
+    "profileSince": "Membre depuis",
+    "profileStatus": {
+      "active": "Actif",
+      "inactive": "Inactif",
+      "manual_banned": "Banni",
+      "sys_banned": "Banni"
+    },
     "loading": "Chargement...",
     "noDrives": "Aucun disque configuré. Ajoutez un disque pour commencer.",
     "launchSettings": "Lancement",

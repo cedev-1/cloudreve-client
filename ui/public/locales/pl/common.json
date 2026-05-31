@@ -53,6 +53,16 @@
     "drives": "Dyski",
     "general": "Ogólne",
     "about": "O programie",
+    "profile": "Profil",
+    "profileNoDrive": "Brak skonfigurowanych dysków.",
+    "profileGroup": "Grupa",
+    "profileSince": "Członek od",
+    "profileStatus": {
+      "active": "Aktywny",
+      "inactive": "Nieaktywny",
+      "manual_banned": "Zablokowany",
+      "sys_banned": "Zablokowany"
+    },
     "loading": "Ładowanie...",
     "noDrives": "Brak skonfigurowanych dysków. Dodaj dysk, aby rozpocząć.",
     "launchSettings": "Uruchamianie",

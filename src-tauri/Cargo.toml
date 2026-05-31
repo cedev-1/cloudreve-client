@@ -32,6 +32,7 @@ urlencoding = "2.1"
 
 # Main sync service crate
 cloudreve-sync = { path = "../crates/cloudreve-sync" }
+cloudreve-api = { path = "../crates/cloudreve-api" }
 
 tauri-plugin-autostart = "2"
 tauri-plugin-frame = "1.1.6"

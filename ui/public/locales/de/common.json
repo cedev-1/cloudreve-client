@@ -53,6 +53,16 @@
     "drives": "Laufwerke",
     "general": "Allgemein",
     "about": "Über",
+    "profile": "Profil",
+    "profileNoDrive": "Keine Laufwerke konfiguriert.",
+    "profileGroup": "Gruppe",
+    "profileSince": "Mitglied seit",
+    "profileStatus": {
+      "active": "Aktiv",
+      "inactive": "Inaktiv",
+      "manual_banned": "Gesperrt",
+      "sys_banned": "Gesperrt"
+    },
     "loading": "Laden...",
     "noDrives": "Keine Laufwerke konfiguriert. Fügen Sie ein Laufwerk hinzu, um zu beginnen.",
     "launchSettings": "Start",

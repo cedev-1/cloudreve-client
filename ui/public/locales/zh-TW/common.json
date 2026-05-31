@@ -53,6 +53,16 @@
     "drives": "雲端硬碟",
     "general": "一般",
     "about": "關於",
+    "profile": "個人資料",
+    "profileNoDrive": "尚未設定雲端硬碟。",
+    "profileGroup": "使用者群組",
+    "profileSince": "註冊時間",
+    "profileStatus": {
+      "active": "正常",
+      "inactive": "未啟用",
+      "manual_banned": "已停權",
+      "sys_banned": "已停權"
+    },
     "loading": "載入中...",
     "noDrives": "尚未設定雲端硬碟。新增一個雲端硬碟以開始使用。",
     "launchSettings": "啟動",

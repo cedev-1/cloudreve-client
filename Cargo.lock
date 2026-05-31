@@ -768,6 +768,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "chrono",
+ "cloudreve-api",
  "cloudreve-sync",
  "log",
  "rust-i18n",

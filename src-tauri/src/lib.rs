@@ -253,6 +253,7 @@ pub fn run() {
             commands::set_log_max_files,
             commands::set_language,
             commands::open_log_folder,
+            commands::get_user_profile,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

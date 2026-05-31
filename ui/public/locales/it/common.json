@@ -53,6 +53,16 @@
     "drives": "Unità",
     "general": "Generale",
     "about": "Informazioni",
+    "profile": "Profilo",
+    "profileNoDrive": "Nessuna unità configurata.",
+    "profileGroup": "Gruppo",
+    "profileSince": "Membro dal",
+    "profileStatus": {
+      "active": "Attivo",
+      "inactive": "Inattivo",
+      "manual_banned": "Sospeso",
+      "sys_banned": "Sospeso"
+    },
     "loading": "Caricamento...",
     "noDrives": "Nessuna unità configurata. Aggiungi un'unità per iniziare.",
     "launchSettings": "Avvio",

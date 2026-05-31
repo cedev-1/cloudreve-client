@@ -1,5 +1,6 @@
 use crate::AppStateHandle;
 use chrono::{Duration, Utc};
+use cloudreve_api::api::UserApi;
 use cloudreve_sync::{
     config::LogLevel, ConfigManager, Credentials, DriveConfig, DriveInfo, StatusSummary,
 };
@@ -456,4 +457,31 @@ pub async fn open_log_folder() -> CommandResult<()> {
     }
     showfile::show_path_in_file_manager(log_dir.display().to_string());
     Ok(())
+}
+
+#[derive(serde::Serialize)]
+pub struct UserProfile {
+    pub user: cloudreve_api::models::user::User,
+    pub avatar_url: String,
+    pub profile_url: String,
+}
+
+#[tauri::command]
+pub async fn get_user_profile(state: State<'_, AppStateHandle>) -> CommandResult<Option<UserProfile>> {
+    let app_state = state.get().ok_or_else(|| "App not yet initialized".to_string())?;
+    let drives = app_state.drive_manager.get_drives_info().await.map_err(|e| e.to_string())?;
+    let first = match drives.first() {
+        Some(d) => d,
+        None => return Ok(None),
+    };
+    let mount = app_state.drive_manager.get_drive(&first.id).await
+        .ok_or_else(|| "Drive not found".to_string())?;
+    let user = mount.cr_client.get_user_me().await.map_err(|e| e.to_string())?;
+    let avatar_url = format!("{}/api/v4/user/avatar/{}", first.instance_url, user.id);
+    let profile_url = format!("{}/profile/{}", first.instance_url, user.id);
+    Ok(Some(UserProfile {
+        user,
+        avatar_url,
+        profile_url,
+    }))
 }

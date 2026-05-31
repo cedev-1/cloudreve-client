@@ -53,6 +53,16 @@
     "drives": "Диски",
     "general": "Общие",
     "about": "О программе",
+    "profile": "Профиль",
+    "profileNoDrive": "Нет настроенных дисков.",
+    "profileGroup": "Группа",
+    "profileSince": "Участник с",
+    "profileStatus": {
+      "active": "Активен",
+      "inactive": "Неактивен",
+      "manual_banned": "Заблокирован",
+      "sys_banned": "Заблокирован"
+    },
     "loading": "Загрузка...",
     "noDrives": "Нет настроенных дисков. Добавьте диск для начала работы.",
     "launchSettings": "Запуск",

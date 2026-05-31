@@ -53,6 +53,16 @@
     "drives": "드라이브",
     "general": "일반",
     "about": "정보",
+    "profile": "프로필",
+    "profileNoDrive": "구성된 드라이브가 없습니다.",
+    "profileGroup": "그룹",
+    "profileSince": "가입일",
+    "profileStatus": {
+      "active": "활성",
+      "inactive": "비활성",
+      "manual_banned": "차단됨",
+      "sys_banned": "차단됨"
+    },
     "loading": "로드 중...",
     "noDrives": "구성된 드라이브가 없습니다. 드라이브를 추가하여 시작하세요.",
     "launchSettings": "시작",
