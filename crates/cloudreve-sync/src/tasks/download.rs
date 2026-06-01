@@ -200,7 +200,7 @@ impl<'a> DownloadTask<'a> {
             .to_string();
 
         // Get remote file info
-        let file_info = self.cr_client
+        let file_info = match self.cr_client
             .get_file_info(&cloudreve_api::models::explorer::GetFileInfoService {
                 uri: Some(uri.clone()),
                 id: None,
@@ -208,7 +208,26 @@ impl<'a> DownloadTask<'a> {
                 folder_summary: None,
             })
             .await
-            .context("failed to get remote file info")?;
+        {
+            Ok(info) => info,
+            Err(cloudreve_api::ApiError::ApiError { code, message: _, .. }) 
+                if code == 40016 || code == 404 => {
+                // File no longer exists on the server — treat as a remote deletion.
+                // Remove the local file if it exists so we stay in sync.
+                info!(
+                    target: "tasks::download",
+                    task_id = %self.task.task_id,
+                    path = %local_path.display(),
+                    code = code,
+                    "Remote file no longer exists, removing local file"
+                );
+                if local_path.exists() && !local_path.is_dir() {
+                    std::fs::remove_file(&local_path).ok();
+                }
+                return Ok(());
+            }
+            Err(e) => return Err(anyhow::Error::from(e).context("failed to get remote file info")),
+        };
 
         // If the local inventory already tracks this exact remote entity (same etag),
         // the file is already in sync — skip the download to avoid a needless

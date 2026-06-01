@@ -209,8 +209,18 @@ impl Mount {
             let local_from = sync_root.join(&from_rel);
             if local_from.exists() {
                 if let Some(parent) = local_from.parent() {
-                    from_grouped.entry(parent.to_path_buf()).or_default().push(local_from);
+                    from_grouped.entry(parent.to_path_buf()).or_default().push(local_from.clone());
                 }
+            }
+
+            // Cancel any pending tasks for the old path since the file was moved remotely
+            if let Err(e) = self.task_queue.cancel_by_path(&local_from).await {
+                tracing::warn!(
+                    target: "drive::remote_events",
+                    path = %local_from.display(),
+                    error = %e,
+                    "Failed to cancel tasks for renamed-from path"
+                );
             }
 
             let to_rel: PathBuf = event.to.trim_start_matches('/').split('/').collect();

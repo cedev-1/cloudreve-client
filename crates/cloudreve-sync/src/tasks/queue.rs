@@ -164,11 +164,14 @@ impl TaskQueue {
             .with_context(|| format!("Failed to persist task {}", task_id))?;
 
         if !inserted {
-            return Err(anyhow!(
-                "Task already exists for {} with type {}",
-                payload.local_path_display(),
-                payload.kind.as_str()
-            ));
+            tracing::trace!(
+                target: "tasks::queue",
+                task_id = %task_id,
+                path = %payload.local_path_display(),
+                kind = %payload.kind.as_str(),
+                "Task already exists, skipping enqueue"
+            );
+            return Ok(task_id);
         }
 
         let payload = payload.with_task_id(task_id.clone());
@@ -295,6 +298,55 @@ impl TaskQueue {
                 drive = %self.drive_id,
                 count = count,
                 "Re-enqueued offline-waiting tasks"
+            );
+        }
+
+        Ok(count)
+    }
+
+    /// Mark all pending and running tasks as offline-waiting.
+    /// This cancels any currently running tasks and updates their custom_state
+    /// so the UI shows "Waiting for connection...".
+    /// Called when the heartbeat detects the connection is lost.
+    pub async fn force_offline_waiting(&self) -> Result<usize> {
+        // Cancel any currently running tasks
+        self.cancel_running_tasks().await;
+
+        let records = self.inventory.list_tasks(
+            Some(&self.drive_id),
+            Some(&[TaskStatus::Pending, TaskStatus::Running]),
+        )?;
+
+        let mut count = 0;
+        for record in records {
+            let mut custom_state = record.custom_state.unwrap_or_default();
+            custom_state["offline_waiting"] = serde_json::Value::Bool(true);
+
+            let update = TaskUpdate {
+                status: Some(TaskStatus::Pending),
+                custom_state: Some(Some(custom_state)),
+                ..Default::default()
+            };
+
+            if let Err(e) = self.inventory.update_task(&record.id, update) {
+                warn!(
+                    target: "tasks::queue",
+                    drive = %self.drive_id,
+                    task_id = %record.id,
+                    error = ?e,
+                    "Failed to mark task as offline waiting"
+                );
+            } else {
+                count += 1;
+            }
+        }
+
+        if count > 0 {
+            info!(
+                target: "tasks::queue",
+                drive = %self.drive_id,
+                count = count,
+                "Marked tasks as offline waiting"
             );
         }
 
