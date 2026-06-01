@@ -388,6 +388,11 @@ pub async fn set_notify_file_conflict(enabled: bool) -> CommandResult<()> {
 }
 
 #[tauri::command]
+pub async fn set_notify_connection_status(enabled: bool) -> CommandResult<()> {
+    ConfigManager::get().set_notify_connection_status(enabled).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn set_fast_popup_launch(enabled: bool) -> CommandResult<()> {
     ConfigManager::get().set_fast_popup_launch(enabled).map_err(|e| e.to_string())
 }

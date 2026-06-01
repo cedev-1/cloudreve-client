@@ -213,6 +213,27 @@ pub fn run() {
                 });
             }
 
+            // Spin up the OS notification listener before the sync service so
+            // toast calls made during drive initialization are delivered.
+            let (notif_tx, mut notif_rx) =
+                tokio::sync::mpsc::unbounded_channel::<(String, String)>();
+            cloudreve_sync::utils::toast::init_os_notifier(notif_tx);
+            let notif_handle = app.handle().clone();
+            spawn(async move {
+                use tauri_plugin_notification::NotificationExt;
+                while let Some((title, body)) = notif_rx.recv().await {
+                    if let Err(e) = notif_handle
+                        .notification()
+                        .builder()
+                        .title(&title)
+                        .body(&body)
+                        .show()
+                    {
+                        tracing::warn!(target: "toast", error = %e, "Failed to send OS notification");
+                    }
+                }
+            });
+
             let app_handle = app.handle().clone();
             spawn(async move {
                 if let Err(e) = init_sync_service(app_handle).await {

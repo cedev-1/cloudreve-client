@@ -52,6 +52,8 @@ pub struct AppConfig {
     pub notify_credential_expired: bool,
     /// Whether to show notifications when file conflicts occur
     pub notify_file_conflict: bool,
+    /// Whether to show notifications when connection status changes
+    pub notify_connection_status: bool,
     /// Whether to keep the popup window alive (hide instead of close) for faster launch
     pub fast_popup_launch: bool,
     /// Whether to write logs to file
@@ -70,6 +72,7 @@ impl Default for AppConfig {
             auto_start: true,
             notify_credential_expired: true,
             notify_file_conflict: true,
+            notify_connection_status: true,
             fast_popup_launch: true,
             log_to_file: true,
             log_level: LogLevel::Debug,
@@ -225,6 +228,21 @@ impl ConfigManager {
     pub fn set_notify_file_conflict(&self, enabled: bool) -> Result<()> {
         self.update(|config| {
             config.notify_file_conflict = enabled;
+        })
+    }
+
+    /// Get whether connection status notifications are enabled
+    pub fn notify_connection_status(&self) -> bool {
+        self.config
+            .read()
+            .map(|c| c.notify_connection_status)
+            .unwrap_or(true)
+    }
+
+    /// Set whether connection status notifications are enabled
+    pub fn set_notify_connection_status(&self, enabled: bool) -> Result<()> {
+        self.update(|config| {
+            config.notify_connection_status = enabled;
         })
     }
 
