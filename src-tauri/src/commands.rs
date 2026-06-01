@@ -388,11 +388,6 @@ pub async fn set_notify_file_conflict(enabled: bool) -> CommandResult<()> {
 }
 
 #[tauri::command]
-pub async fn set_notify_connection_status(enabled: bool) -> CommandResult<()> {
-    ConfigManager::get().set_notify_connection_status(enabled).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
 pub async fn set_fast_popup_launch(enabled: bool) -> CommandResult<()> {
     ConfigManager::get().set_fast_popup_launch(enabled).map_err(|e| e.to_string())
 }
@@ -409,6 +404,7 @@ pub async fn get_general_settings() -> CommandResult<GeneralSettings> {
         log_max_files: config.log_max_files,
         log_dir: ConfigManager::get_log_dir().display().to_string(),
         language: config.language,
+        heartbeat_interval: config.heartbeat_interval_secs,
     })
 }
 
@@ -422,6 +418,12 @@ pub struct GeneralSettings {
     pub log_max_files: usize,
     pub log_dir: String,
     pub language: Option<String>,
+    pub heartbeat_interval: u64,
+}
+
+#[tauri::command]
+pub async fn set_heartbeat_interval(secs: u64) -> CommandResult<()> {
+    ConfigManager::get().set_heartbeat_interval_secs(secs).map_err(|e| e.to_string())
 }
 
 #[tauri::command]

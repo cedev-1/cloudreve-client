@@ -105,8 +105,12 @@
     "driveStatus": {
       "active": "アクティブ",
       "eventPushLost": "リアルタイムイベントプッシュが切断",
+      "offline": "オフライン",
       "credentialExpired": "認証期限切れ"
-    }
+    },
+    "networkSettings": "Network",
+    "heartbeatInterval": "Heartbeat interval",
+    "heartbeatIntervalDescription": "How often to check server connectivity (seconds)"
   },
   "about": {
     "homepage": "ホームページ",

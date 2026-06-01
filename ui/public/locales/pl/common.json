@@ -94,7 +94,7 @@
     "openSite": "Otwórz witrynę",
     "reauthorize": "Ponownie autoryzuj",
     "deleteDrive": "Usuń",
-    "deleteDriveConfirm": "Czy na pewno chcesz usunąć \u201e{{name}}\u201d?",
+    "deleteDriveConfirm": "Czy na pewno chcesz usunąć „{{name}}”?",
     "ignorePatterns": "Wzorce wykluczeń",
     "ignorePatternsTitle": "Edytuj wzorce wykluczeń",
     "ignorePatternsDescription": "Wprowadź wzorce w stylu gitignore, po jednym w wierszu. Pasujące pliki nie będą synchronizowane.",
@@ -105,8 +105,12 @@
     "driveStatus": {
       "active": "Aktywny",
       "eventPushLost": "Utracono połączenie z powiadomieniami w czasie rzeczywistym",
+      "offline": "Offline",
       "credentialExpired": "Dane uwierzytelniające wygasły"
-    }
+    },
+    "networkSettings": "Network",
+    "heartbeatInterval": "Heartbeat interval",
+    "heartbeatIntervalDescription": "How often to check server connectivity (seconds)"
   },
   "about": {
     "homepage": "Strona główna",

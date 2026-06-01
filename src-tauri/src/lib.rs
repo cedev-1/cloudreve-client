@@ -269,6 +269,7 @@ pub fn run() {
             commands::set_notify_file_conflict,
             commands::set_fast_popup_launch,
             commands::get_general_settings,
+            commands::set_heartbeat_interval,
             commands::set_log_to_file,
             commands::set_log_level,
             commands::set_log_max_files,

@@ -600,4 +600,11 @@ impl Client {
     {
         self.send(path, Method::PATCH, Some(body), options).await
     }
+
+    /// Ping the server to check connectivity.
+    /// Sends a lightweight GET /site/ping request without credentials.
+    /// Returns the parsed JSON response on success.
+    pub async fn ping(&self) -> ApiResult<serde_json::Value> {
+        self.get("/site/ping", RequestOptions::new().no_credential()).await
+    }
 }

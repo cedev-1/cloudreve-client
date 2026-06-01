@@ -105,8 +105,12 @@
     "driveStatus": {
       "active": "Active",
       "eventPushLost": "Real time event push lost",
+      "offline": "Offline",
       "credentialExpired": "Credential Expired"
-    }
+    },
+    "networkSettings": "Network",
+    "heartbeatInterval": "Heartbeat interval",
+    "heartbeatIntervalDescription": "How often to check server connectivity (seconds)"
   },
   "about": {
     "homepage": "Homepage",

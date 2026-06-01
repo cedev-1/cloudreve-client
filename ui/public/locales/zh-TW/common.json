@@ -105,8 +105,12 @@
     "driveStatus": {
       "active": "活躍",
       "eventPushLost": "即時事件推送中斷",
+      "offline": "離線",
       "credentialExpired": "憑證已過期"
-    }
+    },
+    "networkSettings": "Network",
+    "heartbeatInterval": "Heartbeat interval",
+    "heartbeatIntervalDescription": "How often to check server connectivity (seconds)"
   },
   "about": {
     "homepage": "首頁",

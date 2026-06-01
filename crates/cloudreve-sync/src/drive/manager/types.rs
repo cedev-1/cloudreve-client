@@ -109,6 +109,8 @@ pub enum DriveInfoStatus {
     EventPushLost,
     /// Credentials have expired
     CredentialExpired,
+    /// Network connection is offline
+    Offline,
 }
 
 /// Format bytes into a human-readable string (e.g., "1.5 GB")

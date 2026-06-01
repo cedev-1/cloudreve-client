@@ -105,8 +105,12 @@
     "driveStatus": {
       "active": "활성",
       "eventPushLost": "실시간 이벤트 푸시 연결 끊김",
+      "offline": "오프라인",
       "credentialExpired": "자격 증명 만료됨"
-    }
+    },
+    "networkSettings": "Network",
+    "heartbeatInterval": "Heartbeat interval",
+    "heartbeatIntervalDescription": "How often to check server connectivity (seconds)"
   },
   "about": {
     "homepage": "홈페이지",

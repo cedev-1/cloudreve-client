@@ -64,6 +64,8 @@ pub struct AppConfig {
     pub log_max_files: usize,
     /// Language/locale setting (e.g., "en-US", "zh-CN"). None means use system default.
     pub language: Option<String>,
+    /// Heartbeat interval in seconds for checking server connectivity (5-120)
+    pub heartbeat_interval_secs: u64,
 }
 
 impl Default for AppConfig {
@@ -78,6 +80,7 @@ impl Default for AppConfig {
             log_level: LogLevel::Debug,
             log_max_files: 5,
             language: None,
+            heartbeat_interval_secs: 15,
         }
     }
 }
@@ -315,6 +318,22 @@ impl ConfigManager {
     pub fn set_language(&self, language: Option<String>) -> Result<()> {
         self.update(|config| {
             config.language = language;
+        })
+    }
+
+    /// Get the heartbeat interval in seconds
+    pub fn heartbeat_interval_secs(&self) -> u64 {
+        self.config
+            .read()
+            .map(|c| c.heartbeat_interval_secs)
+            .unwrap_or(20)
+    }
+
+    /// Set the heartbeat interval in seconds (clamped to 10-120)
+    pub fn set_heartbeat_interval_secs(&self, secs: u64) -> Result<()> {
+        let clamped = secs.clamp(10, 120);
+        self.update(|config| {
+            config.heartbeat_interval_secs = clamped;
         })
     }
 

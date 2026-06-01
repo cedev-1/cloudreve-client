@@ -105,8 +105,12 @@
     "driveStatus": {
       "active": "Activo",
       "eventPushLost": "Pérdida de notificaciones en tiempo real",
+      "offline": "Fuera de línea",
       "credentialExpired": "Credenciales expiradas"
-    }
+    },
+    "networkSettings": "Network",
+    "heartbeatInterval": "Heartbeat interval",
+    "heartbeatIntervalDescription": "How often to check server connectivity (seconds)"
   },
   "about": {
     "homepage": "Página principal",

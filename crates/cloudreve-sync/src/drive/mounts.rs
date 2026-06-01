@@ -5,7 +5,7 @@ use crate::drive::sync::group_fs_events;
 use crate::inventory::{DrivePropsUpdate, InventoryDb};
 use crate::tasks::{TaskQueue, TaskQueueConfig};
 use crate::utils::toast;
-use crate::EventBroadcaster;
+
 use ::serde::{Deserialize, Serialize};
 use anyhow::{Context, Result};
 use cloudreve_api::{Client, ClientConfig, models::user::Token};
@@ -127,7 +127,7 @@ pub struct Mount {
     pub task_queue: Arc<TaskQueue>,
     pub id: String,
     pub event_blocker: EventBlocker,
-    pub(super) event_broadcaster: Arc<EventBroadcaster>,
+
     pub ignore_matcher: RwLock<IgnoreMatcher>,
     pub(super) status_flags: Mutex<MountStatusFlags>,
 }
@@ -137,7 +137,6 @@ impl Mount {
         config: DriveConfig,
         inventory: Arc<InventoryDb>,
         manager_command_tx: mpsc::UnboundedSender<ManagerCommand>,
-        event_broadcaster: Arc<EventBroadcaster>,
     ) -> Self {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
 
@@ -208,7 +207,6 @@ impl Mount {
             event_blocker: event_blocker.clone(),
             ignore_matcher: RwLock::new(ignore_matcher),
             status_flags: Mutex::new(MountStatusFlags::new()),
-            event_broadcaster,
         }
     }
 

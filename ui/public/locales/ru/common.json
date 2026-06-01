@@ -105,8 +105,12 @@
     "driveStatus": {
       "active": "Активен",
       "eventPushLost": "Потеряна связь с push-событиями",
+      "offline": "Не в сети",
       "credentialExpired": "Учётные данные истекли"
-    }
+    },
+    "networkSettings": "Network",
+    "heartbeatInterval": "Heartbeat interval",
+    "heartbeatIntervalDescription": "How often to check server connectivity (seconds)"
   },
   "about": {
     "homepage": "Домашняя страница",

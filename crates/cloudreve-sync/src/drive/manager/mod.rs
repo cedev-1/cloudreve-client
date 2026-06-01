@@ -5,6 +5,7 @@ mod types;
 pub use types::*;
 
 use crate::drive::commands::{ManagerCommand, MountCommand};
+use crate::drive::heartbeat::HeartbeatManager;
 use crate::drive::mounts::{Credentials, DriveConfig, Mount};
 use crate::EventBroadcaster;
 use crate::inventory::InventoryDb;
@@ -25,6 +26,7 @@ pub struct DriveManager {
     pub(super) command_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<ManagerCommand>>>>,
     pub(super) processor_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     pub(super) event_broadcaster: Arc<EventBroadcaster>,
+    heartbeat_manager: HeartbeatManager,
 }
 
 impl DriveManager {
@@ -39,15 +41,18 @@ impl DriveManager {
         }
 
         let (command_tx, command_rx) = mpsc::unbounded_channel();
+        let drives = Arc::new(RwLock::new(HashMap::new()));
+        let heartbeat_manager = HeartbeatManager::new(drives.clone(), event_broadcaster.clone());
 
         Ok(Self {
             config_dir,
-            drives: Arc::new(RwLock::new(HashMap::new())),
+            drives,
             inventory: Arc::new(InventoryDb::new().context("Failed to create inventory database")?),
             command_tx,
             command_rx: Arc::new(Mutex::new(Some(command_rx))),
             processor_handle: Arc::new(Mutex::new(None)),
             event_broadcaster: event_broadcaster,
+            heartbeat_manager,
         })
     }
 
@@ -106,6 +111,9 @@ impl DriveManager {
         }
 
         tracing::info!(target: "drive", count = count, "Loaded drive(s) from config");
+
+        // Start heartbeat monitoring after drives are loaded
+        self.heartbeat_manager.start().await;
 
         Ok(())
     }
@@ -182,7 +190,6 @@ impl DriveManager {
             config.clone(),
             self.inventory.clone(),
             self.command_tx.clone(),
-            self.event_broadcaster.clone(),
         )
         .await;
         if let Err(e) = mount.start().await {
@@ -200,6 +207,10 @@ impl DriveManager {
         let id = mount_arc.id.clone();
         let command_tx = mount_arc.command_tx.clone();
         write_guard.insert(id.clone(), mount_arc);
+        drop(write_guard);
+
+        // Start heartbeat monitoring if this is the first drive
+        self.heartbeat_manager.start().await;
 
         // Trigger an initial full sync so existing remote/local files are reconciled
         if let Err(e) = command_tx.send(MountCommand::FullSync) {
@@ -273,6 +284,8 @@ impl DriveManager {
         // Broadcast no_drive event if no drives remain
         if self.drives.read().await.is_empty() {
             self.event_broadcaster.no_drive();
+            // Stop heartbeat when there are no drives to monitor
+            self.heartbeat_manager.stop().await;
         }
 
         tracing::info!(target: "drive::manager", drive_id = %id, "Drive removed successfully");
@@ -560,12 +573,12 @@ impl DriveManager {
             // Determine drive status
             let status = if drive_state.is_credential_expired() {
                 DriveInfoStatus::CredentialExpired
+            } else if !self.heartbeat_manager.is_online() {
+                DriveInfoStatus::Offline
+            } else if !drive_state.is_event_push_subscribed() {
+                DriveInfoStatus::EventPushLost
             } else {
-                if !drive_state.is_event_push_subscribed(){
-                    DriveInfoStatus::EventPushLost
-                } else {
-                    DriveInfoStatus::Active
-                }
+                DriveInfoStatus::Active
             };
 
             drives_info.push(DriveInfo {
@@ -593,6 +606,9 @@ impl DriveManager {
 
     pub async fn shutdown(&self) {
         tracing::info!(target: "drive::manager", "Shutting down DriveManager");
+
+        // Stop heartbeat monitoring
+        self.heartbeat_manager.stop().await;
 
         // Close the command channel to signal the processor task to stop
         drop(self.command_tx.clone());

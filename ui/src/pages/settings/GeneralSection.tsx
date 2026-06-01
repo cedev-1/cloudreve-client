@@ -7,6 +7,7 @@ import {
   Select,
   MenuItem,
   FormControl,
+  TextField,
 } from "@mui/material";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -211,6 +212,7 @@ interface GeneralSettings {
   log_max_files: number;
   log_dir: string;
   language: string | null;
+  heartbeat_interval: number;
 }
 
 const LOG_LEVELS = [
@@ -239,6 +241,7 @@ export default function GeneralSection() {
   const [logMaxFiles, setLogMaxFiles] = useState(5);
   const [logDir, setLogDir] = useState("");
   const [language, setLanguage] = useState<string | null>(null);
+  const [heartbeatInterval, setHeartbeatInterval] = useState(15);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -257,6 +260,7 @@ export default function GeneralSection() {
         setLogMaxFiles(settings.log_max_files);
         setLogDir(settings.log_dir);
         setLanguage(settings.language);
+        setHeartbeatInterval(settings.heartbeat_interval);
       } catch (error) {
         console.error("Failed to load settings:", error);
       } finally {
@@ -375,6 +379,20 @@ export default function GeneralSection() {
   // Get the current language value for the select, "auto" if null
   const currentLanguageValue = language ?? "auto";
 
+  const handleHeartbeatIntervalChange = async (value: string) => {
+    const numValue = parseInt(value, 10);
+    if (isNaN(numValue)) return;
+    const clamped = Math.max(5, Math.min(120, numValue));
+    const previousValue = heartbeatInterval;
+    setHeartbeatInterval(clamped);
+    try {
+      await invoke("set_heartbeat_interval", { secs: clamped });
+    } catch (error) {
+      console.error("Failed to change heartbeat interval:", error);
+      setHeartbeatInterval(previousValue);
+    }
+  };
+
   return (
     <Box>
       <SettingsGroup title={t("settings.launchSettings")}>
@@ -431,6 +449,36 @@ export default function GeneralSection() {
           disabled={loading}
           isLast={true}
         />
+      </SettingsGroup>
+
+      <SettingsGroup title={t("settings.networkSettings")}>
+        <Box
+          sx={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            py: 1.5,
+            px: 2,
+          }}
+        >
+          <Box sx={{ flex: 1, minWidth: 0, mr: 2 }}>
+            <Typography variant="body2">
+              {t("settings.heartbeatInterval")}
+            </Typography>
+            <Typography variant="caption" color="text.secondary">
+              {t("settings.heartbeatIntervalDescription")}
+            </Typography>
+          </Box>
+          <TextField
+            type="number"
+            size="small"
+            value={heartbeatInterval}
+            onChange={(e) => handleHeartbeatIntervalChange(e.target.value)}
+            inputProps={{ min: 5, max: 120 }}
+            sx={{ width: 80 }}
+            disabled={loading}
+          />
+        </Box>
       </SettingsGroup>
 
       <SettingsGroup title={t("settings.logSettings")}>
