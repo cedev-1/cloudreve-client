@@ -114,7 +114,12 @@
     "heartbeatIntervalDescription": "서버 연결 확인 주기(초)",
     "driveSettingsTitle": "드라이브 설정",
     "maxFileSize": "최대 파일 크기 (MB)",
-    "maxFileSizeDescription": "0 = 무제한. 이 크기보다 큰 파일은 동기화되지 않습니다."
+    "maxFileSizeDescription": "0 = 무제한. 이 크기보다 큰 파일은 동기화되지 않습니다.",
+    "updateSettings": "업데이트",
+    "checkUpdatesOnStartup": "시작 시 업데이트 확인",
+    "checkUpdatesOnStartupDescription": "앱이 시작될 때 새 버전을 자동으로 확인합니다",
+    "autoInstallUpdates": "업데이트 자동 설치",
+    "autoInstallUpdatesDescription": "자동으로 업데이트를 다운로드하고 설치합니다"
   },
   "about": {
     "homepage": "홈페이지",

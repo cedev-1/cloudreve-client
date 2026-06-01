@@ -66,6 +66,10 @@ pub struct AppConfig {
     pub language: Option<String>,
     /// Heartbeat interval in seconds for checking server connectivity (5-120)
     pub heartbeat_interval_secs: u64,
+    /// Whether to automatically check for updates on startup
+    pub check_updates_on_startup: bool,
+    /// Whether to automatically download and install updates
+    pub auto_install_updates: bool,
 }
 
 impl Default for AppConfig {
@@ -81,6 +85,8 @@ impl Default for AppConfig {
             log_max_files: 5,
             language: None,
             heartbeat_interval_secs: 15,
+            check_updates_on_startup: true,
+            auto_install_updates: false,
         }
     }
 }
@@ -334,6 +340,36 @@ impl ConfigManager {
         let clamped = secs.clamp(10, 120);
         self.update(|config| {
             config.heartbeat_interval_secs = clamped;
+        })
+    }
+
+    /// Get whether to check for updates on startup
+    pub fn check_updates_on_startup(&self) -> bool {
+        self.config
+            .read()
+            .map(|c| c.check_updates_on_startup)
+            .unwrap_or(true)
+    }
+
+    /// Set whether to check for updates on startup
+    pub fn set_check_updates_on_startup(&self, enabled: bool) -> Result<()> {
+        self.update(|config| {
+            config.check_updates_on_startup = enabled;
+        })
+    }
+
+    /// Get whether to automatically install updates
+    pub fn auto_install_updates(&self) -> bool {
+        self.config
+            .read()
+            .map(|c| c.auto_install_updates)
+            .unwrap_or(false)
+    }
+
+    /// Set whether to automatically install updates
+    pub fn set_auto_install_updates(&self, enabled: bool) -> Result<()> {
+        self.update(|config| {
+            config.auto_install_updates = enabled;
         })
     }
 

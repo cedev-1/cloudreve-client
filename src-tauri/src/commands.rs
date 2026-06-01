@@ -425,6 +425,8 @@ pub async fn get_general_settings() -> CommandResult<GeneralSettings> {
         log_dir: ConfigManager::get_log_dir().display().to_string(),
         language: config.language,
         heartbeat_interval: config.heartbeat_interval_secs,
+        check_updates_on_startup: config.check_updates_on_startup,
+        auto_install_updates: config.auto_install_updates,
     })
 }
 
@@ -439,6 +441,8 @@ pub struct GeneralSettings {
     pub log_dir: String,
     pub language: Option<String>,
     pub heartbeat_interval: u64,
+    pub check_updates_on_startup: bool,
+    pub auto_install_updates: bool,
 }
 
 #[tauri::command]
@@ -474,6 +478,20 @@ pub async fn set_language(app: AppHandle, language: Option<String>) -> CommandRe
         let _ = window.destroy();
     }
     Ok(())
+}
+
+#[tauri::command]
+pub async fn set_check_updates_on_startup(enabled: bool) -> CommandResult<()> {
+    ConfigManager::get()
+        .set_check_updates_on_startup(enabled)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn set_auto_install_updates(enabled: bool) -> CommandResult<()> {
+    ConfigManager::get()
+        .set_auto_install_updates(enabled)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

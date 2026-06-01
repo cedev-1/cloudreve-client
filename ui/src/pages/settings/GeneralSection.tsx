@@ -213,6 +213,8 @@ interface GeneralSettings {
   log_dir: string;
   language: string | null;
   heartbeat_interval: number;
+  check_updates_on_startup: boolean;
+  auto_install_updates: boolean;
 }
 
 const LOG_LEVELS = [
@@ -242,6 +244,8 @@ export default function GeneralSection() {
   const [logDir, setLogDir] = useState("");
   const [language, setLanguage] = useState<string | null>(null);
   const [heartbeatInterval, setHeartbeatInterval] = useState(15);
+  const [checkUpdatesOnStartup, setCheckUpdatesOnStartup] = useState(true);
+  const [autoInstallUpdates, setAutoInstallUpdates] = useState(false);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -261,6 +265,8 @@ export default function GeneralSection() {
         setLogDir(settings.log_dir);
         setLanguage(settings.language);
         setHeartbeatInterval(settings.heartbeat_interval);
+        setCheckUpdatesOnStartup(settings.check_updates_on_startup);
+        setAutoInstallUpdates(settings.auto_install_updates);
       } catch (error) {
         console.error("Failed to load settings:", error);
       } finally {
@@ -379,6 +385,28 @@ export default function GeneralSection() {
   // Get the current language value for the select, "auto" if null
   const currentLanguageValue = language ?? "auto";
 
+  const handleCheckUpdatesOnStartupChange = async (checked: boolean) => {
+    const previousValue = checkUpdatesOnStartup;
+    setCheckUpdatesOnStartup(checked);
+    try {
+      await invoke("set_check_updates_on_startup", { enabled: checked });
+    } catch (error) {
+      console.error("Failed to change auto update check setting:", error);
+      setCheckUpdatesOnStartup(previousValue);
+    }
+  };
+
+  const handleAutoInstallUpdatesChange = async (checked: boolean) => {
+    const previousValue = autoInstallUpdates;
+    setAutoInstallUpdates(checked);
+    try {
+      await invoke("set_auto_install_updates", { enabled: checked });
+    } catch (error) {
+      console.error("Failed to change auto install setting:", error);
+      setAutoInstallUpdates(previousValue);
+    }
+  };
+
   const handleHeartbeatIntervalChange = async (value: string) => {
     const numValue = parseInt(value, 10);
     if (isNaN(numValue)) return;
@@ -410,6 +438,25 @@ export default function GeneralSection() {
           checked={fastPopupLaunch}
           onChange={handleFastPopupLaunchChange}
           disabled={loading}
+          isLast={true}
+        />
+      </SettingsGroup>
+
+      <SettingsGroup title={t("settings.updateSettings")}>
+        <SettingItem
+          title={t("settings.checkUpdatesOnStartup")}
+          description={t("settings.checkUpdatesOnStartupDescription")}
+          checked={checkUpdatesOnStartup}
+          onChange={handleCheckUpdatesOnStartupChange}
+          disabled={loading}
+          isLast={false}
+        />
+        <SettingItem
+          title={t("settings.autoInstallUpdates")}
+          description={t("settings.autoInstallUpdatesDescription")}
+          checked={autoInstallUpdates}
+          onChange={handleAutoInstallUpdatesChange}
+          disabled={loading || !checkUpdatesOnStartup}
           isLast={true}
         />
       </SettingsGroup>

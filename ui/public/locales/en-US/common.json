@@ -114,7 +114,12 @@
     },
     "networkSettings": "Network",
     "heartbeatInterval": "Heartbeat interval",
-    "heartbeatIntervalDescription": "How often to check server connectivity (seconds)"
+    "heartbeatIntervalDescription": "How often to check server connectivity (seconds)",
+    "updateSettings": "Updates",
+    "checkUpdatesOnStartup": "Check for updates on startup",
+    "checkUpdatesOnStartupDescription": "Automatically check for new versions when the app starts",
+    "autoInstallUpdates": "Auto-install updates",
+    "autoInstallUpdatesDescription": "Download and install updates automatically without prompting"
   },
   "about": {
     "homepage": "Homepage",

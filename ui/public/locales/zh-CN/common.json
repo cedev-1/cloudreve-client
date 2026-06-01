@@ -114,7 +114,12 @@
     "heartbeatIntervalDescription": "检查服务器连接频率（秒）",
     "driveSettingsTitle": "驱动器设置",
     "maxFileSize": "最大文件大小 (MB)",
-    "maxFileSizeDescription": "0 = 无限制。大于此大小的文件将不会被同步。"
+    "maxFileSizeDescription": "0 = 无限制。大于此大小的文件将不会被同步。",
+    "updateSettings": "更新",
+    "checkUpdatesOnStartup": "启动时检查更新",
+    "checkUpdatesOnStartupDescription": "应用启动时自动检查新版本",
+    "autoInstallUpdates": "自动安装更新",
+    "autoInstallUpdatesDescription": "自动下载并安装更新，无需提示"
   },
   "about": {
     "homepage": "主页",

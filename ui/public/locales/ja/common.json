@@ -114,7 +114,12 @@
     "heartbeatIntervalDescription": "サーバー接続確認の間隔（秒）",
     "driveSettingsTitle": "ドライブ設定",
     "maxFileSize": "最大ファイルサイズ (MB)",
-    "maxFileSizeDescription": "0 = 無制限。これより大きいファイルは同期されません。"
+    "maxFileSizeDescription": "0 = 無制限。これより大きいファイルは同期されません。",
+    "updateSettings": "アップデート",
+    "checkUpdatesOnStartup": "起動時にアップデートを確認",
+    "checkUpdatesOnStartupDescription": "アプリ起動時に新しいバージョンを自動的に確認します",
+    "autoInstallUpdates": "アップデートを自動インストール",
+    "autoInstallUpdatesDescription": "確認なしでアップデートを自動的にダウンロードしてインストールします"
   },
   "about": {
     "homepage": "ホームページ",

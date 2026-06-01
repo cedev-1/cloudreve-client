@@ -114,7 +114,12 @@
     "heartbeatIntervalDescription": "檢查伺服器連線頻率（秒）",
     "driveSettingsTitle": "磁碟機設定",
     "maxFileSize": "最大檔案大小 (MB)",
-    "maxFileSizeDescription": "0 = 無限制。大於此大小的檔案將不會被同步。"
+    "maxFileSizeDescription": "0 = 無限制。大於此大小的檔案將不會被同步。",
+    "updateSettings": "更新",
+    "checkUpdatesOnStartup": "啟動時檢查更新",
+    "checkUpdatesOnStartupDescription": "應用啟動時自動檢查新版本",
+    "autoInstallUpdates": "自動安裝更新",
+    "autoInstallUpdatesDescription": "自動下載並安裝更新，無需提示"
   },
   "about": {
     "homepage": "首頁",

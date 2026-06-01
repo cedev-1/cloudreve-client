@@ -114,7 +114,12 @@
     },
     "networkSettings": "Réseau",
     "heartbeatInterval": "Intervalle de heartbeat",
-    "heartbeatIntervalDescription": "Fréquence de vérification de la connectivité (secondes)"
+    "heartbeatIntervalDescription": "Fréquence de vérification de la connectivité (secondes)",
+    "updateSettings": "Mises à jour",
+    "checkUpdatesOnStartup": "Vérifier les mises à jour au démarrage",
+    "checkUpdatesOnStartupDescription": "Vérifier automatiquement les nouvelles versions au lancement de l'application",
+    "autoInstallUpdates": "Installer automatiquement les mises à jour",
+    "autoInstallUpdatesDescription": "Télécharger et installer les mises à jour automatiquement sans demander"
   },
   "about": {
     "homepage": "Page d'accueil",

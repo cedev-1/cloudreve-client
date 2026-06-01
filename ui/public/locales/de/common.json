@@ -114,7 +114,12 @@
     "heartbeatIntervalDescription": "Häufigkeit der Konnektivitätsprüfung (Sekunden)",
     "driveSettingsTitle": "Laufwerk-Einstellungen",
     "maxFileSize": "Max. Dateigröße (MB)",
-    "maxFileSizeDescription": "0 = unbegrenzt. Größere Dateien werden nicht synchronisiert."
+    "maxFileSizeDescription": "0 = unbegrenzt. Größere Dateien werden nicht synchronisiert.",
+    "updateSettings": "Updates",
+    "checkUpdatesOnStartup": "Beim Start nach Updates suchen",
+    "checkUpdatesOnStartupDescription": "Automatisch nach neuen Versionen suchen, wenn die App startet",
+    "autoInstallUpdates": "Updates automatisch installieren",
+    "autoInstallUpdatesDescription": "Updates automatisch herunterladen und installieren, ohne zu fragen"
   },
   "about": {
     "homepage": "Startseite",

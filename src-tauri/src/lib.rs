@@ -8,6 +8,8 @@ use tauri::{
     AppHandle, Emitter, Manager, RunEvent,
 };
 use tauri_plugin_deep_link::DeepLinkExt;
+use tauri_plugin_notification::NotificationExt;
+use tauri_plugin_updater::UpdaterExt;
 use tokio::sync::OnceCell;
 
 use crate::commands::{show_add_drive_window_impl, show_main_window, show_settings_window_impl};
@@ -76,7 +78,95 @@ async fn init_sync_service(app: AppHandle) -> anyhow::Result<()> {
     app.manage(AppStateHandle);
 
     tracing::info!(target: "main", "Sync service started");
+
+    // Spawn auto-update check after a delay
+    let app_handle_clone = app.clone();
+    spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        spawn_auto_update_check(app_handle_clone).await;
+    });
+
     Ok(())
+}
+
+/// Check for available updates
+async fn check_for_updates(app_handle: &AppHandle) -> anyhow::Result<Option<tauri_plugin_updater::Update>> {
+    let updater = app_handle
+        .updater()
+        .map_err(|e| anyhow::anyhow!("Failed to get updater: {}", e))?;
+    updater
+        .check()
+        .await
+        .map_err(|e| anyhow::anyhow!("Update check failed: {}", e))
+}
+
+/// Send a system notification about an update
+fn send_update_notification(app_handle: &AppHandle, title: &str, body: &str) {
+    if let Err(e) = app_handle.notification().builder()
+        .title(title)
+        .body(body)
+        .show()
+    {
+        tracing::error!(target: "updater", "Failed to send notification: {}", e);
+    }
+}
+
+/// Spawn the automatic update check on startup
+async fn spawn_auto_update_check(app_handle: AppHandle) {
+    if !ConfigManager::get().check_updates_on_startup() {
+        tracing::info!(target: "updater", "Auto update check disabled");
+        return;
+    }
+
+    tracing::info!(target: "updater", "Checking for updates...");
+    match check_for_updates(&app_handle).await {
+        Ok(Some(update)) => {
+            tracing::info!(target: "updater", "Update available: {}", update.version);
+            if ConfigManager::get().auto_install_updates() {
+                let mut downloaded = 0u64;
+                if let Err(e) = update
+                    .download_and_install(
+                        |chunk_length, content_length| {
+                            downloaded += chunk_length as u64;
+                            if let Some(total) = content_length {
+                                tracing::debug!(target: "updater", "Downloaded {} / {} bytes", downloaded, total);
+                            }
+                        },
+                        || {
+                            tracing::info!(target: "updater", "Update download finished");
+                        },
+                    )
+                    .await
+                {
+                    tracing::error!(target: "updater", "Failed to auto-install update: {}", e);
+                    send_update_notification(
+                        &app_handle,
+                        "Update failed",
+                        &format!("Failed to install update: {}", e),
+                    );
+                } else {
+                    tracing::info!(target: "updater", "Update installed successfully");
+                    send_update_notification(
+                        &app_handle,
+                        "Update ready",
+                        "Click to restart and apply the update.",
+                    );
+                }
+            } else {
+                send_update_notification(
+                    &app_handle,
+                    "Update available",
+                    &format!("Version {} is available. Open Settings → About to install.", update.version),
+                );
+            }
+        }
+        Ok(None) => {
+            tracing::info!(target: "updater", "No update available");
+        }
+        Err(e) => {
+            tracing::error!(target: "updater", "Failed to check for updates: {}", e);
+        }
+    }
 }
 
 pub struct AppStateHandle;
@@ -272,6 +362,8 @@ pub fn run() {
             commands::set_fast_popup_launch,
             commands::get_general_settings,
             commands::set_heartbeat_interval,
+            commands::set_check_updates_on_startup,
+            commands::set_auto_install_updates,
             commands::set_log_to_file,
             commands::set_log_level,
             commands::set_log_max_files,

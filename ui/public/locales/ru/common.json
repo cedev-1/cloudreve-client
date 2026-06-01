@@ -114,7 +114,12 @@
     "heartbeatIntervalDescription": "Частота проверки подключения (секунды)",
     "driveSettingsTitle": "Настройки диска",
     "maxFileSize": "Макс. размер файла (МБ)",
-    "maxFileSizeDescription": "0 = без ограничений. Файлы больше этого размера не будут синхронизированы."
+    "maxFileSizeDescription": "0 = без ограничений. Файлы больше этого размера не будут синхронизированы.",
+    "updateSettings": "Обновления",
+    "checkUpdatesOnStartup": "Проверять обновления при запуске",
+    "checkUpdatesOnStartupDescription": "Автоматически проверять новые версии при запуске приложения",
+    "autoInstallUpdates": "Автоматически устанавливать обновления",
+    "autoInstallUpdatesDescription": "Автоматически загружать и устанавливать обновления без запроса"
   },
   "about": {
     "homepage": "Домашняя страница",
