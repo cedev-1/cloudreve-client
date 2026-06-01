@@ -71,6 +71,7 @@ pub struct MountStatusFlags(u8);
 impl MountStatusFlags {
     const CREDENTIAL_EXPIRED: u8 = 1 << 0;
     const EVENT_PUSH_SUBSCRIBED: u8 = 1 << 1;
+    const INITIAL_SYNC_COMPLETED: u8 = 1 << 2;
 
     pub fn new() -> Self {
         Self(0)
@@ -102,6 +103,18 @@ impl MountStatusFlags {
 
     pub fn bits(&self) -> u8 {
         self.0
+    }
+
+    pub fn is_initial_sync_completed(&self) -> bool {
+        self.0 & Self::INITIAL_SYNC_COMPLETED != 0
+    }
+
+    pub fn set_initial_sync_completed(&mut self, completed: bool) {
+        if completed {
+            self.0 |= Self::INITIAL_SYNC_COMPLETED;
+        } else {
+            self.0 &= !Self::INITIAL_SYNC_COMPLETED;
+        }
     }
 
     pub fn from_bits(bits: u8) -> Self {
@@ -320,8 +333,13 @@ impl Mount {
                             tracing::warn!(target: "drive::mounts", error = %e, "Failed to re-enqueue offline tasks");
                         }
                         let _lock = mount_clone.sync_lock.lock().await;
-                        if let Err(e) = mount_clone.perform_full_sync().await {
-                            tracing::error!(target: "drive::mounts", error = %e, "Full sync failed");
+                        match mount_clone.perform_full_sync().await {
+                            Ok(()) => {
+                                mount_clone.set_initial_sync_completed(true).await;
+                            }
+                            Err(e) => {
+                                tracing::error!(target: "drive::mounts", error = %e, "Full sync failed");
+                            }
                         }
                     });
                 }
@@ -486,6 +504,11 @@ impl Mount {
     pub async fn set_credential_expired(&self, expired: bool) {
         let mut flags = self.status_flags.lock().await;
         flags.set_credential_expired(expired);
+    }
+
+    pub async fn set_initial_sync_completed(&self, completed: bool) {
+        let mut flags = self.status_flags.lock().await;
+        flags.set_initial_sync_completed(completed);
     }
 
     pub fn get_drive_props(&self) -> Result<Option<crate::inventory::DriveProps>> {

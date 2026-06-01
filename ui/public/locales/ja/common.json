@@ -45,6 +45,7 @@
     "recent": "最近",
     "syncingStatus": "{{count}} 個のファイルを同期中...",
     "upToDate": "ファイルは最新です。",
+    "preparingSync": "同期の準備中...",
     "waiting": "待機中...",
     "processing": "処理中...",
     "offline": "オフライン — 保留中の変更は再接続時に同期されます",

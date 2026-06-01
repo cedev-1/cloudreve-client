@@ -45,6 +45,7 @@
     "recent": "Reciente",
     "syncingStatus": "Sincronizando {{count}} archivo(s)...",
     "upToDate": "Sus archivos están actualizados.",
+    "preparingSync": "Preparando sincronización...",
     "waiting": "Esperando...",
     "processing": "Procesando...",
     "offline": "Sin conexión — los cambios pendientes se sincronizarán al reconectar",

@@ -45,6 +45,7 @@
     "recent": "最近",
     "syncingStatus": "正在同步 {{count}} 个文件...",
     "upToDate": "文件已是最新。",
+    "preparingSync": "正在准备同步...",
     "waiting": "等待中...",
     "processing": "处理中...",
     "offline": "离线 — 待处理的更改将在重新连接时同步",

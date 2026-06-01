@@ -40,6 +40,7 @@ export interface StatusSummary {
   drives: DriveConfig[];
   active_tasks: TaskWithProgress[];
   finished_tasks: TaskRecord[];
+  has_ever_synced?: boolean;
 }
 
 export interface FileIconResponse {

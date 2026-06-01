@@ -17,6 +17,8 @@ pub struct StatusSummary {
     pub active_tasks: Vec<TaskWithProgress>,
     /// Recently finished tasks (completed/failed/cancelled)
     pub finished_tasks: Vec<TaskRecord>,
+    /// Whether at least one drive has completed its initial full sync
+    pub has_ever_synced: bool,
 }
 
 /// A task record with optional live progress information

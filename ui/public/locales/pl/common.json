@@ -45,6 +45,7 @@
     "recent": "Ostatnie",
     "syncingStatus": "Synchronizacja {{count}} plik(ów)...",
     "upToDate": "Twoje pliki są aktualne.",
+    "preparingSync": "Przygotowywanie synchronizacji...",
     "waiting": "Oczekiwanie...",
     "processing": "Przetwarzanie...",
     "offline": "Offline — oczekujące zmiany zostaną zsynchronizowane po ponownym połączeniu",

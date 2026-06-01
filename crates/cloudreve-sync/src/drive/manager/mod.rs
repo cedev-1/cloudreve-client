@@ -507,11 +507,15 @@ impl DriveManager {
     /// * `drive_id` - Optional drive ID to filter tasks. If None, returns tasks from all drives.
     ///                Note: drives list always returns all drives regardless of this filter.
     pub async fn get_status_summary(&self, drive_id: Option<&str>) -> Result<StatusSummary> {
-        // Get all drive configs (unfiltered)
+        // Get all drive configs (unfiltered) and check if any has completed initial sync
         let read_guard = self.drives.read().await;
         let mut drives = Vec::with_capacity(read_guard.len());
+        let mut has_ever_synced = false;
         for mount in read_guard.values() {
             drives.push(mount.get_config().await);
+            if mount.get_status_flags().await.is_initial_sync_completed() {
+                has_ever_synced = true;
+            }
         }
 
         // Query recent tasks from inventory (filtered by drive_id if provided)
@@ -550,10 +554,13 @@ impl DriveManager {
             })
             .collect();
 
+        let finished_tasks = recent_tasks.finished;
+
         Ok(StatusSummary {
             drives,
             active_tasks,
-            finished_tasks: recent_tasks.finished,
+            finished_tasks,
+            has_ever_synced,
         })
     }
 

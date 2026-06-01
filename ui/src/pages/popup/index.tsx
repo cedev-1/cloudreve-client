@@ -10,6 +10,7 @@ import {
   CheckCircle as CheckCircleIcon,
   Refresh as RefreshIcon,
   CloudOff as CloudOffIcon,
+  Sync as SyncIcon,
 } from "@mui/icons-material";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
@@ -289,6 +290,13 @@ export default function Popup() {
               {t("popup.syncingStatus", "Syncing {{count}} file(s)...", {
                 count: summary?.active_tasks.length ?? 0,
               })}
+            </Typography>
+          </>
+        ) : !summary?.has_ever_synced && (summary?.drives.length ?? 0) > 0 ? (
+          <>
+            <SyncIcon sx={{ fontSize: 18, color: "text.secondary" }} />
+            <Typography variant="caption" color="text.secondary">
+              {t("popup.preparingSync", "Preparing sync...")}
             </Typography>
           </>
         ) : (
