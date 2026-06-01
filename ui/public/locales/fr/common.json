@@ -101,6 +101,9 @@
     "ignorePatternsDescription": "Saisissez des motifs de type gitignore, un par ligne. Les fichiers correspondants ne seront pas synchronisés.",
     "ignorePatternsPlaceholder": "*.log\nnode_modules\n*.tmp",
     "ignorePatternsError": "Motifs invalides : {{message}}",
+    "driveSettingsTitle": "Paramètres du drive",
+    "maxFileSize": "Taille max du fichier (Mo)",
+    "maxFileSizeDescription": "0 = illimité. Les fichiers plus gros ne seront pas synchronisés.",
     "save": "Enregistrer",
     "cancel": "Annuler",
     "driveStatus": {

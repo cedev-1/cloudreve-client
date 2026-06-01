@@ -109,9 +109,12 @@
       "offline": "오프라인",
       "credentialExpired": "자격 증명 만료됨"
     },
-    "networkSettings": "Network",
-    "heartbeatInterval": "Heartbeat interval",
-    "heartbeatIntervalDescription": "How often to check server connectivity (seconds)"
+    "networkSettings": "네트워크",
+    "heartbeatInterval": "하트비트 간격",
+    "heartbeatIntervalDescription": "서버 연결 확인 주기(초)",
+    "driveSettingsTitle": "드라이브 설정",
+    "maxFileSize": "최대 파일 크기 (MB)",
+    "maxFileSizeDescription": "0 = 무제한. 이 크기보다 큰 파일은 동기화되지 않습니다."
   },
   "about": {
     "homepage": "홈페이지",

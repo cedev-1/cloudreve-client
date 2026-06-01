@@ -101,6 +101,9 @@
     "ignorePatternsDescription": "Enter gitignore-style patterns, one per line. Matching files will not be synced.",
     "ignorePatternsPlaceholder": "*.log\nnode_modules\n*.tmp",
     "ignorePatternsError": "Invalid patterns: {{message}}",
+    "driveSettingsTitle": "Drive Settings",
+    "maxFileSize": "Max file size (MB)",
+    "maxFileSizeDescription": "0 = unlimited. Files larger than this will not be synced.",
     "save": "Save",
     "cancel": "Cancel",
     "driveStatus": {

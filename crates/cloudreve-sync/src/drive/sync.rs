@@ -167,6 +167,17 @@ pub async fn full_sync(mount: &Mount, local_root: &PathBuf, remote_path: &str) -
                 if should_ignore(mount, &local_path).await {
                     continue;
                 }
+                if let Ok(meta) = std::fs::metadata(&local_path) {
+                    if !mount.is_file_size_allowed(meta.len()).await {
+                        tracing::debug!(
+                            target: "drive::sync",
+                            path = %rel.display(),
+                            size = meta.len(),
+                            "Skipping upload: file exceeds size limit"
+                        );
+                        continue;
+                    }
+                }
                 mount.task_queue.enqueue(TaskPayload::upload(local_path)).await?;
             }
             // New remote file → download
@@ -175,6 +186,15 @@ pub async fn full_sync(mount: &Mount, local_root: &PathBuf, remote_path: &str) -
                     continue;
                 }
                 if let Some(rf) = remote_map.get(rel) {
+                    if !mount.is_file_size_allowed(rf.size as u64).await {
+                        tracing::debug!(
+                            target: "drive::sync",
+                            path = %rel.display(),
+                            size = rf.size,
+                            "Skipping download: file exceeds size limit"
+                        );
+                        continue;
+                    }
                     mount.task_queue.enqueue(
                         TaskPayload::download(local_path).with_totals(0, rf.size)
                     ).await?;
@@ -200,6 +220,15 @@ pub async fn full_sync(mount: &Mount, local_root: &PathBuf, remote_path: &str) -
                     // Check if remote was modified (etag changed)
                     let remote_etag = rf.primary_entity.clone().unwrap_or_default();
                     if !remote_etag.is_empty() && !db_entry.etag.is_empty() && remote_etag != db_entry.etag {
+                        if !mount.is_file_size_allowed(rf.size as u64).await {
+                            tracing::debug!(
+                                target: "drive::sync",
+                                path = %rel.display(),
+                                size = rf.size,
+                                "Skipping download: file exceeds size limit"
+                            );
+                            continue;
+                        }
                         tracing::info!(
                             target: "drive::sync",
                             path = %rel.display(),
@@ -214,6 +243,15 @@ pub async fn full_sync(mount: &Mount, local_root: &PathBuf, remote_path: &str) -
                         // Check if local file was modified (size changed)
                         let local_size = meta.len() as i64;
                         if local_size != db_entry.size {
+                            if !mount.is_file_size_allowed(local_size as u64).await {
+                                tracing::debug!(
+                                    target: "drive::sync",
+                                    path = %rel.display(),
+                                    size = local_size,
+                                    "Skipping upload: file exceeds size limit"
+                                );
+                                continue;
+                            }
                             tracing::info!(
                                 target: "drive::sync",
                                 path = %rel.display(),

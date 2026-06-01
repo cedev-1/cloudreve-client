@@ -140,6 +140,7 @@ pub struct DownloadTask<'a> {
     cancel_token: CancellationToken,
     progress_map: Arc<DashMap<String, TaskProgress>>,
     event_blocker: EventBlocker,
+    max_file_size_mb: u64,
 }
 
 impl<'a> DownloadTask<'a> {
@@ -152,6 +153,7 @@ impl<'a> DownloadTask<'a> {
         remote_base: String,
         progress_map: Arc<DashMap<String, TaskProgress>>,
         event_blocker: EventBlocker,
+        max_file_size_mb: u64,
     ) -> Self {
         Self {
             inventory,
@@ -165,6 +167,7 @@ impl<'a> DownloadTask<'a> {
             cancel_token: CancellationToken::new(),
             progress_map,
             event_blocker,
+            max_file_size_mb,
         }
     }
 
@@ -228,6 +231,22 @@ impl<'a> DownloadTask<'a> {
             }
             Err(e) => return Err(anyhow::Error::from(e).context("failed to get remote file info")),
         };
+
+        // Check if the remote file exceeds the drive's size limit
+        if self.max_file_size_mb > 0 {
+            let max_bytes = self.max_file_size_mb * 1024 * 1024;
+            if file_info.size > 0 && (file_info.size as u64) > max_bytes {
+                info!(
+                    target: "tasks::download",
+                    task_id = %self.task.task_id,
+                    path = %local_path.display(),
+                    size = file_info.size,
+                    limit_mb = self.max_file_size_mb,
+                    "Skipping download: file exceeds size limit"
+                );
+                return Ok(());
+            }
+        }
 
         // If the local inventory already tracks this exact remote entity (same etag),
         // the file is already in sync — skip the download to avoid a needless

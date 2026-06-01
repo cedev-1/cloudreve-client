@@ -109,6 +109,7 @@ pub async fn add_drive(
         enabled: true,
         user_id: config.user_id,
         ignore_patterns: Vec::new(),
+        max_file_size_mb: 3072,
         sse_client_id,
         extra: Default::default(),
     };
@@ -148,6 +149,25 @@ pub async fn set_ignore_patterns(
     app_state.drive_manager.update_ignore_patterns(&drive_id, patterns).await.map_err(|e| e.to_string())?;
     app_state.drive_manager.persist().await.map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[tauri::command]
+pub async fn get_drive_max_file_size(
+    state: State<'_, AppStateHandle>,
+    drive_id: String,
+) -> CommandResult<u64> {
+    let app_state = state.get().ok_or_else(|| "App not yet initialized".to_string())?;
+    app_state.drive_manager.get_drive_max_file_size(&drive_id).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn set_drive_max_file_size(
+    state: State<'_, AppStateHandle>,
+    drive_id: String,
+    max_mb: u64,
+) -> CommandResult<()> {
+    let app_state = state.get().ok_or_else(|| "App not yet initialized".to_string())?;
+    app_state.drive_manager.set_drive_max_file_size(&drive_id, max_mb).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]

@@ -109,9 +109,12 @@
       "offline": "Offline",
       "credentialExpired": "Dane uwierzytelniające wygasły"
     },
-    "networkSettings": "Network",
-    "heartbeatInterval": "Heartbeat interval",
-    "heartbeatIntervalDescription": "How often to check server connectivity (seconds)"
+    "networkSettings": "Sieć",
+    "heartbeatInterval": "Interwał heartbeat",
+    "heartbeatIntervalDescription": "Częstotliwość sprawdzania łączności (sekundy)",
+    "driveSettingsTitle": "Ustawienia dysku",
+    "maxFileSize": "Maks. rozmiar pliku (MB)",
+    "maxFileSizeDescription": "0 = bez limitu. Pliki większe nie będą synchronizowane."
   },
   "about": {
     "homepage": "Strona główna",

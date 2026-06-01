@@ -59,6 +59,7 @@ export default function DrivesSection() {
   const isFetchingRef = useRef(false);
   const [editingDriveId, setEditingDriveId] = useState<string | null>(null);
   const [patternsText, setPatternsText] = useState("");
+  const [maxFileSize, setMaxFileSize] = useState<number>(3072);
   const [saving, setSaving] = useState(false);
   const [patternsError, setPatternsError] = useState<string | null>(null);
 
@@ -141,7 +142,9 @@ export default function DrivesSection() {
   const handleEditIgnorePatterns = async (driveId: string) => {
     try {
       const patterns = await invoke<string[]>("get_ignore_patterns", { driveId });
+      const maxMb = await invoke<number>("get_drive_max_file_size", { driveId });
       setPatternsText(patterns.join("\n"));
+      setMaxFileSize(Number(maxMb) || 3072);
       setPatternsError(null);
       setEditingDriveId(driveId);
     } catch (error) {
@@ -161,6 +164,10 @@ export default function DrivesSection() {
       await invoke("set_ignore_patterns", {
         driveId: editingDriveId,
         patterns,
+      });
+      await invoke("set_drive_max_file_size", {
+        driveId: editingDriveId,
+        maxMb: Math.max(0, Math.floor(maxFileSize)),
       });
       setEditingDriveId(null);
     } catch (error) {
@@ -454,7 +461,7 @@ export default function DrivesSection() {
         maxWidth="sm"
         fullWidth
       >
-        <DialogTitle>{t("settings.ignorePatternsTitle")}</DialogTitle>
+        <DialogTitle>{t("settings.driveSettingsTitle", "Drive Settings")}</DialogTitle>
         <DialogContent>
           <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
             {t("settings.ignorePatternsDescription")}
@@ -467,14 +474,29 @@ export default function DrivesSection() {
           <TextField
             multiline
             fullWidth
-            rows={8}
+            rows={6}
             value={patternsText}
             onChange={(e) => setPatternsText(e.target.value)}
             placeholder={t("settings.ignorePatternsPlaceholder")}
             variant="outlined"
+            sx={{ mb: 2 }}
             slotProps={{
               input: {
                 sx: { fontFamily: "monospace", fontSize: 13 },
+              },
+            }}
+          />
+          <TextField
+            type="number"
+            fullWidth
+            label={t("settings.maxFileSize", "Max file size (MB)")}
+            value={maxFileSize}
+            onChange={(e) => setMaxFileSize(Number(e.target.value))}
+            helperText={t("settings.maxFileSizeDescription", "0 = unlimited. Files larger than this will not be synced.")}
+            variant="outlined"
+            slotProps={{
+              input: {
+                inputProps: { min: 0 },
               },
             }}
           />

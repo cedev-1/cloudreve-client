@@ -109,9 +109,12 @@
       "offline": "Не в сети",
       "credentialExpired": "Учётные данные истекли"
     },
-    "networkSettings": "Network",
-    "heartbeatInterval": "Heartbeat interval",
-    "heartbeatIntervalDescription": "How often to check server connectivity (seconds)"
+    "networkSettings": "Сеть",
+    "heartbeatInterval": "Интервал heartbeat",
+    "heartbeatIntervalDescription": "Частота проверки подключения (секунды)",
+    "driveSettingsTitle": "Настройки диска",
+    "maxFileSize": "Макс. размер файла (МБ)",
+    "maxFileSizeDescription": "0 = без ограничений. Файлы больше этого размера не будут синхронизированы."
   },
   "about": {
     "homepage": "Домашняя страница",

@@ -39,6 +39,10 @@ pub struct DriveConfig {
     #[serde(default)]
     pub ignore_patterns: Vec<String>,
 
+    /// Maximum file size to sync in megabytes (0 = unlimited).
+    #[serde(default = "default_max_file_size_mb")]
+    pub max_file_size_mb: u64,
+
     /// Stable UUID used as SSE client identifier for event subscription.
     /// Persisted so the server can resume event buffering across reconnects.
     #[serde(default)]
@@ -46,6 +50,10 @@ pub struct DriveConfig {
 
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
+}
+
+fn default_max_file_size_mb() -> u64 {
+    3072
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -199,6 +207,7 @@ impl Mount {
             config.sync_path.clone(),
             config.remote_path.clone(),
             event_blocker.clone(),
+            config.max_file_size_mb,
         ).await;
         let id = config.id.clone();
 
@@ -381,6 +390,18 @@ impl Mount {
                     if ignored {
                         continue;
                     }
+                    // Check file size against drive limit before uploading
+                    if let Ok(local_meta) = std::fs::metadata(&path) {
+                        if !self.is_file_size_allowed(local_meta.len()).await {
+                            tracing::debug!(
+                                target: "drive::mounts",
+                                path = %path.display(),
+                                size = local_meta.len(),
+                                "Skipping upload: file exceeds size limit"
+                            );
+                            continue;
+                        }
+                    }
                     // Check inventory DB to avoid re-uploading files we just downloaded.
                     // If the local file size matches the DB entry, the file hasn't been
                     // modified locally — it was likely written by a download task.
@@ -491,6 +512,17 @@ impl Mount {
 
     pub async fn get_config(&self) -> DriveConfig {
         self.config.read().await.clone()
+    }
+
+    /// Check if a file size (in bytes) is within the drive's configured limit.
+    /// Returns true if the file should be synced (within limit or limit is 0).
+    pub async fn is_file_size_allowed(&self, size_bytes: u64) -> bool {
+        let max_mb = self.config.read().await.max_file_size_mb;
+        if max_mb == 0 {
+            return true; // unlimited
+        }
+        let max_bytes = max_mb * 1024 * 1024;
+        size_bytes <= max_bytes
     }
 
     pub async fn get_sync_path(&self) -> PathBuf {

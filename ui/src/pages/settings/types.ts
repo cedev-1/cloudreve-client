@@ -7,8 +7,9 @@ export interface DriveInfo {
   raw_icon_path?: string;
   enabled: boolean;
   user_id: string;
-  remote_path: string
+  remote_path: string;
   status: DriveStatus;
+  max_file_size_mb?: number;
   capacity?: CapacitySummary;
 }
 

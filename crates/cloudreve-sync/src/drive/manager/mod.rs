@@ -440,6 +440,29 @@ impl DriveManager {
         mount.update_ignore_patterns(patterns).await
     }
 
+    /// Get the max file size limit (in MB) for a drive.
+    pub async fn get_drive_max_file_size(&self, id: &str) -> Result<u64> {
+        let read_guard = self.drives.read().await;
+        let mount = read_guard
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("Drive not found: {}", id))?;
+        let config = mount.config.read().await;
+        Ok(config.max_file_size_mb)
+    }
+
+    /// Update the max file size limit (in MB) for a drive.
+    pub async fn set_drive_max_file_size(&self, id: &str, max_mb: u64) -> Result<()> {
+        let read_guard = self.drives.read().await;
+        let mount = read_guard
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("Drive not found: {}", id))?;
+        let mut config = mount.config.write().await;
+        config.max_file_size_mb = max_mb;
+        drop(config);
+        drop(read_guard);
+        self.persist().await
+    }
+
     /// Placeholder: Enable/disable a drive
     pub async fn set_drive_enabled(&self, _id: &str, _enabled: bool) -> Result<()> {
         Err(anyhow::anyhow!("Not implemented"))

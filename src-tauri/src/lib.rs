@@ -254,6 +254,8 @@ pub fn run() {
             commands::remove_drive,
             commands::get_ignore_patterns,
             commands::set_ignore_patterns,
+            commands::get_drive_max_file_size,
+            commands::set_drive_max_file_size,
             commands::get_sync_status,
             commands::get_status_summary,
             commands::get_drives_info,

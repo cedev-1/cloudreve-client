@@ -109,9 +109,12 @@
       "offline": "離線",
       "credentialExpired": "憑證已過期"
     },
-    "networkSettings": "Network",
-    "heartbeatInterval": "Heartbeat interval",
-    "heartbeatIntervalDescription": "How often to check server connectivity (seconds)"
+    "networkSettings": "網路",
+    "heartbeatInterval": "心跳間隔",
+    "heartbeatIntervalDescription": "檢查伺服器連線頻率（秒）",
+    "driveSettingsTitle": "磁碟機設定",
+    "maxFileSize": "最大檔案大小 (MB)",
+    "maxFileSizeDescription": "0 = 無限制。大於此大小的檔案將不會被同步。"
   },
   "about": {
     "homepage": "首頁",

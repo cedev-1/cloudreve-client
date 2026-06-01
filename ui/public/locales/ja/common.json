@@ -109,9 +109,12 @@
       "offline": "オフライン",
       "credentialExpired": "認証期限切れ"
     },
-    "networkSettings": "Network",
-    "heartbeatInterval": "Heartbeat interval",
-    "heartbeatIntervalDescription": "How often to check server connectivity (seconds)"
+    "networkSettings": "ネットワーク",
+    "heartbeatInterval": "ハートビート間隔",
+    "heartbeatIntervalDescription": "サーバー接続確認の間隔（秒）",
+    "driveSettingsTitle": "ドライブ設定",
+    "maxFileSize": "最大ファイルサイズ (MB)",
+    "maxFileSizeDescription": "0 = 無制限。これより大きいファイルは同期されません。"
   },
   "about": {
     "homepage": "ホームページ",

@@ -109,9 +109,12 @@
       "offline": "离线",
       "credentialExpired": "凭证已过期"
     },
-    "networkSettings": "Network",
-    "heartbeatInterval": "Heartbeat interval",
-    "heartbeatIntervalDescription": "How often to check server connectivity (seconds)"
+    "networkSettings": "网络",
+    "heartbeatInterval": "心跳间隔",
+    "heartbeatIntervalDescription": "检查服务器连接频率（秒）",
+    "driveSettingsTitle": "驱动器设置",
+    "maxFileSize": "最大文件大小 (MB)",
+    "maxFileSizeDescription": "0 = 无限制。大于此大小的文件将不会被同步。"
   },
   "about": {
     "homepage": "主页",

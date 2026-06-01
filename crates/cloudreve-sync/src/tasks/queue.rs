@@ -54,6 +54,7 @@ pub struct TaskQueue {
     pub sync_path: PathBuf,
     pub remote_base: String,
     pub event_blocker: EventBlocker,
+    pub max_file_size_mb: u64,
     config: TaskQueueConfig,
     semaphore: Arc<Semaphore>,
     command_tx: UnboundedSender<QueueCommand>,
@@ -77,6 +78,7 @@ impl TaskQueue {
         sync_path: PathBuf,
         remote_base: String,
         event_blocker: EventBlocker,
+        max_file_size_mb: u64,
     ) -> Arc<Self> {
         let drive_id = drive_id.into();
         let max_concurrent = config.max_concurrent.max(1);
@@ -90,6 +92,7 @@ impl TaskQueue {
             sync_path,
             remote_base,
             event_blocker,
+            max_file_size_mb,
             config: sanitized_config,
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
             command_tx,
@@ -702,6 +705,7 @@ impl TaskQueue {
                     self.remote_base.clone(),
                     Arc::clone(&self.progress),
                     self.event_blocker.clone(),
+                    self.max_file_size_mb,
                 );
 
                 task_executor.execute().await?;
