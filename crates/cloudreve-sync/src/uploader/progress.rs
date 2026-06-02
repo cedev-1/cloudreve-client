@@ -195,8 +195,7 @@ impl SpeedCalculator {
         self.samples.retain(|(t, _)| *t >= cutoff);
 
         // Calculate speed from oldest sample in window
-        if self.samples.len() >= 2 {
-            let (oldest_time, oldest_bytes) = self.samples.first().unwrap();
+        if let Some((oldest_time, oldest_bytes)) = self.samples.first() {
             let elapsed = now.duration_since(*oldest_time);
             if elapsed.as_millis() > 0 {
                 let bytes_diff = total_bytes.saturating_sub(*oldest_bytes);

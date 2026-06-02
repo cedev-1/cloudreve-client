@@ -48,7 +48,11 @@ impl DriveManager {
                         continue;
                     }
                     spawn(async move {
-                        let first = paths.first().unwrap().to_str().unwrap_or("");
+                        let Some(first) = paths.first() else {
+                            tracing::error!(target: "drive::manager", "SyncNow paths list unexpectedly empty after check");
+                            return;
+                        };
+                        let first = first.to_str().unwrap_or("");
                         if let Some(drive) = manager.search_drive_by_child_path(first).await {
                             let _ = drive.command_tx.send(MountCommand::Sync {
                                 local_paths: paths,

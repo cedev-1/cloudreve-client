@@ -106,7 +106,7 @@ pub async fn full_sync(mount: &Mount, local_root: &PathBuf, remote_path: &str) -
     let local_files = walk_local(local_root)?;
     let local_set: HashSet<PathBuf> = local_files
         .iter()
-        .map(|p| p.strip_prefix(local_root).unwrap().to_path_buf())
+        .filter_map(|p| p.strip_prefix(local_root).ok().map(|r| r.to_path_buf()))
         .collect();
 
     // 3. DB state (last known synced state)

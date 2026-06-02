@@ -184,7 +184,9 @@ impl<'a> UploadTask<'a> {
             self.sync_path.clone(),
             self.remote_base.clone(),
         ).context("failed to compute remote URI")?.to_string();
-        let etag = self.inventory_meta.as_ref().unwrap().etag.clone();
+        let etag = self.inventory_meta.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("inventory metadata required for clear_file_content but none found"))?
+            .etag.clone();
         let res = self.cr_client.update_file(&FileUpdateService { uri, previous: Some(etag) }, Bytes::new()).await;
         match res {
             Ok(file) => self.file_uploaded(&file),
@@ -193,7 +195,8 @@ impl<'a> UploadTask<'a> {
     }
 
     async fn upload_file_with_uploader(&mut self) -> Result<()> {
-        let local_info = self.local_info.as_ref().unwrap();
+        let local_info = self.local_info.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("local file info not available — file may have been deleted before upload started"))?;
         let file_size = local_info.file_size;
         let last_modified = local_info.last_modified;
         let is_new_file = self.inventory_meta.is_none();
@@ -221,7 +224,9 @@ impl<'a> UploadTask<'a> {
             remote_uri: uri,
             file_size,
             mime_type: None,
-            last_modified: last_modified.map(|t| t.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as i64),
+            last_modified: last_modified
+                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as i64),
             overwrite: !is_new_file || self.task.payload.force_override,
             previous_version,
             task_id: self.task.task_id.clone(),

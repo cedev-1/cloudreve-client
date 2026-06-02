@@ -96,7 +96,7 @@ impl Uploader {
         let http_client = HttpClient::builder()
             .connect_timeout(config.request_timeout)
             .build()
-            .expect("Failed to create HTTP client");
+            .expect("Failed to create reqwest HTTP client — this should never fail unless the system is critically out of memory or TLS configuration is broken");
 
         Self {
             cr_client,

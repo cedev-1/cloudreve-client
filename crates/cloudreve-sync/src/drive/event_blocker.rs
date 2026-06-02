@@ -120,7 +120,7 @@ impl EventBlocker {
             kind: NormalizedEventKind::from(kind),
             path,
         };
-        let mut blocked = self.blocked.lock().unwrap();
+        let mut blocked = self.blocked.lock().expect("EventBlocker mutex poisoned — another thread panicked while holding the lock");
         let entry = blocked.entry(key).or_insert_with(|| BlockEntry::count(0));
         // Extend the deadline if one already exists.
         let new_deadline = Instant::now() + duration;
@@ -136,7 +136,7 @@ impl EventBlocker {
             kind: NormalizedEventKind::from(kind),
             path,
         };
-        let mut blocked = self.blocked.lock().unwrap();
+        let mut blocked = self.blocked.lock().expect("EventBlocker mutex poisoned — another thread panicked while holding the lock");
         let entry = blocked.entry(key).or_insert_with(|| BlockEntry::count(0));
         entry.count += count;
     }
@@ -154,7 +154,7 @@ impl EventBlocker {
             path: path.clone(),
         };
 
-        let mut blocked = self.blocked.lock().unwrap();
+        let mut blocked = self.blocked.lock().expect("EventBlocker mutex poisoned — another thread panicked while holding the lock");
 
         if let Some(entry) = blocked.get_mut(&key) {
             if entry.try_block() {
@@ -203,13 +203,13 @@ impl EventBlocker {
 
     /// Clears all registered event blocks.
     pub fn clear(&self) {
-        let mut blocked = self.blocked.lock().unwrap();
+        let mut blocked = self.blocked.lock().expect("EventBlocker mutex poisoned — another thread panicked while holding the lock");
         blocked.clear();
     }
 
     /// Returns the number of currently registered event blocks.
     pub fn len(&self) -> usize {
-        let blocked = self.blocked.lock().unwrap();
+        let blocked = self.blocked.lock().expect("EventBlocker mutex poisoned — another thread panicked while holding the lock");
         blocked.len()
     }
 

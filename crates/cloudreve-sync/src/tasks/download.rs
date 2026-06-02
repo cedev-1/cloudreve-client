@@ -58,12 +58,11 @@ impl DownloadProgressTracker {
         let now = Instant::now();
 
         let speed = {
-            let mut samples = self.samples.lock().unwrap();
+            let mut samples = self.samples.lock().expect("DownloadProgressTracker mutex poisoned — another thread panicked while holding the lock");
             samples.push((now, downloaded));
             let cutoff = now - self.window_duration;
             samples.retain(|(t, _)| *t >= cutoff);
-            if samples.len() >= 2 {
-                let (oldest_time, oldest_bytes) = samples.first().unwrap();
+            if let Some((oldest_time, oldest_bytes)) = samples.first() {
                 let elapsed = now.duration_since(*oldest_time);
                 if elapsed.as_millis() > 0 {
                     let bytes_diff = downloaded.saturating_sub(*oldest_bytes);
