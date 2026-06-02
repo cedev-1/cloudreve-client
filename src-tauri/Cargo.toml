@@ -1,6 +1,6 @@
 [package]
 name = "cloudreve-desktop"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 description = "Cloudreve Desktop Sync Client (macOS/Linux)"
 authors = ["cloudreve"]
 edition = "2021"
