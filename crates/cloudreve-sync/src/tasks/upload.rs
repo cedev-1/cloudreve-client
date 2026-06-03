@@ -238,7 +238,41 @@ impl<'a> UploadTask<'a> {
             .with_cancel_token(self.cancel_token.clone());
         let progress = InMemoryProgressReporter::new(self.task.task_id.clone(), Arc::clone(&self.progress_map));
 
-        uploader.upload(params, progress).await.context("upload failed")?;
+        let upload_result = uploader.upload(params.clone(), progress).await;
+
+        match upload_result {
+            Err(e) if e.chain().any(|cause| {
+                matches!(
+                    cause.downcast_ref::<ApiError>(),
+                    Some(ApiError::ApiError { code, .. })
+                        if *code == ErrorCode::ObjectExisted as i32
+                )
+            }) => {
+                tracing::info!(
+                    target: "tasks::upload",
+                    task_id = %self.task.task_id,
+                    path = %self.task.payload.local_path_display(),
+                    "File already exists on server, retrying with overwrite"
+                );
+                let retry_params = UploadParams {
+                    overwrite: true,
+                    ..params
+                };
+                let retry_progress = InMemoryProgressReporter::new(
+                    self.task.task_id.clone(),
+                    Arc::clone(&self.progress_map),
+                );
+                let retry_config = UploaderConfig::default();
+                let retry_uploader = Uploader::new(
+                    self.cr_client.clone(),
+                    self.inventory.clone(),
+                    retry_config,
+                ).with_cancel_token(self.cancel_token.clone());
+                retry_uploader.upload(retry_params, retry_progress).await.context("upload failed (retry with overwrite)")?;
+            }
+            Err(e) => return Err(e).context("upload failed"),
+            Ok(()) => {}
+        }
 
         self.finalize_upload().await
     }
