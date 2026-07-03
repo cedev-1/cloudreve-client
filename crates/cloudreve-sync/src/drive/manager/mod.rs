@@ -7,7 +7,7 @@ pub use types::*;
 use crate::drive::commands::{ManagerCommand, MountCommand};
 use crate::drive::heartbeat::HeartbeatManager;
 use crate::drive::mounts::{Credentials, DriveConfig, Mount};
-use crate::EventBroadcaster;
+use crate::{EventBroadcaster, SummaryNotifier};
 use crate::inventory::InventoryDb;
 use crate::tasks::TaskProgress;
 use anyhow::{Context, Result};
@@ -26,6 +26,7 @@ pub struct DriveManager {
     pub(super) command_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<ManagerCommand>>>>,
     pub(super) processor_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     pub(super) event_broadcaster: Arc<EventBroadcaster>,
+    pub(super) summary_notifier: Arc<SummaryNotifier>,
     heartbeat_manager: HeartbeatManager,
 }
 
@@ -43,6 +44,7 @@ impl DriveManager {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let drives = Arc::new(RwLock::new(HashMap::new()));
         let heartbeat_manager = HeartbeatManager::new(drives.clone(), event_broadcaster.clone());
+        let summary_notifier = Arc::new(SummaryNotifier::new(event_broadcaster.clone()));
 
         Ok(Self {
             config_dir,
@@ -52,6 +54,7 @@ impl DriveManager {
             command_rx: Arc::new(Mutex::new(Some(command_rx))),
             processor_handle: Arc::new(Mutex::new(None)),
             event_broadcaster: event_broadcaster,
+            summary_notifier,
             heartbeat_manager,
         })
     }
@@ -190,6 +193,7 @@ impl DriveManager {
             config.clone(),
             self.inventory.clone(),
             self.command_tx.clone(),
+            self.summary_notifier.clone(),
         )
         .await;
         if let Err(e) = mount.start().await {

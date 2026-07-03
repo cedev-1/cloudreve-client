@@ -2,6 +2,7 @@ use crate::drive::commands::{ManagerCommand, MountCommand};
 use crate::drive::event_blocker::EventBlocker;
 use crate::drive::ignore::IgnoreMatcher;
 use crate::drive::sync::group_fs_events;
+use crate::events::SummaryNotifier;
 use crate::inventory::{DrivePropsUpdate, InventoryDb};
 use crate::tasks::{TaskQueue, TaskQueueConfig};
 use crate::utils::toast;
@@ -158,6 +159,7 @@ impl Mount {
         config: DriveConfig,
         inventory: Arc<InventoryDb>,
         manager_command_tx: mpsc::UnboundedSender<ManagerCommand>,
+        summary_notifier: Arc<SummaryNotifier>,
     ) -> Self {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
 
@@ -208,6 +210,7 @@ impl Mount {
             config.remote_path.clone(),
             event_blocker.clone(),
             config.max_file_size_mb,
+            summary_notifier,
         ).await;
         let id = config.id.clone();
 

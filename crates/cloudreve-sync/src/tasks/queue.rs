@@ -1,4 +1,5 @@
 use crate::drive::event_blocker::EventBlocker;
+use crate::events::SummaryNotifier;
 use crate::inventory::{InventoryDb, NewTaskRecord, TaskRecord, TaskStatus, TaskUpdate};
 use crate::tasks::download::DownloadTask;
 use crate::tasks::types::{TaskKind, TaskPayload, TaskProgress};
@@ -64,6 +65,7 @@ pub struct TaskQueue {
     shutting_down: AtomicBool,
     cancel_requested: AtomicBool,
     progress: Arc<DashMap<String, TaskProgress>>,
+    notifier: Arc<SummaryNotifier>,
     task_handles: DashMap<String, JoinHandle<()>>,
     /// Maps task_id to local_path for running tasks, used for path-based cancellation
     task_paths: DashMap<String, String>,
@@ -79,6 +81,7 @@ impl TaskQueue {
         remote_base: String,
         event_blocker: EventBlocker,
         max_file_size_mb: u64,
+        notifier: Arc<SummaryNotifier>,
     ) -> Arc<Self> {
         let drive_id = drive_id.into();
         let max_concurrent = config.max_concurrent.max(1);
@@ -102,6 +105,7 @@ impl TaskQueue {
             shutting_down: AtomicBool::new(false),
             cancel_requested: AtomicBool::new(false),
             progress: Arc::new(DashMap::new()),
+            notifier,
             task_handles: DashMap::new(),
             task_paths: DashMap::new(),
         });
@@ -179,7 +183,12 @@ impl TaskQueue {
 
         let payload = payload.with_task_id(task_id.clone());
         self.dispatch_task(task_id.clone(), payload)?;
+        self.notifier.notify();
         Ok(task_id)
+    }
+
+    pub fn notifier(&self) -> &Arc<SummaryNotifier> {
+        &self.notifier
     }
 
     pub fn list_active_tasks(&self) -> Result<Vec<TaskRecord>> {
@@ -302,6 +311,7 @@ impl TaskQueue {
                 count = count,
                 "Re-enqueued offline-waiting tasks"
             );
+            self.notifier.notify();
         }
 
         Ok(count)
@@ -351,6 +361,7 @@ impl TaskQueue {
                 count = count,
                 "Marked tasks as offline waiting"
             );
+            self.notifier.notify();
         }
 
         Ok(count)
@@ -415,6 +426,7 @@ impl TaskQueue {
                 count = cancelled_count,
                 "Cancelled tasks by path"
             );
+            self.notifier.notify();
         }
 
         Ok(cancelled_count)
@@ -526,6 +538,7 @@ impl TaskQueue {
                     );
                 }
                 queue_for_notify.cleanup_task_entry(&handle_task_id).await;
+                queue_for_notify.notifier.notify();
             }
 
             drop(permit);
@@ -587,6 +600,7 @@ impl TaskQueue {
             );
             return;
         }
+        self.notifier.notify();
 
         // Register task path for path-based cancellation
         self.task_paths
@@ -611,6 +625,7 @@ impl TaskQueue {
                         "Failed to mark task as completed"
                     );
                 }
+                self.notifier.notify();
             }
             Ok(TaskRunState::Cancelled) => {
                 if let Err(err) = self.inventory.update_task(
@@ -629,6 +644,7 @@ impl TaskQueue {
                     );
                 }
                 self.cleanup_task_entry(&task.task_id).await;
+                self.notifier.notify();
                 return;
             }
             Err(err) => {
@@ -675,6 +691,7 @@ impl TaskQueue {
                             );
                         }
                         self.cleanup_task_entry(&task.task_id).await;
+                        self.notifier.notify();
                         return;
                     }
                 }
@@ -696,6 +713,7 @@ impl TaskQueue {
                     );
                 }
                 self.cleanup_task_entry(&task.task_id).await;
+                self.notifier.notify();
                 return;
             }
         }
@@ -723,6 +741,7 @@ impl TaskQueue {
                     self.sync_path.clone(),
                     self.remote_base.clone(),
                     Arc::clone(&self.progress),
+                    Arc::clone(&self.notifier),
                 );
 
                 task_executor.execute().await?;
@@ -736,6 +755,7 @@ impl TaskQueue {
                     self.sync_path.clone(),
                     self.remote_base.clone(),
                     Arc::clone(&self.progress),
+                    Arc::clone(&self.notifier),
                     self.event_blocker.clone(),
                     self.max_file_size_mb,
                 );

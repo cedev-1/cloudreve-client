@@ -254,6 +254,7 @@ pub async fn full_sync(mount: &Mount, local_root: &PathBuf, remote_path: &str) -
                             &local_path,
                             db_entry.id,
                         );
+                        mount.task_queue.notifier().notify();
                         continue;
                     }
 

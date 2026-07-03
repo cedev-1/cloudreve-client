@@ -13,6 +13,9 @@ pub fn handle_event(app_handle: &AppHandle, event: &Event) {
         }
         Event::OpenSyncStatusWindow => handle_open_sync_status_window(app_handle),
         Event::OpenSettingsWindow => handle_open_settings_window(app_handle),
+        Event::SummaryChanged => {
+            // Forwarded to frontend via emit; the popup refetches the summary
+        }
     }
 }
 

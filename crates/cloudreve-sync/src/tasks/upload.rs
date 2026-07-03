@@ -1,5 +1,6 @@
 use std::{path::PathBuf, str::FromStr, sync::Arc, time::SystemTime};
 
+use crate::events::SummaryNotifier;
 use crate::utils::toast::send_conflict_toast;
 use crate::{
     drive::utils::local_path_to_cr_uri,
@@ -25,11 +26,16 @@ use super::types::TaskProgress;
 pub struct InMemoryProgressReporter {
     task_id: String,
     progress_map: Arc<DashMap<String, TaskProgress>>,
+    notifier: Arc<SummaryNotifier>,
 }
 
 impl InMemoryProgressReporter {
-    pub fn new(task_id: String, progress_map: Arc<DashMap<String, TaskProgress>>) -> Self {
-        Self { task_id, progress_map }
+    pub fn new(
+        task_id: String,
+        progress_map: Arc<DashMap<String, TaskProgress>>,
+        notifier: Arc<SummaryNotifier>,
+    ) -> Self {
+        Self { task_id, progress_map, notifier }
     }
 }
 
@@ -37,6 +43,8 @@ impl ProgressCallback for InMemoryProgressReporter {
     fn on_progress(&self, update: ProgressUpdate) {
         if let Some(mut entry) = self.progress_map.get_mut(&self.task_id) {
             entry.update_from_progress(&update);
+            drop(entry);
+            self.notifier.notify_throttled();
         }
     }
 }
@@ -79,6 +87,7 @@ pub struct UploadTask<'a> {
     inventory_meta: Option<FileMetadata>,
     cancel_token: CancellationToken,
     progress_map: Arc<DashMap<String, TaskProgress>>,
+    notifier: Arc<SummaryNotifier>,
 }
 
 impl<'a> UploadTask<'a> {
@@ -90,6 +99,7 @@ impl<'a> UploadTask<'a> {
         sync_path: PathBuf,
         remote_base: String,
         progress_map: Arc<DashMap<String, TaskProgress>>,
+        notifier: Arc<SummaryNotifier>,
     ) -> Self {
         Self {
             inventory,
@@ -102,6 +112,7 @@ impl<'a> UploadTask<'a> {
             remote_base,
             cancel_token: CancellationToken::new(),
             progress_map,
+            notifier,
         }
     }
 
@@ -236,7 +247,11 @@ impl<'a> UploadTask<'a> {
         let config = UploaderConfig::default();
         let uploader = Uploader::new(self.cr_client.clone(), self.inventory.clone(), config)
             .with_cancel_token(self.cancel_token.clone());
-        let progress = InMemoryProgressReporter::new(self.task.task_id.clone(), Arc::clone(&self.progress_map));
+        let progress = InMemoryProgressReporter::new(
+            self.task.task_id.clone(),
+            Arc::clone(&self.progress_map),
+            Arc::clone(&self.notifier),
+        );
 
         let upload_result = uploader.upload(params.clone(), progress).await;
 
@@ -261,6 +276,7 @@ impl<'a> UploadTask<'a> {
                 let retry_progress = InMemoryProgressReporter::new(
                     self.task.task_id.clone(),
                     Arc::clone(&self.progress_map),
+                    Arc::clone(&self.notifier),
                 );
                 let retry_config = UploaderConfig::default();
                 let retry_uploader = Uploader::new(

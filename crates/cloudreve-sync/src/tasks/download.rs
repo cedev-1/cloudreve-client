@@ -22,6 +22,7 @@ use uuid::Uuid;
 
 use crate::{
     drive::{event_blocker::EventBlocker, utils::local_path_to_cr_uri},
+    events::SummaryNotifier,
     inventory::{local_mtime_secs, ConflictState, FileMetadata, InventoryDb, MetadataEntry},
     tasks::queue::QueuedTask,
     utils::toast::send_conflict_toast,
@@ -110,11 +111,16 @@ pub struct DownloadProgressUpdate {
 pub struct InMemoryDownloadProgressReporter {
     task_id: String,
     progress_map: Arc<DashMap<String, TaskProgress>>,
+    notifier: Arc<SummaryNotifier>,
 }
 
 impl InMemoryDownloadProgressReporter {
-    pub fn new(task_id: String, progress_map: Arc<DashMap<String, TaskProgress>>) -> Self {
-        Self { task_id, progress_map }
+    pub fn new(
+        task_id: String,
+        progress_map: Arc<DashMap<String, TaskProgress>>,
+        notifier: Arc<SummaryNotifier>,
+    ) -> Self {
+        Self { task_id, progress_map, notifier }
     }
 
     pub fn on_progress(&self, update: &DownloadProgressUpdate) {
@@ -124,6 +130,8 @@ impl InMemoryDownloadProgressReporter {
             entry.total_bytes = Some(update.total_size as i64);
             entry.speed_bytes_per_sec = update.speed_bytes_per_sec;
             entry.eta_seconds = update.eta_seconds;
+            drop(entry);
+            self.notifier.notify_throttled();
         }
     }
 }
@@ -139,6 +147,7 @@ pub struct DownloadTask<'a> {
     remote_file_info: Option<cloudreve_api::models::explorer::FileResponse>,
     cancel_token: CancellationToken,
     progress_map: Arc<DashMap<String, TaskProgress>>,
+    notifier: Arc<SummaryNotifier>,
     event_blocker: EventBlocker,
     max_file_size_mb: u64,
 }
@@ -152,6 +161,7 @@ impl<'a> DownloadTask<'a> {
         sync_path: PathBuf,
         remote_base: String,
         progress_map: Arc<DashMap<String, TaskProgress>>,
+        notifier: Arc<SummaryNotifier>,
         event_blocker: EventBlocker,
         max_file_size_mb: u64,
     ) -> Self {
@@ -166,6 +176,7 @@ impl<'a> DownloadTask<'a> {
             remote_base,
             cancel_token: CancellationToken::new(),
             progress_map,
+            notifier,
             event_blocker,
             max_file_size_mb,
         }
@@ -320,7 +331,11 @@ impl<'a> DownloadTask<'a> {
         }
 
         let tracker = Arc::new(DownloadProgressTracker::new(file_size));
-        let reporter = InMemoryDownloadProgressReporter::new(self.task.task_id.clone(), Arc::clone(&self.progress_map));
+        let reporter = InMemoryDownloadProgressReporter::new(
+            self.task.task_id.clone(),
+            Arc::clone(&self.progress_map),
+            Arc::clone(&self.notifier),
+        );
 
         let result = self.download_to_temp(&download_url, &temp_path, tracker.clone(), &reporter).await;
 

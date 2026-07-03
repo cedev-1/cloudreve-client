@@ -11,6 +11,7 @@ use std::sync::Arc;
 use cloudreve_sync::drive::commands::ManagerCommand;
 use cloudreve_sync::drive::mounts::{Credentials, DriveConfig, Mount};
 use cloudreve_sync::inventory::{InventoryDb, MetadataEntry, TaskRecord};
+use cloudreve_sync::{EventBroadcaster, SummaryNotifier};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::sync::mpsc;
@@ -76,7 +77,8 @@ impl TestEnv {
         };
 
         let (manager_tx, manager_rx) = mpsc::unbounded_channel();
-        let mount = Mount::new(config, inventory.clone(), manager_tx).await;
+        let notifier = Arc::new(SummaryNotifier::new(Arc::new(EventBroadcaster::new(16))));
+        let mount = Mount::new(config, inventory.clone(), manager_tx, notifier).await;
 
         Self {
             server,

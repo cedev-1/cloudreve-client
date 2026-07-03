@@ -32,6 +32,7 @@ export default function Popup() {
   const [loading, setLoading] = useState(true);
   const [connected, setConnected] = useState(true);
   const isFetchingRef = useRef(false);
+  const refetchQueuedRef = useRef(false);
 
   // Listen for connection status changes
   useEffect(() => {
@@ -67,7 +68,12 @@ export default function Popup() {
 
   // Fetch status summary
   const fetchSummary = useCallback(async () => {
-    if (isFetchingRef.current) return;
+    // Coalesce bursts: if a fetch is in flight, queue a single refetch so the
+    // latest state is never missed.
+    if (isFetchingRef.current) {
+      refetchQueuedRef.current = true;
+      return;
+    }
 
     isFetchingRef.current = true;
     try {
@@ -80,19 +86,23 @@ export default function Popup() {
     } finally {
       isFetchingRef.current = false;
       setLoading(false);
+      if (refetchQueuedRef.current) {
+        refetchQueuedRef.current = false;
+        fetchSummary();
+      }
     }
   }, [selectedDrive]);
 
-  // Initial fetch and polling
+  // Initial fetch, then refetch whenever the backend signals a change
   useEffect(() => {
     fetchSummary();
 
-    const intervalId = setInterval(() => {
+    const unlisten = listen("SummaryChanged", () => {
       fetchSummary();
-    }, 1000);
+    });
 
     return () => {
-      clearInterval(intervalId);
+      unlisten.then((fn) => fn());
     };
   }, [fetchSummary]);
 

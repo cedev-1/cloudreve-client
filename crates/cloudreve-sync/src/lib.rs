@@ -11,7 +11,7 @@ pub mod utils;
 pub use config::{AppConfig, ConfigManager};
 pub use drive::manager::{ConflictInfo, ConflictResolution, DriveInfo, DriveInfoStatus, DriveManager, StatusSummary, TaskWithProgress};
 pub use drive::mounts::{Credentials, DriveConfig};
-pub use events::{Event, EventBroadcaster};
+pub use events::{Event, EventBroadcaster, SummaryNotifier};
 pub use logging::{LogConfig, LogGuard};
 
 /// User agent string for HTTP requests
