@@ -252,7 +252,17 @@ impl Client {
     pub async fn set_tokens_with_expiry(&self, token: &Token) -> ApiResult<()> {
         // Validate the access token
         Self::validate_jwt_scopes(&token.access_token)?;
+        self.store_tokens(token).await;
+        Ok(())
+    }
 
+    /// Load tokens from persisted config without JWT validation.
+    /// Use this when restoring tokens from disk rather than from a fresh OAuth exchange.
+    pub async fn load_tokens(&self, token: &Token) {
+        self.store_tokens(token).await;
+    }
+
+    async fn store_tokens(&self, token: &Token) {
         let mut store = self.tokens.write().await;
 
         store.access_token = Some(token.access_token.clone());
@@ -265,8 +275,6 @@ impl Client {
         if let Ok(exp) = DateTime::parse_from_rfc3339(&token.refresh_expires) {
             store.refresh_token_expires = Some(exp.with_timezone(&Utc));
         }
-
-        Ok(())
     }
 
     /// Validate that a JWT token has a non-empty `scopes` field
@@ -375,7 +383,8 @@ impl Client {
 
         if api_response.code != ErrorCode::Success as i32 {
             if let Some(error_code) = ErrorCode::from_code(api_response.code) {
-                if error_code.is_credential_error() {
+                let is_scope_error = api_response.msg.contains("Insufficient scope");
+                if error_code.is_credential_error() && !is_scope_error {
                     self.notify_credential_invalid().await;
                 }
             }
@@ -504,9 +513,13 @@ impl Client {
 
         // Check response code
         if api_response.code != ErrorCode::Success as i32 {
-            // Check if this is a credential error and invoke callback
+            // Check if this is a credential error and invoke callback.
+            // "Insufficient scope" errors use the same error code (40089/SessionExpired) but
+            // are NOT actual credential errors — they indicate the OAuth token lacks a required
+            // scope. Treating them as credential errors causes a reauth loop.
             if let Some(error_code) = ErrorCode::from_code(api_response.code) {
-                if error_code.is_credential_error() {
+                let is_scope_error = api_response.msg.contains("Insufficient scope");
+                if error_code.is_credential_error() && !is_scope_error {
                     self.notify_credential_invalid().await;
                 }
             }

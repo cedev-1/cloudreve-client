@@ -165,8 +165,8 @@ impl Mount {
             .with_client_id(config.sse_client_id.clone())
             .with_user_agent(crate::USER_AGENT);
         let mut cr_client = Client::new(client_config);
-        let _ = cr_client
-            .set_tokens_with_expiry(&Token {
+        cr_client
+            .load_tokens(&Token {
                 access_token: config.credentials.access_token.clone().unwrap_or_default(),
                 refresh_token: config.credentials.refresh_token.clone(),
                 access_expires: config.credentials.access_expires.clone().unwrap_or_default(),
