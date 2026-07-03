@@ -495,7 +495,39 @@ impl TaskQueue {
         let handle_task_id = task_id.clone();
 
         let handle = tokio::spawn(async move {
-            queue_for_execute.execute_task(task).await;
+            // Catch panics from task execution so the queue never leaks
+            // permits/counters and the task doesn't stay "Running" forever.
+            let result = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+                queue_for_execute.execute_task(task),
+            ))
+            .await;
+
+            if result.is_err() {
+                error!(
+                    target: "tasks::queue",
+                    drive = %queue_for_notify.drive_id,
+                    task_id = %handle_task_id,
+                    "Task panicked during execution"
+                );
+                if let Err(update_err) = queue_for_notify.inventory.update_task(
+                    &handle_task_id,
+                    TaskUpdate {
+                        status: Some(TaskStatus::Failed),
+                        error: Some(Some("Task panicked during execution".to_string())),
+                        ..Default::default()
+                    },
+                ) {
+                    warn!(
+                        target: "tasks::queue",
+                        drive = %queue_for_notify.drive_id,
+                        task_id = %handle_task_id,
+                        error = %update_err,
+                        "Failed to persist panic failure state"
+                    );
+                }
+                queue_for_notify.cleanup_task_entry(&handle_task_id).await;
+            }
+
             drop(permit);
             queue_for_notify.inflight.fetch_sub(1, Ordering::SeqCst);
             queue_for_notify.idle_notify.notify_waiters();
