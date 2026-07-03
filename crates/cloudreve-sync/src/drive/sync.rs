@@ -369,3 +369,57 @@ fn walk_dir_recursive(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use notify_debouncer_full::DebouncedEvent;
+    use notify_debouncer_full::notify::event::{
+        CreateKind, Event, EventKind, ModifyKind, RemoveKind,
+    };
+    use std::time::Instant;
+
+    fn ev(kind: EventKind, path: &str) -> DebouncedEvent {
+        DebouncedEvent::new(Event::new(kind).add_path(PathBuf::from(path)), Instant::now())
+    }
+
+    /// An editor that saves via "write temp + delete + recreate" must end up
+    /// as a change, not a deletion — otherwise the file would vanish.
+    #[test]
+    fn delete_then_recreate_is_a_change() {
+        let grouped = group_fs_events(vec![
+            ev(EventKind::Remove(RemoveKind::File), "/sync/doc.txt"),
+            ev(EventKind::Create(CreateKind::File), "/sync/doc.txt"),
+        ]);
+
+        assert_eq!(grouped.changed, vec![PathBuf::from("/sync/doc.txt")]);
+        assert!(grouped.deleted.is_empty());
+    }
+
+    /// A file created then deleted within the debounce window is a deletion:
+    /// it must not be uploaded.
+    #[test]
+    fn create_then_delete_is_a_deletion() {
+        let grouped = group_fs_events(vec![
+            ev(EventKind::Create(CreateKind::File), "/sync/tmp.bin"),
+            ev(EventKind::Modify(ModifyKind::Any), "/sync/tmp.bin"),
+            ev(EventKind::Remove(RemoveKind::File), "/sync/tmp.bin"),
+        ]);
+
+        assert!(grouped.changed.is_empty());
+        assert_eq!(grouped.deleted, vec![PathBuf::from("/sync/tmp.bin")]);
+    }
+
+    /// Repeated modifications of the same file collapse into a single change.
+    #[test]
+    fn repeated_modifications_are_deduplicated() {
+        let grouped = group_fs_events(vec![
+            ev(EventKind::Modify(ModifyKind::Any), "/sync/log.txt"),
+            ev(EventKind::Modify(ModifyKind::Any), "/sync/log.txt"),
+            ev(EventKind::Modify(ModifyKind::Any), "/sync/log.txt"),
+        ]);
+
+        assert_eq!(grouped.changed.len(), 1);
+        assert!(grouped.deleted.is_empty());
+    }
+}

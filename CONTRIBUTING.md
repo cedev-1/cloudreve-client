@@ -52,6 +52,28 @@ cargo check -p cloudreve-sync -p cloudreve-desktop
 cd ui && yarn lint
 ```
 
+### Running the tests
+
+```sh
+# All tests (unit + integration)
+cargo test -p cloudreve-sync
+
+# Only the sync integration scenarios
+cargo test -p cloudreve-sync --test sync_scenarios
+
+# Only unit tests (inventory, conflict lifecycle, fs events...)
+cargo test -p cloudreve-sync --lib
+
+# A single test by name
+cargo test -p cloudreve-sync both_sides_modified
+```
+
+Tests are **behavior-driven**: they describe real user situations (edits on both sides, deletions, same-size edits...) and assert the outcome the user cares about — no silent data loss, conflicts surfaced instead of overwritten, deletions never propagated to the server.
+
+The integration tests in `crates/cloudreve-sync/tests/` run against a real `Mount`, a real SQLite inventory, and real files on disk; only the Cloudreve API is faked with a [wiremock](https://docs.rs/wiremock) HTTP server (see the `TestEnv` harness in `tests/common/mod.rs`). No network access or real server is needed.
+
+If your change touches the sync engine, add a scenario to `tests/sync_scenarios.rs` describing the user-visible behavior — reuse `TestEnv` (`write_local`, `track_synced`, `set_remote_files`, `full_sync`, `all_tasks`...).
+
 ## How to contribute
 
 ### 1. Fork and branch
@@ -103,6 +125,7 @@ The UI is translated in 11 languages under `ui/public/locales/<lng>/common.json`
 
 ### 4. Before opening a pull request
 
+- Make sure `cargo test -p cloudreve-sync` passes.
 - Make sure `cargo check` passes and the frontend builds (`cargo tauri build --debug`).
 - Run `yarn lint` in `ui/` for frontend changes.
 - Rebase on the latest `main` if needed.

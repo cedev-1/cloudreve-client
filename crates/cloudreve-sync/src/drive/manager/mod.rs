@@ -828,3 +828,32 @@ impl DriveManager {
     }
 
 }
+
+#[cfg(test)]
+mod tests {
+    use super::conflicted_copy_path;
+    use std::path::Path;
+
+    /// "Keep both" must produce a sibling file that keeps the original
+    /// extension so the OS still opens it with the right application.
+    #[test]
+    fn conflicted_copy_keeps_extension_and_directory() {
+        let copy = conflicted_copy_path(Path::new("/sync/docs/report.pdf"));
+        let name = copy.file_name().unwrap().to_string_lossy().to_string();
+
+        assert_eq!(copy.parent(), Some(Path::new("/sync/docs")));
+        assert!(name.starts_with("report (conflicted copy "));
+        assert!(name.ends_with(".pdf"));
+        assert_ne!(copy, Path::new("/sync/docs/report.pdf"), "must not collide");
+    }
+
+    /// Files without an extension must still get a valid, distinct name.
+    #[test]
+    fn conflicted_copy_handles_files_without_extension() {
+        let copy = conflicted_copy_path(Path::new("/sync/Makefile"));
+        let name = copy.file_name().unwrap().to_string_lossy().to_string();
+
+        assert!(name.starts_with("Makefile (conflicted copy "));
+        assert!(!name.ends_with('.'), "no dangling dot");
+    }
+}

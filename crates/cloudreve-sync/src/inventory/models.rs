@@ -388,3 +388,94 @@ impl DrivePropsUpdate {
         self
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a FileMetadata reflecting the state recorded after a sync of
+    /// the given real file (its actual size and mtime).
+    fn synced_metadata(path: &std::path::Path) -> FileMetadata {
+        let size = std::fs::metadata(path).map(|m| m.len() as i64).unwrap_or(0);
+        let mut metadata = HashMap::new();
+        if let Some(mtime) = local_mtime_secs(path) {
+            metadata.insert(LOCAL_MTIME_KEY.to_string(), mtime.to_string());
+        }
+        FileMetadata {
+            id: 1,
+            drive_id: Uuid::new_v4(),
+            is_folder: false,
+            local_path: path.to_string_lossy().to_string(),
+            created_at: 0,
+            updated_at: 0,
+            etag: "etag".to_string(),
+            metadata,
+            props: None,
+            permissions: String::new(),
+            shared: false,
+            size,
+            conflict_state: None,
+        }
+    }
+
+    #[test]
+    fn untouched_file_is_not_modified() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        std::fs::write(&path, b"content").unwrap();
+        let meta = synced_metadata(&path);
+
+        assert!(!meta.is_locally_modified(&path));
+    }
+
+    #[test]
+    fn size_change_is_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        std::fs::write(&path, b"content").unwrap();
+        let meta = synced_metadata(&path);
+
+        std::fs::write(&path, b"content plus more").unwrap();
+        assert!(meta.is_locally_modified(&path));
+    }
+
+    #[test]
+    fn same_size_edit_is_detected_via_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        std::fs::write(&path, b"aaaa").unwrap();
+        let meta = synced_metadata(&path);
+
+        // Same size, different content, mtime pushed forward.
+        std::fs::write(&path, b"bbbb").unwrap();
+        filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(4102444800, 0))
+            .unwrap();
+        assert!(meta.is_locally_modified(&path));
+    }
+
+    #[test]
+    fn missing_file_is_not_modified() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        std::fs::write(&path, b"content").unwrap();
+        let meta = synced_metadata(&path);
+        std::fs::remove_file(&path).unwrap();
+
+        assert!(!meta.is_locally_modified(&path));
+    }
+
+    #[test]
+    fn legacy_entry_without_recorded_mtime_relies_on_size_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        std::fs::write(&path, b"aaaa").unwrap();
+        let mut meta = synced_metadata(&path);
+        meta.metadata.clear(); // entry written before mtime tracking existed
+
+        // Same size → considered unchanged (no mtime to compare).
+        assert!(!meta.is_locally_modified(&path));
+        // Different size → still detected.
+        std::fs::write(&path, b"aaaaaa").unwrap();
+        assert!(meta.is_locally_modified(&path));
+    }
+}

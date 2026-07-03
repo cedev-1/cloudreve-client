@@ -42,3 +42,5 @@ features = ["v4", "serde"]
 
 [dev-dependencies]
 tempfile = "3.8"
+wiremock = "0.6"
+filetime = "0.2"
