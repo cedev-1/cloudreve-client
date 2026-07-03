@@ -210,16 +210,54 @@ pub async fn full_sync(mount: &Mount, local_root: &PathBuf, remote_path: &str) -
                         .with_created_at(parse_ts(&rf.created_at))
                         .with_updated_at(parse_ts(&rf.updated_at))
                         .with_etag(rf.primary_entity.clone().unwrap_or_default())
-                        .with_size(rf.size);
+                        .with_size(rf.size)
+                        .with_local_mtime(crate::inventory::local_mtime_secs(&local_path));
                     let _ = mount.inventory.upsert(&entry);
                 }
             }
             // Already tracked and present everywhere → check for modifications
             (true, true, true) => {
                 if let (Some(db_entry), Some(rf)) = (db_map.get(rel), remote_map.get(rel)) {
+                    // Files with an unresolved conflict are frozen: no transfer
+                    // until the user resolves them.
+                    if db_entry.conflict_state.is_some() {
+                        tracing::debug!(
+                            target: "drive::sync",
+                            path = %rel.display(),
+                            "Skipping transfer: file has an unresolved conflict"
+                        );
+                        continue;
+                    }
+
                     // Check if remote was modified (etag changed)
                     let remote_etag = rf.primary_entity.clone().unwrap_or_default();
-                    if !remote_etag.is_empty() && !db_entry.etag.is_empty() && remote_etag != db_entry.etag {
+                    let remote_changed = !remote_etag.is_empty()
+                        && !db_entry.etag.is_empty()
+                        && remote_etag != db_entry.etag;
+                    let local_changed = db_entry.is_locally_modified(&local_path);
+
+                    // Both sides modified since last sync → conflict, let the user decide
+                    if remote_changed && local_changed {
+                        tracing::warn!(
+                            target: "drive::sync",
+                            path = %rel.display(),
+                            db_etag = %db_entry.etag,
+                            remote_etag = %remote_etag,
+                            "Conflict detected: both local and remote modified since last sync"
+                        );
+                        let _ = mount.inventory.mark_as_conflicted(
+                            &path_str,
+                            Some(crate::inventory::ConflictState::Pending),
+                        );
+                        crate::utils::toast::send_conflict_toast(
+                            &mount.id,
+                            &local_path,
+                            db_entry.id,
+                        );
+                        continue;
+                    }
+
+                    if remote_changed {
                         if !mount.is_file_size_allowed(rf.size as u64).await {
                             tracing::debug!(
                                 target: "drive::sync",
@@ -239,28 +277,27 @@ pub async fn full_sync(mount: &Mount, local_root: &PathBuf, remote_path: &str) -
                         mount.task_queue.enqueue(
                             TaskPayload::download(local_path).with_totals(0, rf.size)
                         ).await?;
-                    } else if let Ok(meta) = std::fs::metadata(&local_path) {
-                        // Check if local file was modified (size changed)
-                        let local_size = meta.len() as i64;
-                        if local_size != db_entry.size {
-                            if !mount.is_file_size_allowed(local_size as u64).await {
-                                tracing::debug!(
-                                    target: "drive::sync",
-                                    path = %rel.display(),
-                                    size = local_size,
-                                    "Skipping upload: file exceeds size limit"
-                                );
-                                continue;
-                            }
-                            tracing::info!(
+                    } else if local_changed {
+                        let local_size = std::fs::metadata(&local_path)
+                            .map(|m| m.len() as i64)
+                            .unwrap_or(0);
+                        if !mount.is_file_size_allowed(local_size as u64).await {
+                            tracing::debug!(
                                 target: "drive::sync",
                                 path = %rel.display(),
-                                db_size = db_entry.size,
-                                local_size = local_size,
-                                "Local file modified since last sync, uploading"
+                                size = local_size,
+                                "Skipping upload: file exceeds size limit"
                             );
-                            mount.task_queue.enqueue(TaskPayload::upload(local_path)).await?;
+                            continue;
                         }
+                        tracing::info!(
+                            target: "drive::sync",
+                            path = %rel.display(),
+                            db_size = db_entry.size,
+                            local_size = local_size,
+                            "Local file modified since last sync, uploading"
+                        );
+                        mount.task_queue.enqueue(TaskPayload::upload(local_path)).await?;
                     }
                 }
             }

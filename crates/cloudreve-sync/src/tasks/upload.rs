@@ -3,7 +3,7 @@ use std::{path::PathBuf, str::FromStr, sync::Arc, time::SystemTime};
 use crate::utils::toast::send_conflict_toast;
 use crate::{
     drive::utils::local_path_to_cr_uri,
-    inventory::{ConflictState, FileMetadata, InventoryDb, MetadataEntry},
+    inventory::{local_mtime_secs, ConflictState, FileMetadata, InventoryDb, MetadataEntry},
     tasks::queue::QueuedTask,
     uploader::{ProgressCallback, ProgressUpdate, UploadParams, Uploader, UploaderConfig},
 };
@@ -336,7 +336,8 @@ impl<'a> UploadTask<'a> {
             .with_created_at(parse_ts(&file.created_at))
             .with_updated_at(parse_ts(&file.updated_at))
             .with_etag(file.primary_entity.clone().unwrap_or_default())
-            .with_size(file.size);
+            .with_size(file.size)
+            .with_local_mtime(local_mtime_secs(&self.task.payload.local_path));
         self.inventory.upsert(&entry).context("failed to update inventory")?;
 
         Ok(())

@@ -22,8 +22,9 @@ use uuid::Uuid;
 
 use crate::{
     drive::{event_blocker::EventBlocker, utils::local_path_to_cr_uri},
-    inventory::{FileMetadata, InventoryDb, MetadataEntry},
+    inventory::{local_mtime_secs, ConflictState, FileMetadata, InventoryDb, MetadataEntry},
     tasks::queue::QueuedTask,
+    utils::toast::send_conflict_toast,
 };
 
 use super::types::TaskProgress;
@@ -259,6 +260,33 @@ impl<'a> DownloadTask<'a> {
             }
         }
 
+        // Conflict guard: this is the single choke point for every download
+        // (SSE, full sync, heartbeat). Never overwrite local changes silently.
+        // `force_override` is set when the user explicitly resolved the conflict.
+        if !self.task.payload.force_override {
+            if let Some(ref meta) = self.inventory_meta {
+                if matches!(meta.conflict_state, Some(ConflictState::Pending)) {
+                    info!(target: "tasks::download", task_id = %self.task.task_id, path = %local_path.display(), "Skipping download: file has an unresolved conflict");
+                    return Ok(());
+                }
+                if meta.is_locally_modified(&local_path) {
+                    warn!(
+                        target: "tasks::download",
+                        task_id = %self.task.task_id,
+                        path = %local_path.display(),
+                        "Conflict detected: local file modified while remote also changed"
+                    );
+                    if let Some(path_str) = local_path.to_str() {
+                        if let Err(e) = self.inventory.mark_as_conflicted(path_str, Some(ConflictState::Pending)) {
+                            warn!(target: "tasks::download", error = ?e, "Failed to mark conflict");
+                        }
+                    }
+                    send_conflict_toast(self.drive_id, &local_path, meta.id);
+                    return Ok(());
+                }
+            }
+        }
+
         let file_size = file_info.size as u64;
         self.remote_file_info = Some(file_info);
 
@@ -319,7 +347,8 @@ impl<'a> DownloadTask<'a> {
                             .with_created_at(parse_ts(&file_info.created_at))
                             .with_updated_at(parse_ts(&file_info.updated_at))
                             .with_etag(file_info.primary_entity.clone().unwrap_or_default())
-                            .with_size(file_info.size);
+                            .with_size(file_info.size)
+                            .with_local_mtime(local_mtime_secs(&local_path));
                         if let Err(e) = self.inventory.upsert(&entry) {
                             warn!(target: "tasks::download", task_id = %self.task.task_id, error = %e, "Failed to update inventory after download");
                         }

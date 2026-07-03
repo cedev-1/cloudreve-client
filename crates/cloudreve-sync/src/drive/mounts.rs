@@ -403,20 +403,17 @@ impl Mount {
                         }
                     }
                     // Check inventory DB to avoid re-uploading files we just downloaded.
-                    // If the local file size matches the DB entry, the file hasn't been
-                    // modified locally — it was likely written by a download task.
-                    if let Ok(local_meta) = std::fs::metadata(&path) {
-                        let local_size = local_meta.len() as i64;
-                        if let Some(path_str) = path.to_str() {
-                            if let Ok(Some(db_entry)) = self.inventory.query_by_path(path_str) {
-                                if db_entry.size == local_size {
-                                    tracing::debug!(
-                                        target: "drive::mounts",
-                                        path = %path.display(),
-                                        "Skipping upload: file matches inventory (likely just downloaded)"
-                                    );
-                                    continue;
-                                }
+                    // If the local file still matches the last synced state (size and
+                    // recorded mtime), it was likely written by a download task.
+                    if let Some(path_str) = path.to_str() {
+                        if let Ok(Some(db_entry)) = self.inventory.query_by_path(path_str) {
+                            if !db_entry.is_locally_modified(&path) {
+                                tracing::debug!(
+                                    target: "drive::mounts",
+                                    path = %path.display(),
+                                    "Skipping upload: file matches inventory (likely just downloaded)"
+                                );
+                                continue;
                             }
                         }
                     }

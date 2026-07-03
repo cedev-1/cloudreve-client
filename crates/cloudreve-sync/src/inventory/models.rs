@@ -30,6 +30,21 @@ impl ConflictState {
     }
 }
 
+/// Metadata map key storing the local file mtime (unix seconds) recorded at last sync.
+/// Used to detect local modifications that keep the same file size.
+pub const LOCAL_MTIME_KEY: &str = "local_mtime";
+
+/// Read the mtime (unix seconds) of a local file, if available.
+pub fn local_mtime_secs(path: &std::path::Path) -> Option<i64> {
+    std::fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs() as i64)
+}
+
 /// Represents a file metadata entry in the inventory
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileMetadata {
@@ -46,6 +61,31 @@ pub struct FileMetadata {
     pub shared: bool,
     pub size: i64,
     pub conflict_state: Option<ConflictState>,
+}
+
+impl FileMetadata {
+    /// The local file mtime (unix seconds) recorded at last sync, if any.
+    pub fn local_mtime(&self) -> Option<i64> {
+        self.metadata.get(LOCAL_MTIME_KEY).and_then(|v| v.parse().ok())
+    }
+
+    /// Whether the local file diverged from the last synced state.
+    ///
+    /// Size is the primary signal; the recorded mtime (when available)
+    /// additionally catches modifications that keep the same size.
+    /// Returns false if the local file does not exist.
+    pub fn is_locally_modified(&self, local_path: &std::path::Path) -> bool {
+        let Ok(fs_meta) = std::fs::metadata(local_path) else {
+            return false;
+        };
+        if fs_meta.len() as i64 != self.size {
+            return true;
+        }
+        match (self.local_mtime(), local_mtime_secs(local_path)) {
+            (Some(recorded), Some(current)) => current != recorded,
+            _ => false,
+        }
+    }
 }
 
 /// Entry for inserting or updating file metadata
@@ -115,6 +155,15 @@ impl MetadataEntry {
 
     pub fn with_metadata(mut self, metadata: HashMap<String, String>) -> Self {
         self.metadata = metadata;
+        self
+    }
+
+    /// Record the local file mtime (unix seconds) at sync time.
+    /// A `None` value leaves the metadata map untouched.
+    pub fn with_local_mtime(mut self, mtime: Option<i64>) -> Self {
+        if let Some(mtime) = mtime {
+            self.metadata.insert(LOCAL_MTIME_KEY.to_string(), mtime.to_string());
+        }
         self
     }
 
