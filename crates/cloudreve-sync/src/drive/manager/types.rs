@@ -19,6 +19,39 @@ pub struct StatusSummary {
     pub finished_tasks: Vec<TaskRecord>,
     /// Whether at least one drive has completed its initial full sync
     pub has_ever_synced: bool,
+    /// Files with an unresolved conflict, pending user action
+    pub conflicts: Vec<ConflictInfo>,
+}
+
+/// A file conflict awaiting user resolution
+#[derive(Debug, Clone, Serialize)]
+pub struct ConflictInfo {
+    /// Inventory row id
+    pub id: i64,
+    /// Drive this file belongs to
+    pub drive_id: String,
+    /// Drive display name
+    pub drive_name: String,
+    /// Absolute local path
+    pub local_path: String,
+    /// Last synced size (from inventory)
+    pub synced_size: i64,
+    /// Current local size (None if the local file is missing)
+    pub local_size: Option<i64>,
+    /// Current local modification time (unix seconds)
+    pub local_modified_at: Option<i64>,
+}
+
+/// How the user wants to resolve a conflict
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictResolution {
+    /// Keep the local version: overwrite the remote file
+    KeepLocal,
+    /// Keep the remote version: overwrite the local file
+    KeepRemote,
+    /// Keep both: rename the local copy, then download the remote version
+    KeepBoth,
 }
 
 /// A task record with optional live progress information

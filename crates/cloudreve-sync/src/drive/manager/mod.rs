@@ -579,12 +579,126 @@ impl DriveManager {
 
         let finished_tasks = recent_tasks.finished;
 
+        // Collect pending conflicts (filtered by drive_id if provided)
+        let mut conflicts = Vec::new();
+        let conflicted_files = self
+            .inventory
+            .query_conflicts(drive_id)
+            .context("Failed to query conflicts")?;
+        for meta in conflicted_files {
+            let meta_drive_id = meta.drive_id.to_string();
+            let drive_name = match read_guard.get(&meta_drive_id) {
+                Some(mount) => mount.get_config().await.name,
+                // Skip conflicts for drives that are no longer mounted
+                None => continue,
+            };
+            let (local_size, local_modified_at) = match fs::metadata(&meta.local_path) {
+                Ok(m) => (
+                    Some(m.len() as i64),
+                    m.modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs() as i64),
+                ),
+                Err(_) => (None, None),
+            };
+            conflicts.push(ConflictInfo {
+                id: meta.id,
+                drive_id: meta_drive_id,
+                drive_name,
+                local_path: meta.local_path,
+                synced_size: meta.size,
+                local_size,
+                local_modified_at,
+            });
+        }
+
         Ok(StatusSummary {
             drives,
             active_tasks,
             finished_tasks,
             has_ever_synced,
+            conflicts,
         })
+    }
+
+    /// Resolve a pending file conflict.
+    ///
+    /// - `KeepLocal`: mark as override and re-upload, replacing the remote version.
+    /// - `KeepRemote`: clear the conflict and download, replacing the local version.
+    /// - `KeepBoth`: rename the local file to a "conflicted copy", upload the copy,
+    ///   then download the remote version at the original path.
+    pub async fn resolve_conflict(
+        &self,
+        drive_id: &str,
+        local_path: &str,
+        resolution: ConflictResolution,
+    ) -> Result<()> {
+        use crate::inventory::ConflictState;
+        use crate::tasks::TaskPayload;
+
+        let read_guard = self.drives.read().await;
+        let mount = read_guard
+            .get(drive_id)
+            .ok_or_else(|| anyhow::anyhow!("Drive not found: {}", drive_id))?;
+
+        let meta = self
+            .inventory
+            .query_by_path(local_path)
+            .context("Failed to query conflicted file")?
+            .ok_or_else(|| anyhow::anyhow!("File not found in inventory: {}", local_path))?;
+        if !matches!(meta.conflict_state, Some(ConflictState::Pending)) {
+            anyhow::bail!("File has no pending conflict: {}", local_path);
+        }
+
+        match resolution {
+            ConflictResolution::KeepLocal => {
+                // Override tells the upload task to skip the etag check
+                self.inventory
+                    .mark_as_conflicted(local_path, Some(ConflictState::Override))?;
+                mount
+                    .task_queue
+                    .enqueue(TaskPayload::upload(local_path).with_force_override(true))
+                    .await?;
+            }
+            ConflictResolution::KeepRemote => {
+                self.inventory.mark_as_conflicted(local_path, None)?;
+                // force_override: the user explicitly chose to overwrite local changes
+                mount
+                    .task_queue
+                    .enqueue(TaskPayload::download(local_path).with_force_override(true))
+                    .await?;
+            }
+            ConflictResolution::KeepBoth => {
+                let path = PathBuf::from(local_path);
+                if path.exists() {
+                    let copy_path = conflicted_copy_path(&path);
+                    fs::rename(&path, &copy_path).with_context(|| {
+                        format!("Failed to rename conflicted file to {}", copy_path.display())
+                    })?;
+                    mount
+                        .task_queue
+                        .enqueue(TaskPayload::upload(copy_path))
+                        .await?;
+                }
+                self.inventory.mark_as_conflicted(local_path, None)?;
+                // The original path no longer exists locally (renamed above),
+                // but force_override keeps this robust if a copy reappears.
+                mount
+                    .task_queue
+                    .enqueue(TaskPayload::download(local_path).with_force_override(true))
+                    .await?;
+            }
+        }
+
+        tracing::info!(
+            target: "drive::manager",
+            drive_id = %drive_id,
+            path = %local_path,
+            resolution = ?resolution,
+            "Conflict resolved"
+        );
+        Ok(())
     }
 
     /// Get all drives with their status information for the settings UI.
@@ -655,6 +769,22 @@ impl DriveManager {
         }
         tracing::info!(target: "drive", "All drives shutdown");
     }
+}
+
+/// Build a "conflicted copy" path next to the original file,
+/// e.g. `report.txt` → `report (conflicted copy 2026-07-03 14-32-05).txt`.
+fn conflicted_copy_path(path: &std::path::Path) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_string());
+    let ext = path
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    let timestamp = chrono::Local::now().format("%Y-%m-%d %H-%M-%S");
+    let file_name = format!("{} (conflicted copy {}){}", stem, timestamp, ext);
+    path.with_file_name(file_name)
 }
 
 impl DriveManager {

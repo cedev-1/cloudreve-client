@@ -348,6 +348,7 @@ pub fn run() {
             commands::set_drive_max_file_size,
             commands::get_sync_status,
             commands::get_status_summary,
+            commands::resolve_conflict,
             commands::get_drives_info,
             commands::show_file_in_explorer,
             commands::show_add_drive_window,

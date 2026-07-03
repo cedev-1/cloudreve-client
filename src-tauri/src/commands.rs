@@ -2,7 +2,8 @@ use crate::AppStateHandle;
 use chrono::{Duration, Utc};
 use cloudreve_api::api::UserApi;
 use cloudreve_sync::{
-    config::LogLevel, ConfigManager, Credentials, DriveConfig, DriveInfo, StatusSummary,
+    config::LogLevel, ConfigManager, ConflictResolution, Credentials, DriveConfig, DriveInfo,
+    StatusSummary,
 };
 #[cfg(target_os = "macos")]
 use tauri::TitleBarStyle;
@@ -186,6 +187,21 @@ pub async fn get_status_summary(
 ) -> CommandResult<StatusSummary> {
     let app_state = state.get().ok_or_else(|| "App not yet initialized".to_string())?;
     app_state.drive_manager.get_status_summary(drive_id.as_deref()).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn resolve_conflict(
+    state: State<'_, AppStateHandle>,
+    drive_id: String,
+    local_path: String,
+    resolution: ConflictResolution,
+) -> CommandResult<()> {
+    let app_state = state.get().ok_or_else(|| "App not yet initialized".to_string())?;
+    app_state
+        .drive_manager
+        .resolve_conflict(&drive_id, &local_path, resolution)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

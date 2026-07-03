@@ -206,6 +206,21 @@ impl InventoryDb {
         Ok(total)
     }
 
+    /// Query all files with a pending conflict, optionally filtered by drive.
+    pub fn query_conflicts(&self, drive_id: Option<&str>) -> Result<Vec<FileMetadata>> {
+        let mut conn = self.connection()?;
+        let mut query = file_metadata_dsl::file_metadata
+            .filter(file_metadata_dsl::conflict_state.eq(ConflictState::Pending.as_str()))
+            .into_boxed();
+        if let Some(drive) = drive_id {
+            query = query.filter(file_metadata_dsl::drive_id.eq(drive.to_string()));
+        }
+        let rows = query
+            .load::<FileMetadataRow>(&mut conn)
+            .context("Failed to query conflicted files")?;
+        rows.into_iter().map(FileMetadata::try_from).collect()
+    }
+
     /// Mark a file as conflicted by setting its conflict_state.
     /// Pass `None` to clear the conflict state.
     ///
