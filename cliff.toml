@@ -1,0 +1,38 @@
+# git-cliff configuration — https://git-cliff.org/docs/configuration
+# Used by the release workflow to generate release notes from conventional commits.
+
+[changelog]
+header = ""
+body = """
+{% if version %}\
+## What's Changed in {{ version }}
+{% else %}\
+## Unreleased
+{% endif %}\
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | striptags | trim }}
+{% for commit in commits %}\
+- {{ commit.message | upper_first }} ([{{ commit.id | truncate(length=7, end="") }}](https://github.com/cedev-1/cloudreve-client/commit/{{ commit.id }}))
+{% endfor %}\
+{% endfor %}
+"""
+footer = ""
+trim = true
+
+[git]
+conventional_commits = true
+filter_unconventional = false
+protect_breaking_commits = true
+tag_pattern = "v[0-9].*"
+sort_commits = "newest"
+commit_parsers = [
+  { message = "^chore\\(release\\)", skip = true },
+  { message = "^feat", group = "<!-- 0 -->Features" },
+  { message = "^fix", group = "<!-- 1 -->Bug Fixes" },
+  { message = "^perf", group = "<!-- 2 -->Performance" },
+  { message = "^refactor", group = "<!-- 3 -->Refactoring" },
+  { message = "^docs", group = "<!-- 4 -->Documentation" },
+  { message = "^test", group = "<!-- 5 -->Testing" },
+  { message = "^(chore|ci|build)", group = "<!-- 6 -->Miscellaneous" },
+  { message = ".*", group = "<!-- 7 -->Other" },
+]

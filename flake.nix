@@ -25,6 +25,7 @@
             openssl
             yarn
             cargo-tauri
+            git-cliff
           ];
         };
       });

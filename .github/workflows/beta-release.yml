@@ -22,6 +22,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6.0.2
+        with:
+          fetch-depth: 0
 
       - name: Create git tag (workflow_dispatch only)
         if: github.event_name == 'workflow_dispatch'
@@ -31,7 +33,17 @@ jobs:
           git tag ${{ github.event.inputs.version }} || true
           git push origin ${{ github.event.inputs.version }} || true
         env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate changelog
+        uses: orhun/git-cliff-action@v4
+        id: cliff
+        with:
+          config: cliff.toml
+          args: --latest
+        env:
+          OUTPUT: /tmp/release-notes.md
+          GITHUB_REPO: ${{ github.repository }}
 
       - name: Create GitHub Release
         id: create
@@ -41,10 +53,11 @@ jobs:
           name: 'Cloudreve Desktop ${{ github.event.inputs.version || github.ref_name }}'
           prerelease: false
           draft: false
+          body_path: /tmp/release-notes.md
+          append_body: true
           body: |
-            ## ⚠️ Beta Release
 
-            This is a beta release — expect bugs and missing features.
+            ---
 
             ### Installation (macOS)
             1. Download the `.dmg` for your architecture (Apple Silicon → `aarch64`, Intel → `x86_64`)
@@ -55,13 +68,8 @@ jobs:
             ### Installation (Linux)
             - `.AppImage`: make executable and run (`chmod +x *.AppImage && ./Cloudreve*.AppImage`)
             - `.deb`: `sudo dpkg -i *.deb`
-
-            ### Known limitations
-            - Deletions are local only (not propagated to server or vice versa)
-            - No conflict resolution
-            - macOS app is unsigned (Gatekeeper warning on first launch)
         env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   build:
     needs: create-release
@@ -127,7 +135,7 @@ jobs:
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0.6.2
         env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
