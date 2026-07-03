@@ -49,7 +49,17 @@
     "waiting": "Ожидание...",
     "processing": "Обработка...",
     "offline": "Офлайн — ожидающие изменения будут синхронизированы при повторном подключении",
-    "waitingConnection": "Ожидание соединения..."
+    "waitingConnection": "Ожидание соединения...",
+    "conflicts": "Конфликты",
+    "conflictsStatus": "{{count}} файл(ов) требуют вашего внимания",
+    "conflictResolve": "Разрешить",
+    "conflictModifiedBoth": "Изменён с обеих сторон",
+    "conflictKeepLocal": "Оставить локальную версию",
+    "conflictKeepLocalHint": "Перезапишет файл на сервере",
+    "conflictKeepRemote": "Оставить версию с сервера",
+    "conflictKeepRemoteHint": "Перезапишет локальный файл",
+    "conflictKeepBoth": "Оставить оба",
+    "conflictKeepBothHint": "Переименует локальную копию"
   },
   "settings": {
     "title": "Настройки",

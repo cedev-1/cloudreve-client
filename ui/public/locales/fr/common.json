@@ -49,7 +49,17 @@
     "waiting": "En attente...",
     "processing": "Traitement...",
     "offline": "Hors ligne — les modifications seront synchronisées à la reconnexion",
-    "waitingConnection": "En attente de connexion..."
+    "waitingConnection": "En attente de connexion...",
+    "conflicts": "Conflits",
+    "conflictsStatus": "{{count}} fichier(s) nécessitent votre attention",
+    "conflictResolve": "Résoudre",
+    "conflictModifiedBoth": "Modifié des deux côtés",
+    "conflictKeepLocal": "Garder la version locale",
+    "conflictKeepLocalHint": "Écrase le fichier sur le serveur",
+    "conflictKeepRemote": "Garder la version du serveur",
+    "conflictKeepRemoteHint": "Écrase le fichier local",
+    "conflictKeepBoth": "Garder les deux",
+    "conflictKeepBothHint": "Renomme la copie locale"
   },
   "settings": {
     "title": "Paramètres",

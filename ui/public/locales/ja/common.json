@@ -49,7 +49,17 @@
     "waiting": "待機中...",
     "processing": "処理中...",
     "offline": "オフライン — 保留中の変更は再接続時に同期されます",
-    "waitingConnection": "接続待機中..."
+    "waitingConnection": "接続待機中...",
+    "conflicts": "競合",
+    "conflictsStatus": "{{count}} 個のファイルに対応が必要です",
+    "conflictResolve": "解決",
+    "conflictModifiedBoth": "両側で変更されています",
+    "conflictKeepLocal": "ローカル版を保持",
+    "conflictKeepLocalHint": "サーバー上のファイルを上書きします",
+    "conflictKeepRemote": "サーバー版を保持",
+    "conflictKeepRemoteHint": "ローカルファイルを上書きします",
+    "conflictKeepBoth": "両方を保持",
+    "conflictKeepBothHint": "ローカルコピーの名前を変更します"
   },
   "settings": {
     "title": "設定",

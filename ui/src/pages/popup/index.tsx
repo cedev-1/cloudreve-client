@@ -19,9 +19,11 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useTranslation } from "react-i18next";
 import Settings from "../../common/icons/Settings";
 import CloudreveLogo from "../../common/CloudreveLogo";
+import { Warning as WarningIcon } from "@mui/icons-material";
 import type { StatusSummary } from "./types";
 import DriveChips from "./DriveChips";
 import TaskItem from "./TaskItem";
+import ConflictItem from "./ConflictItem";
 
 export default function Popup() {
   const { t } = useTranslation();
@@ -118,6 +120,7 @@ export default function Popup() {
     summary?.active_tasks && summary.active_tasks.length > 0;
   const hasFinishedTasks =
     summary?.finished_tasks && summary.finished_tasks.length > 0;
+  const hasConflicts = summary?.conflicts && summary.conflicts.length > 0;
 
   return (
     <Box
@@ -182,7 +185,7 @@ export default function Popup() {
               {t("popup.loading", "Loading...")}
             </Typography>
           </Box>
-        ) : !hasActiveTasks && !hasFinishedTasks ? (
+        ) : !hasActiveTasks && !hasFinishedTasks && !hasConflicts ? (
           <Box
             sx={{
               display: "flex",
@@ -200,6 +203,34 @@ export default function Popup() {
           </Box>
         ) : (
           <List disablePadding>
+            {/* Conflicts */}
+            {hasConflicts && (
+              <>
+                <Typography
+                  variant="caption"
+                  color="warning.main"
+                  sx={{
+                    px: 2,
+                    py: 1,
+                    pb: 0,
+                    display: "block",
+                    fontWeight: 600,
+                    textTransform: "uppercase",
+                  }}
+                >
+                  {t("popup.conflicts", "Conflicts")}
+                </Typography>
+                {summary?.conflicts.map((conflict) => (
+                  <ConflictItem
+                    key={conflict.id}
+                    conflict={conflict}
+                    onResolved={fetchSummary}
+                  />
+                ))}
+                {(hasActiveTasks || hasFinishedTasks) && <Divider sx={{ my: 1 }} />}
+              </>
+            )}
+
             {/* Active Tasks */}
             {hasActiveTasks && (
               <>
@@ -271,6 +302,15 @@ export default function Popup() {
             <CloudOffIcon sx={{ fontSize: 18, color: "warning.main" }} />
             <Typography variant="caption" color="text.secondary">
               {t("popup.offline", "Offline — pending changes will sync when reconnected")}
+            </Typography>
+          </>
+        ) : hasConflicts ? (
+          <>
+            <WarningIcon sx={{ fontSize: 18, color: "warning.main" }} />
+            <Typography variant="caption" color="text.secondary">
+              {t("popup.conflictsStatus", "{{count}} file(s) need your attention", {
+                count: summary?.conflicts.length ?? 0,
+              })}
             </Typography>
           </>
         ) : hasActiveTasks ? (

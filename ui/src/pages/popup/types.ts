@@ -36,11 +36,24 @@ export interface TaskWithProgress extends TaskRecord {
   live_progress?: TaskProgress;
 }
 
+export interface ConflictInfo {
+  id: number;
+  drive_id: string;
+  drive_name: string;
+  local_path: string;
+  synced_size: number;
+  local_size?: number;
+  local_modified_at?: number;
+}
+
+export type ConflictResolution = "keep_local" | "keep_remote" | "keep_both";
+
 export interface StatusSummary {
   drives: DriveConfig[];
   active_tasks: TaskWithProgress[];
   finished_tasks: TaskRecord[];
   has_ever_synced?: boolean;
+  conflicts: ConflictInfo[];
 }
 
 export interface FileIconResponse {

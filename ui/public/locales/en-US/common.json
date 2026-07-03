@@ -49,7 +49,17 @@
     "waiting": "Waiting...",
     "processing": "Processing...",
     "offline": "Offline — pending changes will sync when reconnected",
-    "waitingConnection": "Waiting for connection..."
+    "waitingConnection": "Waiting for connection...",
+    "conflicts": "Conflicts",
+    "conflictsStatus": "{{count}} file(s) need your attention",
+    "conflictResolve": "Resolve",
+    "conflictModifiedBoth": "Modified on both sides",
+    "conflictKeepLocal": "Keep local version",
+    "conflictKeepLocalHint": "Overwrites the server file",
+    "conflictKeepRemote": "Keep server version",
+    "conflictKeepRemoteHint": "Overwrites the local file",
+    "conflictKeepBoth": "Keep both",
+    "conflictKeepBothHint": "Renames the local copy"
   },
   "settings": {
     "title": "Settings",

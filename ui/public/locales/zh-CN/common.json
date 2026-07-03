@@ -49,7 +49,17 @@
     "waiting": "等待中...",
     "processing": "处理中...",
     "offline": "离线 — 待处理的更改将在重新连接时同步",
-    "waitingConnection": "等待连接..."
+    "waitingConnection": "等待连接...",
+    "conflicts": "冲突",
+    "conflictsStatus": "{{count}} 个文件需要您处理",
+    "conflictResolve": "解决",
+    "conflictModifiedBoth": "两侧均已修改",
+    "conflictKeepLocal": "保留本地版本",
+    "conflictKeepLocalHint": "将覆盖服务器上的文件",
+    "conflictKeepRemote": "保留服务器版本",
+    "conflictKeepRemoteHint": "将覆盖本地文件",
+    "conflictKeepBoth": "两者都保留",
+    "conflictKeepBothHint": "将重命名本地副本"
   },
   "settings": {
     "title": "设置",
