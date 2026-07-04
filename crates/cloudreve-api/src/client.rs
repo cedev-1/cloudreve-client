@@ -147,6 +147,9 @@ pub struct Client {
     pub(crate) purchase_ticket: Arc<RwLock<Option<String>>>,
     on_credential_refreshed: Option<OnCredentialRefreshed>,
     on_credential_invalid: Option<OnCredentialInvalid>,
+    /// Serializes token refreshes so concurrent requests never consume the
+    /// same refresh token twice (the server rotates refresh tokens).
+    refresh_lock: tokio::sync::Mutex<()>,
 }
 
 impl Client {
@@ -179,6 +182,7 @@ impl Client {
             purchase_ticket: Arc::new(RwLock::new(None)),
             on_credential_refreshed: None,
             on_credential_invalid: None,
+            refresh_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -363,10 +367,29 @@ impl Client {
         self.refresh_access_token().await
     }
 
-    /// Refresh the access token using the refresh token
+    /// Refresh the access token using the refresh token.
+    ///
+    /// Refreshes are serialized: if another task refreshed the token while we
+    /// were waiting for the lock, its result is reused instead of consuming
+    /// the (rotated, now invalid) refresh token a second time.
     async fn refresh_access_token(&self) -> ApiResult<String> {
+        let stale_access_token = {
+            let store = self.tokens.read().await;
+            store.access_token.clone()
+        };
+
+        let _guard = self.refresh_lock.lock().await;
+
         let refresh_token = {
             let store = self.tokens.read().await;
+            // Another task refreshed while we waited for the lock
+            if let Some(current) = store.access_token.clone() {
+                if Some(&current) != stale_access_token.as_ref()
+                    && !store.is_access_token_expired()
+                {
+                    return Ok(current);
+                }
+            }
             store
                 .refresh_token
                 .clone()
@@ -448,6 +471,7 @@ impl Client {
         method: Method,
         body: Option<&T>,
         options: RequestOptions,
+        notify_credential_error: bool,
     ) -> ApiResult<R>
     where
         T: Serialize + ?Sized,
@@ -519,7 +543,7 @@ impl Client {
             // scope. Treating them as credential errors causes a reauth loop.
             if let Some(error_code) = ErrorCode::from_code(api_response.code) {
                 let is_scope_error = api_response.msg.contains("Insufficient scope");
-                if error_code.is_credential_error() && !is_scope_error {
+                if error_code.is_credential_error() && !is_scope_error && notify_credential_error {
                     self.notify_credential_invalid().await;
                 }
             }
@@ -543,14 +567,19 @@ impl Client {
         R: DeserializeOwned + Default,
     {
         match self
-            .send_internal(path, method.clone(), body, options.clone())
+            .send_internal(path, method.clone(), body, options.clone(), false)
             .await
         {
             Ok(result) => Ok(result),
-            Err(ApiError::AccessTokenExpired) => {
-                // Token expired, refresh and retry
+            Err(ApiError::LoginRequired(msg))
+                if !options.no_credential && !msg.contains("Insufficient scope") =>
+            {
+                // The server rejected an access token we believed valid
+                // (revoked, rotated, clock skew...). Refresh and retry once;
+                // if the retry is rejected too, credentials are genuinely
+                // invalid and the callback fires.
                 self.refresh_access_token().await?;
-                self.send_internal(path, method, body, options).await
+                self.send_internal(path, method, body, options, true).await
             }
             Err(e) => Err(e),
         }

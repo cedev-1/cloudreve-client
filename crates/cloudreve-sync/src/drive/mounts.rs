@@ -330,6 +330,7 @@ impl Mount {
                     mount.handle_refresh_credentials(credentials).await;
                 }
                 MountCommand::CredentialInvalid => {
+                    tracing::warn!(target: "drive::mounts", id = %mount.id, "Credential invalid, marking drive as expired");
                     mount.set_credential_expired(true).await;
                     let config = mount.config.read().await;
                     toast::send_token_expiry_toast(
@@ -366,6 +367,11 @@ impl Mount {
         config.credentials.access_expires = Some(token.access_expires.clone());
         config.credentials.refresh_expires = token.refresh_expires.clone();
         drop(config);
+
+        // A successful refresh proves credentials are valid again: clear any
+        // stale "credentials expired" state without requiring re-authorization.
+        self.set_credential_expired(false).await;
+
         let _ = self.manager_command_tx.send(ManagerCommand::PersistConfig);
     }
 

@@ -769,6 +769,7 @@ dependencies = [
  "tokio-test",
  "url",
  "urlencoding",
+ "wiremock",
 ]
 
 [[package]]
