@@ -4,6 +4,10 @@
 //! Tests written on top of this harness describe *user-visible behavior*
 //! (data safety, conflict handling, deletions) rather than implementation
 //! details.
+//!
+//! Each integration test file compiles this module independently and only
+//! uses part of the harness, so dead_code warnings are suppressed.
+#![allow(dead_code)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
