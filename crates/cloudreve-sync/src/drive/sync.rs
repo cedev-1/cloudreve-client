@@ -195,9 +195,12 @@ pub async fn full_sync(mount: &Mount, local_root: &PathBuf, remote_path: &str) -
                         );
                         continue;
                     }
-                    mount.task_queue.enqueue(
-                        TaskPayload::download(local_path).with_totals(0, rf.size)
-                    ).await?;
+                    let mut payload = TaskPayload::download(local_path).with_totals(0, rf.size);
+                    if let Some(etag) = &rf.primary_entity {
+                        payload = payload
+                            .with_custom_state(serde_json::json!({ "remote_etag": etag }));
+                    }
+                    mount.task_queue.enqueue(payload).await?;
                 }
             }
             // Exists on both sides but not tracked → mark as synced in DB (no transfer needed)
@@ -275,9 +278,14 @@ pub async fn full_sync(mount: &Mount, local_root: &PathBuf, remote_path: &str) -
                             remote_etag = %remote_etag,
                             "Remote file modified since last sync, downloading"
                         );
-                        mount.task_queue.enqueue(
-                            TaskPayload::download(local_path).with_totals(0, rf.size)
-                        ).await?;
+                        let mut payload =
+                            TaskPayload::download(local_path).with_totals(0, rf.size);
+                        if !remote_etag.is_empty() {
+                            payload = payload.with_custom_state(
+                                serde_json::json!({ "remote_etag": remote_etag }),
+                            );
+                        }
+                        mount.task_queue.enqueue(payload).await?;
                     } else if local_changed {
                         let local_size = std::fs::metadata(&local_path)
                             .map(|m| m.len() as i64)

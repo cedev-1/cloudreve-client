@@ -139,8 +139,13 @@ impl Mount {
                         if let Err(e) = self.task_queue.re_enqueue_offline_tasks() {
                             tracing::warn!(target: "drive::remote_events", error = %e, "Failed to re-enqueue offline tasks on resume");
                         }
-                        tracing::info!(target: "drive::remote_events", "Subscription resumed, triggering full sync");
-                        let _ = self.command_tx.send(MountCommand::FullSync);
+                        // The server replayed every event missed while we were
+                        // disconnected (buffered per Client-Id): nothing was
+                        // lost, so no full sync is needed. Proxies like
+                        // Cloudflare cut idle SSE connections every couple of
+                        // minutes — re-listing the whole drive on each resume
+                        // would be pure waste.
+                        tracing::info!(target: "drive::remote_events", "Subscription resumed");
                     }
                     FileEvent::Subscribed => {
                         self.set_event_push_subscribed(true).await;

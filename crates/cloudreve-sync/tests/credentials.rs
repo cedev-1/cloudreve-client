@@ -2,7 +2,6 @@
 
 mod common;
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -15,7 +14,7 @@ use common::TestEnv;
 #[tokio::test]
 async fn successful_token_refresh_clears_credential_expired_flag() {
     let env = TestEnv::new().await;
-    let mount = Arc::new(env.mount);
+    let mount = env.mount.clone();
     mount.spawn_command_processor(mount.clone()).await;
 
     mount.set_credential_expired(true).await;

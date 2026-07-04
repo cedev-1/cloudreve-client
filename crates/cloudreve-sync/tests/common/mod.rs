@@ -27,7 +27,7 @@ pub const REMOTE_BASE: &str = "cloudreve://my/sync";
 
 pub struct TestEnv {
     pub server: MockServer,
-    pub mount: Mount,
+    pub mount: Arc<Mount>,
     pub inventory: Arc<InventoryDb>,
     pub sync_dir: PathBuf,
     pub drive_id: String,
@@ -82,7 +82,7 @@ impl TestEnv {
 
         let (manager_tx, manager_rx) = mpsc::unbounded_channel();
         let notifier = Arc::new(SummaryNotifier::new(Arc::new(EventBroadcaster::new(16))));
-        let mount = Mount::new(config, inventory.clone(), manager_tx, notifier).await;
+        let mount = Arc::new(Mount::new(config, inventory.clone(), manager_tx, notifier).await);
 
         Self {
             server,

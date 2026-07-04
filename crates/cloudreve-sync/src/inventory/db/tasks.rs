@@ -135,6 +135,26 @@ impl InventoryDb {
         Ok(task_ids)
     }
 
+    /// Most recent task (any status) of a given type for a local path.
+    pub fn latest_task_for_path(
+        &self,
+        drive_id: &str,
+        task_type: &str,
+        local_path: &str,
+    ) -> Result<Option<TaskRecord>> {
+        let mut conn = self.connection()?;
+        let row: Option<TaskRow> = task_queue_dsl::task_queue
+            .filter(task_queue_dsl::drive_id.eq(drive_id))
+            .filter(task_queue_dsl::task_type.eq(task_type))
+            .filter(task_queue_dsl::local_path.eq(local_path))
+            .order(task_queue_dsl::created_at.desc())
+            .first(&mut conn)
+            .optional()
+            .context("Failed to query latest task for path")?;
+
+        row.map(TaskRecord::try_from).transpose()
+    }
+
     /// Get task status by task ID
     pub fn get_task_status(&self, task_id: &str) -> Result<Option<TaskStatus>> {
         let mut conn = self.connection()?;

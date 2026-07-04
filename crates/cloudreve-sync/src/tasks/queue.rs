@@ -135,6 +135,42 @@ impl TaskQueue {
             return Err(anyhow!("task queue is shutting down"));
         }
 
+        // A download that permanently failed for this exact remote version
+        // (same etag) will fail again: don't re-enqueue it on every sync.
+        // A new etag (remote file changed) makes it eligible again, and
+        // force_override (explicit user action) always bypasses this.
+        if payload.kind == TaskKind::Download && !payload.force_override {
+            if let Some(etag) = payload
+                .custom_state
+                .as_ref()
+                .and_then(|s| s.get("remote_etag"))
+                .and_then(|v| v.as_str())
+            {
+                let latest = self.inventory.latest_task_for_path(
+                    &self.drive_id,
+                    payload.kind.as_str(),
+                    &payload.local_path_display(),
+                )?;
+                if let Some(prev) = latest {
+                    let prev_etag = prev
+                        .custom_state
+                        .as_ref()
+                        .and_then(|s| s.get("remote_etag"))
+                        .and_then(|v| v.as_str());
+                    if prev.status == TaskStatus::Failed && prev_etag == Some(etag) {
+                        debug!(
+                            target: "tasks::queue",
+                            drive = %self.drive_id,
+                            path = %payload.local_path_display(),
+                            etag = %etag,
+                            "Skipping download: already failed permanently for this remote version"
+                        );
+                        return Ok(prev.id);
+                    }
+                }
+            }
+        }
+
         let task_id = payload
             .task_id
             .clone()
