@@ -142,6 +142,14 @@ pub async fn full_sync(mount: &Mount, local_root: &PathBuf, remote_path: &str) -
 
     let drive_uuid = Uuid::parse_str(&mount.id).ok();
 
+    // A file with an active upload session has no downloadable entity yet
+    // (the listing shows it, but downloading it fails with "Entity not exist").
+    let is_uploading = |f: &FileResponse| {
+        f.metadata.as_ref().is_some_and(|m| {
+            m.contains_key(cloudreve_api::models::explorer::metadata::UPLOAD_SESSION_ID)
+        })
+    };
+
     for rel in &all_paths {
         let local_path = local_root.join(rel);
         let in_remote = remote_map.contains_key(rel);
@@ -186,6 +194,14 @@ pub async fn full_sync(mount: &Mount, local_root: &PathBuf, remote_path: &str) -
                     continue;
                 }
                 if let Some(rf) = remote_map.get(rel) {
+                    if is_uploading(rf) {
+                        tracing::debug!(
+                            target: "drive::sync",
+                            path = %rel.display(),
+                            "Skipping download: remote file is still being uploaded"
+                        );
+                        continue;
+                    }
                     if !mount.is_file_size_allowed(rf.size as u64).await {
                         tracing::debug!(
                             target: "drive::sync",
@@ -262,6 +278,14 @@ pub async fn full_sync(mount: &Mount, local_root: &PathBuf, remote_path: &str) -
                     }
 
                     if remote_changed {
+                        if is_uploading(rf) {
+                            tracing::debug!(
+                                target: "drive::sync",
+                                path = %rel.display(),
+                                "Skipping download: remote file is still being uploaded"
+                            );
+                            continue;
+                        }
                         if !mount.is_file_size_allowed(rf.size as u64).await {
                             tracing::debug!(
                                 target: "drive::sync",
