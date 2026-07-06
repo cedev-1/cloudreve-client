@@ -152,6 +152,10 @@ pub struct Mount {
 
     pub ignore_matcher: RwLock<IgnoreMatcher>,
     pub(super) status_flags: Mutex<MountStatusFlags>,
+    /// Maximum time (seconds) to wait for any SSE data (event or keep-alive)
+    /// before treating the connection as dead and reconnecting.
+    /// Defaults to 120 s; tests override with a short value.
+    pub sse_idle_timeout_secs: std::sync::atomic::AtomicU64,
 }
 
 impl Mount {
@@ -232,6 +236,7 @@ impl Mount {
             event_blocker: event_blocker.clone(),
             ignore_matcher: RwLock::new(ignore_matcher),
             status_flags: Mutex::new(MountStatusFlags::new()),
+            sse_idle_timeout_secs: std::sync::atomic::AtomicU64::new(120),
         }
     }
 

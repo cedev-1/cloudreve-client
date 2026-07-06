@@ -11,11 +11,14 @@ use std::{
     time::Duration,
 };
 
-const MAX_RETRIES: u32 = 5;
 const INITIAL_BACKOFF_SECS: u64 = 1;
-const MAX_BACKOFF_SECS: u64 = 32;
-const LONG_RETRY_DELAY_SECS: u64 = 3600;
+// Cap low enough that the client recovers quickly once the server is back:
+// while the SSE stream is down, only the periodic full sync keeps us in sync.
+const MAX_BACKOFF_SECS: u64 = 60;
 
+/// Exponential backoff that never gives up: a subscription failure only means
+/// the server is unreachable *right now*, going deaf for a long period (the
+/// old behavior was a 1-hour pause after 5 failures) just delays recovery.
 struct BackoffState {
     retry_count: u32,
     current_delay: Duration,
@@ -34,15 +37,49 @@ impl BackoffState {
         self.current_delay = Duration::from_secs(INITIAL_BACKOFF_SECS);
     }
 
-    fn next_delay(&mut self) -> Option<Duration> {
-        if self.retry_count >= MAX_RETRIES {
-            return None;
-        }
+    fn next_delay(&mut self) -> Duration {
         let delay = self.current_delay;
-        self.retry_count += 1;
+        self.retry_count = self.retry_count.saturating_add(1);
         self.current_delay =
             Duration::from_secs((self.current_delay.as_secs() * 2).min(MAX_BACKOFF_SECS));
-        Some(delay)
+        delay
+    }
+}
+
+#[cfg(test)]
+mod backoff_tests {
+    use super::*;
+
+    /// The event loop must never go deaf: whatever the number of consecutive
+    /// failures, the backoff keeps producing delays, capped at MAX_BACKOFF.
+    #[test]
+    fn backoff_never_gives_up_and_caps() {
+        let mut backoff = BackoffState::new();
+        let mut last = Duration::ZERO;
+        for _ in 0..50 {
+            let delay = backoff.next_delay();
+            assert!(delay <= Duration::from_secs(MAX_BACKOFF_SECS));
+            last = delay;
+        }
+        assert_eq!(
+            last,
+            Duration::from_secs(MAX_BACKOFF_SECS),
+            "repeated failures must settle at the max delay, not stop"
+        );
+    }
+
+    /// A successful connection resets the backoff to the initial delay.
+    #[test]
+    fn backoff_resets_after_success() {
+        let mut backoff = BackoffState::new();
+        for _ in 0..10 {
+            backoff.next_delay();
+        }
+        backoff.reset();
+        assert_eq!(
+            backoff.next_delay(),
+            Duration::from_secs(INITIAL_BACKOFF_SECS)
+        );
     }
 }
 
@@ -81,26 +118,15 @@ impl Mount {
                     continue;
                 }
                 ListenResult::Error(e) => {
-                    if let Some(delay) = backoff.next_delay() {
-                        tracing::error!(
-                            target: "drive::remote_events",
-                            error = %e,
-                            retry_count = backoff.retry_count,
-                            delay_secs = delay.as_secs(),
-                            "Failed to listen to remote events, retrying"
-                        );
-                        tokio::time::sleep(delay).await;
-                    } else {
-                        tracing::error!(
-                            target: "drive::remote_events",
-                            error = %e,
-                            "Max retries reached, triggering full sync and waiting 1 hour"
-                        );
-                        tokio::time::sleep(Duration::from_secs(10)).await;
-                        let _ = s.command_tx.send(MountCommand::FullSync);
-                        tokio::time::sleep(Duration::from_secs(LONG_RETRY_DELAY_SECS)).await;
-                        backoff.reset();
-                    }
+                    let delay = backoff.next_delay();
+                    tracing::error!(
+                        target: "drive::remote_events",
+                        error = %e,
+                        retry_count = backoff.retry_count,
+                        delay_secs = delay.as_secs(),
+                        "Failed to listen to remote events, retrying"
+                    );
+                    tokio::time::sleep(delay).await;
                 }
             }
         }
@@ -125,9 +151,35 @@ impl Mount {
             }
         };
 
+        let idle_timeout = Duration::from_secs(
+            self.sse_idle_timeout_secs.load(std::sync::atomic::Ordering::Relaxed),
+        );
+
         loop {
-            match subscription.next_event().await {
-                Ok(Some(event)) => match event {
+            let next = tokio::time::timeout(idle_timeout, subscription.next_event()).await;
+            match next {
+                Err(_elapsed) => {
+                    // No data (not even a keep-alive) for the whole idle window:
+                    // the connection is silently dead (half-open socket, proxy
+                    // dropped without FIN/RST, etc.).
+                    tracing::warn!(
+                        target: "drive::remote_events",
+                        id = %self.id,
+                        timeout_secs = idle_timeout.as_secs(),
+                        "SSE stream idle timeout, reconnecting"
+                    );
+                    self.set_event_push_subscribed(false).await;
+                    return ListenResult::StreamEnded;
+                }
+                Ok(Err(e)) => {
+                    self.set_event_push_subscribed(false).await;
+                    return ListenResult::Error(e.into());
+                }
+                Ok(Ok(None)) => {
+                    self.set_event_push_subscribed(false).await;
+                    return ListenResult::StreamEnded;
+                }
+                Ok(Ok(Some(event))) => match event {
                     FileEvent::Event(events) => {
                         tracing::info!(target: "drive::remote_events", id = %self.id, count = events.len(), "Received remote file events");
                         if let Err(e) = self.handle_file_events(sync_path.clone(), events).await {
@@ -163,14 +215,6 @@ impl Mount {
                         return ListenResult::ReconnectRequired;
                     }
                 },
-                Ok(None) => {
-                    self.set_event_push_subscribed(false).await;
-                    return ListenResult::StreamEnded;
-                }
-                Err(e) => {
-                    self.set_event_push_subscribed(false).await;
-                    return ListenResult::Error(e.into());
-                }
             }
         }
     }
