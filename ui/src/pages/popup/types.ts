@@ -54,6 +54,7 @@ export interface StatusSummary {
   finished_tasks: TaskRecord[];
   has_ever_synced?: boolean;
   conflicts: ConflictInfo[];
+  paused_drives: string[];
 }
 
 export interface FileIconResponse {

@@ -11,6 +11,9 @@ import {
   Refresh as RefreshIcon,
   CloudOff as CloudOffIcon,
   Sync as SyncIcon,
+  PauseCircleOutline as PauseIcon,
+  PlayCircleOutline as PlayIcon,
+  PauseCircle as PausedStatusIcon,
 } from "@mui/icons-material";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
@@ -126,6 +129,33 @@ export default function Popup() {
     }
   };
 
+  // A drive is paused if it appears in paused_drives.
+  // When "All" is selected, paused means ALL drives are paused.
+  const isPaused = (() => {
+    const paused = summary?.paused_drives ?? [];
+    if (paused.length === 0) return false;
+    if (selectedDrive) return paused.includes(selectedDrive);
+    return (summary?.drives.length ?? 0) > 0 && paused.length >= (summary?.drives.length ?? 0);
+  })();
+
+  const handleTogglePause = async () => {
+    try {
+      if (selectedDrive) {
+        // Pause/resume a single drive
+        await invoke(isPaused ? "resume_sync" : "pause_sync", { driveId: selectedDrive });
+      } else {
+        // Pause/resume all drives
+        const drives = summary?.drives ?? [];
+        for (const drive of drives) {
+          await invoke(isPaused ? "resume_sync" : "pause_sync", { driveId: drive.id });
+        }
+      }
+      fetchSummary();
+    } catch (error) {
+      console.error("Failed to toggle pause:", error);
+    }
+  };
+
   const hasActiveTasks =
     summary?.active_tasks && summary.active_tasks.length > 0;
   const hasFinishedTasks =
@@ -166,9 +196,26 @@ export default function Popup() {
           <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
             <CloudreveLogo height={28} />
           </Box>
-          <IconButton size="small" onClick={handleSettings}>
-            <Settings fontSize="small" />
-          </IconButton>
+          <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+            {(summary?.drives.length ?? 0) > 0 && (
+              <IconButton
+                size="small"
+                onClick={handleTogglePause}
+                title={isPaused
+                  ? t("popup.resume", "Resume sync")
+                  : t("popup.pause", "Pause sync")}
+              >
+                {isPaused ? (
+                  <PlayIcon fontSize="small" color="primary" />
+                ) : (
+                  <PauseIcon fontSize="small" />
+                )}
+              </IconButton>
+            )}
+            <IconButton size="small" onClick={handleSettings}>
+              <Settings fontSize="small" />
+            </IconButton>
+          </Box>
         </Box>
 
         {/* Drive filter chips */}
@@ -307,7 +354,14 @@ export default function Popup() {
           gap: 1,
         }}
       >
-        {!connected ? (
+        {isPaused ? (
+          <>
+            <PausedStatusIcon sx={{ fontSize: 18, color: "text.secondary" }} />
+            <Typography variant="caption" color="text.secondary">
+              {t("popup.pausedStatus", "Sync paused")}
+            </Typography>
+          </>
+        ) : !connected ? (
           <>
             <CloudOffIcon sx={{ fontSize: 18, color: "warning.main" }} />
             <Typography variant="caption" color="text.secondary">
