@@ -499,6 +499,44 @@ impl DriveManager {
         Ok(())
     }
 
+    /// Pause a drive: stop background workers and cancel tasks, but keep the
+    /// mount alive so it can be resumed.
+    pub async fn pause_drive(&self, id: &str) -> Result<()> {
+        let read_guard = self.drives.read().await;
+        let mount = read_guard
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("Drive not found: {}", id))?;
+
+        mount.pause().await;
+        tracing::info!(target: "drive::manager", drive_id = %id, "Drive paused");
+        Ok(())
+    }
+
+    /// Resume a paused drive: restart background workers and trigger a full sync.
+    pub async fn resume_drive(&self, id: &str) -> Result<()> {
+        let read_guard = self.drives.read().await;
+        let mount = read_guard
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("Drive not found: {}", id))?
+            .clone();
+        drop(read_guard);
+
+        mount.resume().await;
+
+        // Restart background workers
+        let sync_path = mount.get_sync_path().await;
+        mount.start_fs_watcher_public(&sync_path).await?;
+        mount.spawn_remote_event_processor(mount.clone()).await;
+        mount.spawn_periodic_sync().await;
+        mount.spawn_props_refresh_task().await;
+
+        // Trigger a full sync to catch up on missed changes
+        let _ = mount.command_tx.send(MountCommand::FullSync);
+
+        tracing::info!(target: "drive::manager", drive_id = %id, "Drive resumed");
+        Ok(())
+    }
+
     /// Get sync status for a drive.
     pub async fn get_sync_status(&self, id: &str) -> Result<serde_json::Value> {
         let read_guard = self.drives.read().await;
@@ -538,10 +576,14 @@ impl DriveManager {
         let read_guard = self.drives.read().await;
         let mut drives = Vec::with_capacity(read_guard.len());
         let mut has_ever_synced = false;
+        let mut paused_drives = Vec::new();
         for mount in read_guard.values() {
             drives.push(mount.get_config().await);
             if mount.get_status_flags().await.is_initial_sync_completed() {
                 has_ever_synced = true;
+            }
+            if mount.is_paused() {
+                paused_drives.push(mount.id.clone());
             }
         }
 
@@ -738,6 +780,7 @@ impl DriveManager {
                 remote_path: config.remote_path.clone(),
                 raw_icon_path: config.raw_icon_path.clone(),
                 enabled: config.enabled,
+                paused: mount.is_paused(),
                 user_id: config.user_id.clone(),
                 status,
                 capacity,

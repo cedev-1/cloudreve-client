@@ -86,6 +86,10 @@ pub fn group_fs_events(events: Vec<DebouncedEvent>) -> GroupedFsEvents {
 /// - `(false, true, true)` : exists on both sides, not yet tracked → mark as synced in DB
 /// - `(true, true, true)` : already in sync, SSE handles live changes
 pub async fn full_sync(mount: &Mount, local_root: &PathBuf, remote_path: &str) -> Result<()> {
+    if mount.is_paused() {
+        tracing::info!(target: "drive::sync", id = %mount.id, "Sync skipped: drive is paused");
+        return Ok(());
+    }
     tracing::info!(target: "drive::sync", id = %mount.id, remote = remote_path, "Starting 3-way full sync");
 
     let remote_base = CrUri::new(remote_path)?;

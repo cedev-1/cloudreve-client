@@ -350,6 +350,8 @@ pub fn run() {
             commands::get_status_summary,
             commands::resolve_conflict,
             commands::get_drives_info,
+            commands::pause_sync,
+            commands::resume_sync,
             commands::show_file_in_explorer,
             commands::show_add_drive_window,
             commands::show_reauthorize_window,

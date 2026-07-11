@@ -21,6 +21,8 @@ pub struct StatusSummary {
     pub has_ever_synced: bool,
     /// Files with an unresolved conflict, pending user action
     pub conflicts: Vec<ConflictInfo>,
+    /// Drive IDs that are currently paused
+    pub paused_drives: Vec<String>,
 }
 
 /// A file conflict awaiting user resolution
@@ -126,6 +128,8 @@ pub struct DriveInfo {
     pub raw_icon_path: Option<String>,
     /// Whether the drive is enabled
     pub enabled: bool,
+    /// Whether the drive is currently paused
+    pub paused: bool,
     /// User ID
     pub user_id: String,
     /// Current drive status

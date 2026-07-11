@@ -135,6 +135,28 @@ impl InventoryDb {
         Ok(task_ids)
     }
 
+    /// Cancel all pending/running tasks for a drive.
+    pub fn cancel_all_active_tasks(&self, drive_id: &str) -> Result<usize> {
+        let mut conn = self.connection()?;
+        let active_statuses = vec![
+            TaskStatus::Pending.as_str().to_string(),
+            TaskStatus::Running.as_str().to_string(),
+        ];
+        let now = chrono::Utc::now().timestamp();
+        let count = diesel::update(
+            task_queue_dsl::task_queue
+                .filter(task_queue_dsl::drive_id.eq(drive_id))
+                .filter(task_queue_dsl::status.eq_any(&active_statuses)),
+        )
+        .set((
+            task_queue_dsl::status.eq(TaskStatus::Cancelled.as_str()),
+            task_queue_dsl::updated_at.eq(now),
+        ))
+        .execute(&mut conn)
+        .context("Failed to cancel all active tasks")?;
+        Ok(count)
+    }
+
     /// Most recent task (any status) of a given type for a local path.
     pub fn latest_task_for_path(
         &self,

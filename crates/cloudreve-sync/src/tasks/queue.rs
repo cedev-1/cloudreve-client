@@ -468,6 +468,21 @@ impl TaskQueue {
         Ok(cancelled_count)
     }
 
+    /// Cancel all running and pending tasks without shutting down the queue.
+    /// Used when pausing a drive — the queue stays alive for later resume.
+    pub async fn cancel_all(&self) {
+        // Abort running task handles
+        self.cancel_running_tasks().await;
+
+        // Cancel pending tasks in the DB
+        if let Err(e) = self.inventory.cancel_all_active_tasks(&self.drive_id) {
+            warn!(target: "tasks::queue", error = %e, "Failed to cancel active tasks in inventory");
+        }
+
+        self.notifier.notify();
+        info!(target: "tasks::queue", drive = %self.drive_id, "All tasks cancelled (drive paused)");
+    }
+
     async fn spawn_dispatcher(self: &Arc<Self>, command_rx: UnboundedReceiver<QueueCommand>) {
         let queue = Arc::clone(self);
         let handle = tokio::spawn(async move {

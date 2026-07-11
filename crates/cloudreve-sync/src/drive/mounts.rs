@@ -156,6 +156,9 @@ pub struct Mount {
     /// before treating the connection as dead and reconnecting.
     /// Defaults to 120 s; tests override with a short value.
     pub sse_idle_timeout_secs: std::sync::atomic::AtomicU64,
+    /// Runtime-only pause flag (not persisted). When true, sync operations
+    /// are skipped and background workers are stopped.
+    pub paused: std::sync::atomic::AtomicBool,
 }
 
 impl Mount {
@@ -237,6 +240,7 @@ impl Mount {
             ignore_matcher: RwLock::new(ignore_matcher),
             status_flags: Mutex::new(MountStatusFlags::new()),
             sse_idle_timeout_secs: std::sync::atomic::AtomicU64::new(120),
+            paused: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -259,6 +263,11 @@ impl Mount {
 
         tracing::info!(target: "drive::mounts", id = %self.id, path = %sync_path.display(), "Mount started");
         Ok(())
+    }
+
+    /// Public wrapper for restarting the FS watcher (used by resume).
+    pub async fn start_fs_watcher_public(&self, sync_path: &PathBuf) -> Result<()> {
+        self.start_fs_watcher(sync_path).await
     }
 
     async fn start_fs_watcher(&self, sync_path: &PathBuf) -> Result<()> {
@@ -388,6 +397,11 @@ impl Mount {
     ) -> Result<()> {
         use crate::drive::sync::SyncMode;
         use crate::tasks::TaskPayload;
+
+        if self.is_paused() {
+            tracing::info!(target: "drive::mounts", id = %self.id, "Incremental sync skipped: drive is paused");
+            return Ok(());
+        }
 
         tracing::debug!(target: "drive::mounts", id = %self.id, mode = ?mode, paths = local_paths.len(), "Incremental sync triggered");
 
@@ -567,6 +581,43 @@ impl Mount {
         drop(config);
         *self.ignore_matcher.write().await = new_matcher;
         Ok(())
+    }
+
+    /// Check if this mount is currently paused.
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Pause sync: sets the flag, stops background workers (SSE, periodic
+    /// sync, props refresh, FS watcher), and cancels running tasks.
+    /// The command processor stays alive so it can process Resume.
+    pub async fn pause(&self) {
+        self.paused.store(true, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!(target: "drive::mounts", id = %self.id, "Drive paused");
+
+        // Stop FS watcher
+        *self.fs_watcher.lock().await = None;
+
+        // Abort background handles (but NOT the command processor)
+        if let Some(h) = self.remote_event_handle.lock().await.take() {
+            h.abort();
+        }
+        if let Some(h) = self.periodic_sync_handle.lock().await.take() {
+            h.abort();
+        }
+        if let Some(h) = self.props_refresh_handle.lock().await.take() {
+            h.abort();
+        }
+
+        // Cancel all running/pending tasks
+        self.task_queue.cancel_all().await;
+    }
+
+    /// Resume sync: clears the flag. Callers (DriveManager) are responsible
+    /// for restarting background workers and triggering a full sync.
+    pub async fn resume(&self) {
+        self.paused.store(false, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!(target: "drive::mounts", id = %self.id, "Drive resumed");
     }
 
     pub async fn shutdown(&self) {

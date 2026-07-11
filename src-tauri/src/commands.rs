@@ -210,6 +210,24 @@ pub async fn get_drives_info(state: State<'_, AppStateHandle>) -> CommandResult<
     app_state.drive_manager.get_drives_info().await.map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+pub async fn pause_sync(
+    state: State<'_, AppStateHandle>,
+    drive_id: String,
+) -> CommandResult<()> {
+    let app_state = state.get().ok_or_else(|| "App not yet initialized".to_string())?;
+    app_state.drive_manager.pause_drive(&drive_id).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn resume_sync(
+    state: State<'_, AppStateHandle>,
+    drive_id: String,
+) -> CommandResult<()> {
+    let app_state = state.get().ok_or_else(|| "App not yet initialized".to_string())?;
+    app_state.drive_manager.resume_drive(&drive_id).await.map_err(|e| e.to_string())
+}
+
 pub fn show_main_window(app: &AppHandle) {
     show_main_window_at_position(app, Position::TrayCenter);
 }
