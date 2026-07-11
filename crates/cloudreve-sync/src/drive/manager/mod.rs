@@ -665,6 +665,7 @@ impl DriveManager {
             finished_tasks,
             has_ever_synced,
             conflicts,
+            paused_drives,
         })
     }
 
