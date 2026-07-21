@@ -320,13 +320,22 @@ impl TaskQueue {
                 "Re-enqueuing offline-waiting task"
             );
 
-            let _ = self.inventory.update_task(
+            if let Err(err) = self.inventory.update_task(
                 &record.id,
                 TaskUpdate {
                     custom_state: Some(None),
                     ..Default::default()
                 },
-            );
+            ) {
+                warn!(
+                    target: "tasks::queue",
+                    drive = %self.drive_id,
+                    task_id = %record.id,
+                    error = ?err,
+                    "Failed to clear offline-waiting flag; skipping re-enqueue"
+                );
+                continue;
+            }
 
             let payload = match Self::payload_from_record(&record) {
                 Ok(p) => p,
@@ -336,7 +345,16 @@ impl TaskQueue {
                 }
             };
 
-            let _ = self.dispatch_task(record.id.clone(), payload);
+            if let Err(err) = self.dispatch_task(record.id.clone(), payload) {
+                warn!(
+                    target: "tasks::queue",
+                    drive = %self.drive_id,
+                    task_id = %record.id,
+                    error = ?err,
+                    "Failed to dispatch offline-waiting task"
+                );
+                continue;
+            }
             count += 1;
         }
 

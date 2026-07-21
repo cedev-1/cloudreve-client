@@ -164,15 +164,24 @@ pub async fn full_sync(mount: &Mount, local_root: &PathBuf, remote_path: &str) -
         match (in_db, in_local, in_remote) {
             // Deleted locally (still on server) → forget it, don't re-download, don't touch server
             (true, false, true) => {
-                let _ = mount.inventory.batch_delete_by_path(vec![&path_str]);
+                mount
+                    .inventory
+                    .batch_delete_by_path(vec![&path_str])
+                    .context("Failed to forget locally-deleted file in inventory")?;
             }
             // Deleted from server (still local) → keep local copy, forget tracking
             (true, true, false) => {
-                let _ = mount.inventory.batch_delete_by_path(vec![&path_str]);
+                mount
+                    .inventory
+                    .batch_delete_by_path(vec![&path_str])
+                    .context("Failed to forget server-deleted file in inventory")?;
             }
             // Deleted from both → clean DB
             (true, false, false) => {
-                let _ = mount.inventory.batch_delete_by_path(vec![&path_str]);
+                mount
+                    .inventory
+                    .batch_delete_by_path(vec![&path_str])
+                    .context("Failed to clean inventory entry for file deleted on both sides")?;
             }
             // New local file → upload
             (false, true, false) => {
@@ -235,7 +244,10 @@ pub async fn full_sync(mount: &Mount, local_root: &PathBuf, remote_path: &str) -
                         .with_etag(rf.primary_entity.clone().unwrap_or_default())
                         .with_size(rf.size)
                         .with_local_mtime(crate::inventory::local_mtime_secs(&local_path));
-                    let _ = mount.inventory.upsert(&entry);
+                    mount
+                        .inventory
+                        .upsert(&entry)
+                        .context("Failed to mark existing file as synced in inventory")?;
                 }
             }
             // Already tracked and present everywhere → check for modifications
@@ -268,10 +280,13 @@ pub async fn full_sync(mount: &Mount, local_root: &PathBuf, remote_path: &str) -
                             remote_etag = %remote_etag,
                             "Conflict detected: both local and remote modified since last sync"
                         );
-                        let _ = mount.inventory.mark_as_conflicted(
-                            &path_str,
-                            Some(crate::inventory::ConflictState::Pending),
-                        );
+                        mount
+                            .inventory
+                            .mark_as_conflicted(
+                                &path_str,
+                                Some(crate::inventory::ConflictState::Pending),
+                            )
+                            .context("Failed to persist conflict state in inventory")?;
                         crate::utils::toast::send_conflict_toast(
                             &mount.id,
                             &local_path,

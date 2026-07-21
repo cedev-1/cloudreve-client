@@ -236,7 +236,15 @@ impl<'a> DownloadTask<'a> {
                     "Remote file no longer exists, removing local file"
                 );
                 if local_path.exists() && !local_path.is_dir() {
-                    std::fs::remove_file(&local_path).ok();
+                    if let Err(e) = std::fs::remove_file(&local_path) {
+                        warn!(
+                            target: "tasks::download",
+                            task_id = %self.task.task_id,
+                            path = %local_path.display(),
+                            error = %e,
+                            "Failed to remove local file mirroring remote deletion"
+                        );
+                    }
                 }
                 return Ok(());
             }

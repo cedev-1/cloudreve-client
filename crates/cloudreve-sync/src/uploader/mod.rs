@@ -242,8 +242,17 @@ impl Uploader {
                         task_id = %params.task_id,
                         "Existing session expired, will create new one"
                     );
-                    // Delete expired session
-                    let _ = self.inventory.delete_upload_session(&session.id);
+                    // Delete expired session (best-effort; a stale row is harmless
+                    // but should not go unnoticed)
+                    if let Err(e) = self.inventory.delete_upload_session(&session.id) {
+                        warn!(
+                            target: "uploader",
+                            task_id = %params.task_id,
+                            session_id = %session.id,
+                            error = %e,
+                            "Failed to delete expired upload session"
+                        );
+                    }
                     Ok(None)
                 } else {
                     Ok(Some(session))
