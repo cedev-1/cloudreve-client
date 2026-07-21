@@ -156,6 +156,7 @@ impl ConfigManager {
         if let Some(parent) = self.config_path.parent() {
             if !parent.exists() {
                 fs::create_dir_all(parent).context("Failed to create config directory")?;
+                crate::utils::secure_fs::restrict_dir(parent)?;
             }
         }
 
@@ -166,7 +167,8 @@ impl ConfigManager {
         let content =
             serde_json::to_string_pretty(&*config).context("Failed to serialize config")?;
 
-        fs::write(&self.config_path, content).context("Failed to write config file")?;
+        crate::utils::secure_fs::write_private(&self.config_path, content)
+            .context("Failed to write config file")?;
 
         tracing::debug!(target: "config", path = %self.config_path.display(), "Configuration saved");
 

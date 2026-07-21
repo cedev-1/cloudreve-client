@@ -40,6 +40,9 @@ impl DriveManager {
             fs::create_dir_all(&config_dir)
                 .context("Failed to create .cloudreve config directory")?;
         }
+        // The config dir holds drive credentials (OAuth tokens); keep it
+        // owner-only so other local users can't read them.
+        crate::utils::secure_fs::restrict_dir(&config_dir)?;
 
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let drives = Arc::new(RwLock::new(HashMap::new()));
@@ -138,7 +141,9 @@ impl DriveManager {
 
         let content =
             serde_json::to_string_pretty(&new_state).context("Failed to serialize drive state")?;
-        fs::write(&config_file, content).context("Failed to write drive config file")?;
+        // drives.json contains OAuth access/refresh tokens: persist it owner-only.
+        crate::utils::secure_fs::write_private(&config_file, content)
+            .context("Failed to write drive config file")?;
 
         tracing::info!(target: "drive", count = new_state.drives.len(), "Persisted drive(s) to config");
 
