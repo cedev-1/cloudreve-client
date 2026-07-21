@@ -84,9 +84,87 @@ pub fn recycle_bin_url(config: &DriveConfig) -> Result<String> {
     {
         let mut query = base.query_pairs_mut();
         query.append_pair("user_hint", config.user_id.as_str());
-         query.append_pair("path", "cloudreve://trash");
+        query.append_pair("path", "cloudreve://trash");
     }
 
     Ok(base.to_string())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> DriveConfig {
+        DriveConfig {
+            instance_url: "https://cloud.example.com".to_string(),
+            user_id: "user-42".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn local_path_maps_to_remote_uri() {
+        let root = PathBuf::from("/home/me/sync");
+        let path = PathBuf::from("/home/me/sync/docs/report.txt");
+        let uri = local_path_to_cr_uri(path, root, "cloudreve://my/data".to_string()).unwrap();
+        assert_eq!(uri.path(), "/data/docs/report.txt");
+    }
+
+    #[test]
+    fn local_path_at_root_returns_base() {
+        let root = PathBuf::from("/home/me/sync");
+        let path = PathBuf::from("/home/me/sync");
+        let uri = local_path_to_cr_uri(path, root, "cloudreve://my/data".to_string()).unwrap();
+        assert_eq!(uri.path(), "/data");
+    }
+
+    #[test]
+    fn local_path_outside_root_errors() {
+        let root = PathBuf::from("/home/me/sync");
+        let path = PathBuf::from("/etc/passwd");
+        assert!(local_path_to_cr_uri(path, root, "cloudreve://my".to_string()).is_err());
+    }
+
+    #[test]
+    fn remote_path_maps_to_local_relative() {
+        let base = CrUri::new("cloudreve://my/data").unwrap();
+        let remote = CrUri::new("cloudreve://my/data/docs/report.txt").unwrap();
+        let rel = remote_path_to_local_relative_path(&remote, &base).unwrap();
+        assert_eq!(rel, PathBuf::from("docs/report.txt"));
+    }
+
+    #[test]
+    fn remote_path_outside_base_errors() {
+        let base = CrUri::new("cloudreve://my/data").unwrap();
+        let remote = CrUri::new("cloudreve://my/other/file").unwrap();
+        assert!(remote_path_to_local_relative_path(&remote, &base).is_err());
+    }
+
+    #[test]
+    fn view_online_url_for_folder() {
+        let url = view_online_url("cloudreve://my/docs", None, &config()).unwrap();
+        assert!(url.starts_with("https://cloud.example.com/home?"));
+        assert!(url.contains("user_hint=user-42"));
+        assert!(url.contains("path=cloudreve"));
+        assert!(!url.contains("open="));
+    }
+
+    #[test]
+    fn view_online_url_for_file_includes_open() {
+        let url = view_online_url(
+            "cloudreve://my/docs",
+            Some("cloudreve://my/docs/a.txt"),
+            &config(),
+        )
+        .unwrap();
+        assert!(url.contains("open=cloudreve"));
+    }
+
+    #[test]
+    fn recycle_bin_url_points_at_trash() {
+        let url = recycle_bin_url(&config()).unwrap();
+        assert!(url.starts_with("https://cloud.example.com/home?"));
+        assert!(url.contains("user_hint=user-42"));
+        assert!(url.contains("trash"));
+    }
+}
