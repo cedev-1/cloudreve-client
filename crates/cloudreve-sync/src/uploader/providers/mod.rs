@@ -1,5 +1,6 @@
 //! Storage provider implementations
 
+mod http;
 mod local;
 mod onedrive;
 mod qiniu;

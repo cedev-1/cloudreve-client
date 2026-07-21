@@ -4,6 +4,7 @@
 //! For Remote policy: uploads chunks to slave nodes
 
 use crate::uploader::chunk::ChunkInfo;
+use crate::uploader::providers::http::read_error_body;
 use crate::uploader::session::UploadSession;
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -104,8 +105,7 @@ where
         .context("failed to upload chunk")?;
 
     if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let (status, body) = read_error_body(response).await;
         return Err(anyhow::anyhow!("HTTP {}: {}", status, body));
     }
 

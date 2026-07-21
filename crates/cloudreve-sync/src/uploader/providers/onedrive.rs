@@ -1,6 +1,7 @@
 //! OneDrive upload implementation
 
 use crate::uploader::chunk::ChunkInfo;
+use crate::uploader::providers::http::read_error_body;
 use crate::uploader::session::UploadSession;
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
@@ -142,8 +143,7 @@ pub async fn query_session_status(
         .context("failed to query OneDrive session status")?;
 
     if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let (status, body) = read_error_body(response).await;
         bail!(
             "failed to query OneDrive session: HTTP {}: {}",
             status,

@@ -3,6 +3,7 @@
 //! Upyun uses form-based upload with policy and authorization
 
 use crate::uploader::chunk::ChunkInfo;
+use crate::uploader::providers::http::read_error_body;
 use crate::uploader::session::UploadSession;
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
@@ -82,8 +83,7 @@ where
         .context("failed to upload to Upyun")?;
 
     if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let (status, body) = read_error_body(response).await;
 
         // Try to parse Upyun error
         if let Ok(error) = serde_json::from_str::<UpyunError>(&body) {

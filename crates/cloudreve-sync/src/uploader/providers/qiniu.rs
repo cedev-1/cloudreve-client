@@ -1,6 +1,7 @@
 //! Qiniu Cloud Storage upload implementation
 
 use crate::uploader::chunk::ChunkInfo;
+use crate::uploader::providers::http::read_error_body;
 use crate::uploader::session::UploadSession;
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
@@ -79,8 +80,7 @@ where
         .with_context(|| format!("failed to upload chunk {} to Qiniu", chunk.index))?;
 
     if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let (status, body) = read_error_body(response).await;
 
         // Try to parse Qiniu error
         if let Ok(error) = serde_json::from_str::<QiniuError>(&body) {
@@ -146,8 +146,7 @@ pub async fn complete_upload(http_client: &HttpClient, session: &UploadSession) 
         .context("failed to complete Qiniu upload")?;
 
     if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let (status, body) = read_error_body(response).await;
 
         // Try to parse Qiniu error
         if let Ok(error) = serde_json::from_str::<QiniuError>(&body) {

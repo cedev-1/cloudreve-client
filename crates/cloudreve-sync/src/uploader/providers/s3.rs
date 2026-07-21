@@ -3,6 +3,7 @@
 //! Supports: OSS, COS, S3, KS3, OBS
 
 use crate::uploader::chunk::{ChunkInfo, ChunkProgress};
+use crate::uploader::providers::http::read_error_body;
 use crate::uploader::session::UploadSession;
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
@@ -49,8 +50,7 @@ where
         .with_context(|| format!("failed to upload chunk {}", chunk.index))?;
 
     if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let (status, body) = read_error_body(response).await;
         bail!(
             "chunk {} upload failed: {}",
             chunk.index,
@@ -131,8 +131,7 @@ pub async fn complete_upload_oss(http_client: &HttpClient, session: &UploadSessi
         .context("failed to complete OSS upload")?;
 
     if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let (status, body) = read_error_body(response).await;
         bail!(
             "failed to complete OSS upload: {}",
             format_s3_error(status.as_u16(), &body)
@@ -172,8 +171,7 @@ pub async fn complete_upload_s3like(
         .context("failed to complete S3-like upload")?;
 
     if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let (status, body) = read_error_body(response).await;
         bail!(
             "failed to complete S3-like upload: {}",
             format_s3_error(status.as_u16(), &body)
@@ -203,8 +201,7 @@ pub async fn complete_upload_obs(http_client: &HttpClient, session: &UploadSessi
         .context("failed to complete OBS upload")?;
 
     if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let (status, body) = read_error_body(response).await;
 
         // OBS may return JSON or XML errors
         if body.starts_with('{') {
