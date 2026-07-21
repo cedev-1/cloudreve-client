@@ -157,6 +157,8 @@ impl ConfigManager {
             if !parent.exists() {
                 fs::create_dir_all(parent).context("Failed to create config directory")?;
             }
+            // Tighten even a pre-existing directory that predates this hardening.
+            crate::utils::secure_fs::restrict_dir(parent)?;
         }
 
         let config = self.config.read().map_err(|e| {
@@ -166,7 +168,8 @@ impl ConfigManager {
         let content =
             serde_json::to_string_pretty(&*config).context("Failed to serialize config")?;
 
-        fs::write(&self.config_path, content).context("Failed to write config file")?;
+        crate::utils::secure_fs::write_private(&self.config_path, content)
+            .context("Failed to write config file")?;
 
         tracing::debug!(target: "config", path = %self.config_path.display(), "Configuration saved");
 
