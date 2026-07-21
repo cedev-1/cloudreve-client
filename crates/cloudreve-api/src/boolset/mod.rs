@@ -118,3 +118,106 @@ impl Default for Boolset {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_and_default_are_empty() {
+        assert_eq!(Boolset::new().as_bytes(), &[] as &[u8]);
+        assert_eq!(Boolset::default(), Boolset::new());
+    }
+
+    #[test]
+    fn from_raw_preserves_bytes() {
+        let bs = Boolset::from_raw(vec![1, 2, 3]);
+        assert_eq!(bs.as_bytes(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn base64_roundtrip() {
+        // byte 0b0000_0101 -> bits 0 and 2 set
+        let bs = Boolset::from_raw(vec![0b0000_0101]);
+        let encoded = bs.to_base64();
+        let decoded = Boolset::from_base64(&encoded).unwrap();
+        assert_eq!(bs, decoded);
+        assert_eq!(Boolset::from_base64("BQ==").unwrap().as_bytes(), &[5]);
+    }
+
+    #[test]
+    fn from_base64_rejects_invalid_input() {
+        assert!(Boolset::from_base64("not valid base64!!!").is_err());
+    }
+
+    #[test]
+    fn from_data_prefers_base64_then_raw_then_empty() {
+        assert_eq!(
+            Boolset::from_data(Some("BQ=="), Some(vec![9])).as_bytes(),
+            &[5]
+        );
+        assert_eq!(
+            Boolset::from_data(None, Some(vec![9, 8])).as_bytes(),
+            &[9, 8]
+        );
+        assert_eq!(Boolset::from_data(None, None).as_bytes(), &[] as &[u8]);
+    }
+
+    #[test]
+    fn from_data_falls_back_to_empty_on_bad_base64() {
+        assert_eq!(
+            Boolset::from_data(Some("###"), Some(vec![9])).as_bytes(),
+            &[] as &[u8]
+        );
+    }
+
+    #[test]
+    fn enabled_reads_individual_bits() {
+        let bs = Boolset::from_raw(vec![0b0000_0101]);
+        assert!(bs.enabled(0));
+        assert!(!bs.enabled(1));
+        assert!(bs.enabled(2));
+    }
+
+    #[test]
+    fn enabled_out_of_range_is_false() {
+        let bs = Boolset::from_raw(vec![0xFF]);
+        assert!(bs.enabled(7));
+        assert!(!bs.enabled(8));
+        assert!(!Boolset::new().enabled(0));
+    }
+
+    #[test]
+    fn set_expands_storage_and_toggles_bits() {
+        let mut bs = Boolset::new();
+        bs.set(9, true);
+        assert_eq!(bs.as_bytes().len(), 2);
+        assert!(bs.enabled(9));
+
+        bs.set(9, false);
+        assert!(!bs.enabled(9));
+        // Storage is not shrunk when clearing.
+        assert_eq!(bs.as_bytes().len(), 2);
+    }
+
+    #[test]
+    fn sets_applies_multiple_values() {
+        let mut bs = Boolset::new();
+        bs.sets(&[(0, true), (3, true), (3, false), (16, true)]);
+        assert!(bs.enabled(0));
+        assert!(!bs.enabled(3));
+        assert!(bs.enabled(16));
+    }
+
+    #[test]
+    fn and_or_handle_differing_lengths() {
+        let a = Boolset::from_raw(vec![0b1100, 0b1010]);
+        let b = Boolset::from_raw(vec![0b1010]);
+
+        assert_eq!(a.and(&b).as_bytes(), &[0b1000, 0b0000]);
+        assert_eq!(a.or(&b).as_bytes(), &[0b1110, 0b1010]);
+        // Operation is commutative with respect to length handling.
+        assert_eq!(b.and(&a).as_bytes(), a.and(&b).as_bytes());
+        assert_eq!(b.or(&a).as_bytes(), a.or(&b).as_bytes());
+    }
+}

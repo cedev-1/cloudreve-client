@@ -105,3 +105,110 @@ impl EncryptionConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cloudreve_api::models::explorer::EncryptionCipher;
+
+    fn metadata(key: &[u8], iv: &[u8]) -> EncryptMetadata {
+        EncryptMetadata {
+            algorithm: EncryptionCipher::Aes256Ctr,
+            key_plain_text: BASE64.encode(key),
+            iv: BASE64.encode(iv),
+        }
+    }
+
+    fn valid_config() -> EncryptionConfig {
+        EncryptionConfig::from_metadata(&metadata(&[7u8; 32], &[3u8; 16])).unwrap()
+    }
+
+    #[test]
+    fn from_metadata_accepts_valid_key_and_iv() {
+        let config = EncryptionConfig::from_metadata(&metadata(&[1u8; 32], &[2u8; 16])).unwrap();
+        assert_eq!(config.key, [1u8; 32]);
+        assert_eq!(config.iv, [2u8; 16]);
+    }
+
+    #[test]
+    fn from_metadata_rejects_bad_base64() {
+        let mut meta = metadata(&[1u8; 32], &[2u8; 16]);
+        meta.key_plain_text = "not base64 @@@".to_string();
+        assert!(EncryptionConfig::from_metadata(&meta).is_err());
+
+        let mut meta = metadata(&[1u8; 32], &[2u8; 16]);
+        meta.iv = "###".to_string();
+        assert!(EncryptionConfig::from_metadata(&meta).is_err());
+    }
+
+    #[test]
+    fn from_metadata_rejects_wrong_lengths() {
+        assert!(EncryptionConfig::from_metadata(&metadata(&[1u8; 16], &[2u8; 16])).is_err());
+        assert!(EncryptionConfig::from_metadata(&metadata(&[1u8; 32], &[2u8; 8])).is_err());
+    }
+
+    #[test]
+    fn encryption_is_reversible() {
+        let config = valid_config();
+        let original: Vec<u8> = (0..200u32).map(|i| i as u8).collect();
+
+        let mut buf = original.clone();
+        config.encrypt_at_offset(&mut buf, 0);
+        assert_ne!(buf, original, "ciphertext should differ from plaintext");
+
+        // CTR mode is symmetric: applying the keystream again decrypts.
+        config.encrypt_at_offset(&mut buf, 0);
+        assert_eq!(buf, original);
+    }
+
+    #[test]
+    fn block_aligned_chunks_match_full_encryption() {
+        let config = valid_config();
+        let original: Vec<u8> = (0..64u32).map(|i| (i * 3) as u8).collect();
+
+        let mut full = original.clone();
+        config.encrypt_at_offset(&mut full, 0);
+
+        // Encrypt the same data in two 32-byte (block-aligned) chunks.
+        let mut chunked = original.clone();
+        let (first, second) = chunked.split_at_mut(32);
+        config.encrypt_at_offset(first, 0);
+        config.encrypt_at_offset(second, 32);
+
+        assert_eq!(chunked, full);
+    }
+
+    #[test]
+    fn non_block_aligned_offset_matches_full_encryption() {
+        let config = valid_config();
+        let original: Vec<u8> = (0..50u32).map(|i| (i + 1) as u8).collect();
+
+        let mut full = original.clone();
+        config.encrypt_at_offset(&mut full, 0);
+
+        // Split at offset 10, which is not a multiple of the 16-byte block size.
+        let mut chunked = original.clone();
+        let (first, second) = chunked.split_at_mut(10);
+        config.encrypt_at_offset(first, 0);
+        config.encrypt_at_offset(second, 10);
+
+        assert_eq!(chunked, full);
+    }
+
+    #[test]
+    fn increment_counter_handles_carry_across_bytes() {
+        let mut counter = [0u8; 16];
+        EncryptionConfig::increment_counter(&mut counter, 1);
+        assert_eq!(counter[15], 1);
+
+        let mut counter = [0u8; 16];
+        EncryptionConfig::increment_counter(&mut counter, 256);
+        assert_eq!(counter[14], 1);
+        assert_eq!(counter[15], 0);
+
+        // No-op when incrementing by zero blocks.
+        let mut counter = [5u8; 16];
+        EncryptionConfig::increment_counter(&mut counter, 0);
+        assert_eq!(counter, [5u8; 16]);
+    }
+}

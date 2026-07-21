@@ -332,10 +332,8 @@ impl CrUri {
 
     /// Set the path of the URI
     pub fn set_path(&mut self, path: &str) -> &mut Self {
-        let encoded_segments: Vec<String> = path
-            .split('/')
-            .map(|p| encode_uri_component(p))
-            .collect();
+        let encoded_segments: Vec<String> =
+            path.split('/').map(|p| encode_uri_component(p)).collect();
         let encoded_path = encoded_segments.join("/");
         self.url.set_path(&encoded_path);
         self
@@ -499,5 +497,243 @@ pub fn new_my_uri(uid: Option<&str>) -> Result<CrUri> {
     match uid {
         Some(uid) => CrUri::new(&format!("cloudreve://{}@my", uid)),
         None => CrUri::new("cloudreve://my"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_rejects_invalid_prefix() {
+        assert!(CrUri::new("https://example.com/my").is_err());
+        assert!(CrUri::new("my/path").is_err());
+    }
+
+    #[test]
+    fn new_parses_components_and_strips_trailing_slash() {
+        let uri = CrUri::new("cloudreve://alice:secret@my/docs/report/").unwrap();
+        assert_eq!(uri.id(), "alice");
+        assert_eq!(uri.password(), "secret");
+        assert_eq!(uri.fs(), "my");
+        assert_eq!(uri.path(), "/docs/report");
+        assert_eq!(uri.path_trimmed(), "docs/report");
+    }
+
+    #[test]
+    fn password_defaults_to_empty() {
+        let uri = CrUri::new("cloudreve://alice@my").unwrap();
+        assert_eq!(uri.password(), "");
+    }
+
+    #[test]
+    fn root_detection() {
+        assert!(CrUri::new("cloudreve://my").unwrap().is_root());
+        assert!(CrUri::new("cloudreve://alice@my").unwrap().is_root());
+        assert!(!CrUri::new("cloudreve://my/a").unwrap().is_root());
+    }
+
+    #[test]
+    fn elements_are_decoded() {
+        let uri = CrUri::new("cloudreve://my").unwrap();
+        assert!(uri.elements().is_empty());
+
+        let uri = CrUri::new("cloudreve://my/folder/sub").unwrap();
+        assert_eq!(uri.elements(), vec!["folder", "sub"]);
+    }
+
+    #[test]
+    fn set_path_percent_encodes_segments_and_path_decodes() {
+        let mut uri = CrUri::new("cloudreve://my").unwrap();
+        uri.set_path("/a b/c+d");
+        // Spaces and '+' must be percent-encoded in the raw url.
+        assert!(uri.path_trimmed().contains("a%20b"));
+        assert_eq!(uri.path(), "/a b/c+d");
+        assert_eq!(uri.elements(), vec!["a b", "c+d"]);
+    }
+
+    #[test]
+    fn join_appends_encoded_segments() {
+        let mut uri = CrUri::new("cloudreve://my/base").unwrap();
+        uri.join(&["a b", "c"]);
+        assert_eq!(uri.elements(), vec!["base", "a b", "c"]);
+    }
+
+    #[test]
+    fn join_raw_relative_and_absolute() {
+        let mut relative = CrUri::new("cloudreve://my/base").unwrap();
+        relative.join_raw("child/leaf");
+        assert_eq!(relative.path(), "/base/child/leaf");
+
+        let mut absolute = CrUri::new("cloudreve://my/base").unwrap();
+        absolute.join_raw("/other/place");
+        assert_eq!(absolute.path(), "/other/place");
+    }
+
+    #[test]
+    fn join_raw_relative_from_root() {
+        let mut uri = CrUri::new("cloudreve://my").unwrap();
+        uri.join_raw("first");
+        assert_eq!(uri.path(), "/first");
+    }
+
+    #[test]
+    fn parent_drops_last_element() {
+        let uri = CrUri::new("cloudreve://my/a/b/c").unwrap();
+        assert_eq!(uri.parent().unwrap().path(), "/a/b");
+
+        let single = CrUri::new("cloudreve://my/a").unwrap();
+        assert!(single.parent().unwrap().is_root());
+    }
+
+    #[test]
+    fn query_and_is_search() {
+        let mut uri = CrUri::new("cloudreve://my").unwrap();
+        assert!(!uri.is_search());
+
+        uri.add_query("name", "foo").add_query("name", "bar");
+        assert!(uri.is_search());
+        assert_eq!(uri.query("name"), vec!["foo", "bar"]);
+        assert!(uri.query("missing").is_empty());
+    }
+
+    #[test]
+    fn to_string_restores_cloudreve_prefix() {
+        let uri = CrUri::new("cloudreve://alice@my/docs").unwrap();
+        assert_eq!(uri.to_string(), "cloudreve://alice@my/docs");
+    }
+
+    #[test]
+    fn base_excludes_path_and_optionally_search() {
+        let mut uri = CrUri::new("cloudreve://alice@my/docs").unwrap();
+        uri.add_query("name", "foo");
+        assert_eq!(uri.base(true), "cloudreve://alice@my");
+        assert!(uri.base(false).contains("name=foo"));
+    }
+
+    #[test]
+    fn root_id_format() {
+        let uri = CrUri::new("cloudreve://alice@my/docs").unwrap();
+        assert_eq!(uri.root_id(), "my/alice/0");
+    }
+
+    #[test]
+    fn set_username_and_password() {
+        let mut uri = CrUri::new("cloudreve://my/docs").unwrap();
+        uri.set_username("bob").unwrap();
+        uri.set_password("pw").unwrap();
+        assert_eq!(uri.id(), "bob");
+        assert_eq!(uri.password(), "pw");
+    }
+
+    #[test]
+    fn search_params_none_when_no_query() {
+        let uri = CrUri::new("cloudreve://my/docs").unwrap();
+        assert!(uri.search_params().is_none());
+    }
+
+    #[test]
+    fn search_param_roundtrip() {
+        let mut uri = CrUri::new("cloudreve://my").unwrap();
+        let param = SearchParam {
+            name: Some(vec!["foo".to_string(), "bar".to_string()]),
+            name_op_or: Some(true),
+            case_folding: Some(true),
+            category: Some(uri_search_category::IMAGE.to_string()),
+            type_: Some(file_type::FOLDER),
+            size_gte: Some(10),
+            size_lte: Some(100),
+            created_at_gte: Some(1),
+            created_at_lte: Some(2),
+            updated_at_gte: Some(3),
+            updated_at_lte: Some(4),
+            ..Default::default()
+        };
+        uri.set_search_param(param);
+
+        let parsed = uri.search_params().expect("search params present");
+        assert_eq!(
+            parsed.name,
+            Some(vec!["foo".to_string(), "bar".to_string()])
+        );
+        assert_eq!(parsed.name_op_or, Some(true));
+        assert_eq!(parsed.case_folding, Some(true));
+        assert_eq!(parsed.category.as_deref(), Some(uri_search_category::IMAGE));
+        assert_eq!(parsed.type_, Some(file_type::FOLDER));
+        assert_eq!(parsed.size_gte, Some(10));
+        assert_eq!(parsed.size_lte, Some(100));
+        assert_eq!(parsed.created_at_gte, Some(1));
+        assert_eq!(parsed.created_at_lte, Some(2));
+        assert_eq!(parsed.updated_at_gte, Some(3));
+        assert_eq!(parsed.updated_at_lte, Some(4));
+    }
+
+    #[test]
+    fn search_param_type_file_roundtrip() {
+        let mut uri = CrUri::new("cloudreve://my").unwrap();
+        uri.set_search_param(SearchParam {
+            type_: Some(file_type::FILE),
+            ..Default::default()
+        });
+        assert_eq!(uri.query(uri_query::TYPE), vec!["file"]);
+        assert_eq!(uri.search_params().unwrap().type_, Some(file_type::FILE));
+    }
+
+    #[test]
+    fn search_param_metadata_roundtrip() {
+        let mut uri = CrUri::new("cloudreve://my").unwrap();
+        let mut meta = HashMap::new();
+        meta.insert("color".to_string(), "red".to_string());
+        let mut strong = HashMap::new();
+        strong.insert("tag".to_string(), "final".to_string());
+
+        uri.set_search_param(SearchParam {
+            metadata: Some(meta),
+            metadata_strong_match: Some(strong),
+            ..Default::default()
+        });
+
+        let parsed = uri.search_params().unwrap();
+        assert_eq!(
+            parsed.metadata.unwrap().get("color").map(String::as_str),
+            Some("red")
+        );
+        assert_eq!(
+            parsed
+                .metadata_strong_match
+                .unwrap()
+                .get("tag")
+                .map(String::as_str),
+            Some("final")
+        );
+    }
+
+    #[test]
+    fn search_param_in_trash_uses_restore_uri_metadata() {
+        let mut uri = CrUri::new("cloudreve://trash").unwrap();
+        uri.set_search_param(SearchParam {
+            name: Some(vec!["a".to_string(), "b".to_string()]),
+            ..Default::default()
+        });
+        // No plain name query; instead a restore_uri metadata key.
+        assert!(uri.query(uri_query::NAME).is_empty());
+        assert_eq!(uri.query("meta_restore_uri"), vec!["a%20b"]);
+    }
+
+    #[test]
+    fn pure_uri_keeps_only_exceptions() {
+        let mut uri = CrUri::new("cloudreve://my/docs").unwrap();
+        uri.add_query("name", "foo").add_query("type", "file");
+        let pure = uri.pure_uri(&["name"]).unwrap();
+        assert_eq!(pure.query("name"), vec!["foo"]);
+        assert!(pure.query("type").is_empty());
+    }
+
+    #[test]
+    fn new_my_uri_with_and_without_uid() {
+        assert_eq!(new_my_uri(Some("alice")).unwrap().id(), "alice");
+        let anon = new_my_uri(None).unwrap();
+        assert_eq!(anon.fs(), "my");
+        assert_eq!(anon.id(), "");
     }
 }

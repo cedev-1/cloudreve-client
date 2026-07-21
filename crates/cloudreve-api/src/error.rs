@@ -209,3 +209,135 @@ impl ApiError {
 
 /// Result type alias for API operations
 pub type ApiResult<T> = Result<T, ApiError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn response(code: i32, msg: &str) -> ApiResponse<()> {
+        ApiResponse {
+            data: None,
+            code,
+            msg: msg.to_string(),
+            error: None,
+            correlation_id: None,
+            aggregated_error: None,
+        }
+    }
+
+    #[test]
+    fn error_code_from_code_maps_known_values() {
+        assert_eq!(ErrorCode::from_code(0), Some(ErrorCode::Success));
+        assert_eq!(ErrorCode::from_code(40073), Some(ErrorCode::LockConflict));
+        assert_eq!(ErrorCode::from_code(401), Some(ErrorCode::LoginRequired));
+        assert_eq!(ErrorCode::from_code(404), Some(ErrorCode::NotFound));
+    }
+
+    #[test]
+    fn error_code_from_code_returns_none_for_unknown() {
+        assert_eq!(ErrorCode::from_code(12345), None);
+        // ParentNotExist has a variant but is intentionally not mapped.
+        assert_eq!(ErrorCode::from_code(40016), None);
+    }
+
+    #[test]
+    fn is_credential_error_only_for_auth_codes() {
+        assert!(ErrorCode::CredentialInvalid.is_credential_error());
+        assert!(ErrorCode::LoginRequired.is_credential_error());
+        assert!(ErrorCode::SessionExpired.is_credential_error());
+        assert!(!ErrorCode::NotFound.is_credential_error());
+        assert!(!ErrorCode::Success.is_credential_error());
+    }
+
+    #[test]
+    fn from_response_maps_lock_conflict() {
+        let err = ApiError::from_response(response(40073, "locked"));
+        match err {
+            ApiError::LockConflict { message, detail } => {
+                assert_eq!(message, "locked");
+                assert!(detail.is_none());
+            }
+            other => panic!("expected LockConflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_response_maps_batch_error_with_aggregated() {
+        let mut resp = response(40081, "partial");
+        let mut agg = HashMap::new();
+        agg.insert("file1".to_string(), response(404, "missing"));
+        resp.aggregated_error = Some(agg);
+
+        match ApiError::from_response(resp) {
+            ApiError::BatchError {
+                message,
+                aggregated_errors,
+            } => {
+                assert_eq!(message, "partial");
+                let agg = aggregated_errors.expect("aggregated errors present");
+                assert_eq!(agg.get("file1").map(String::as_str), Some("missing"));
+            }
+            other => panic!("expected BatchError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_response_maps_auth_codes_to_login_required() {
+        for code in [401, 40020, 40089] {
+            match ApiError::from_response(response(code, "auth")) {
+                ApiError::LoginRequired(msg) => assert_eq!(msg, "auth"),
+                other => panic!("expected LoginRequired for {code}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn from_response_defaults_to_generic_api_error() {
+        let mut resp = response(500, "boom");
+        resp.error = Some("stacktrace".to_string());
+        resp.correlation_id = Some("cid-1".to_string());
+
+        match ApiError::from_response(resp) {
+            ApiError::ApiError {
+                code,
+                message,
+                error_detail,
+                correlation_id,
+                aggregated_errors,
+            } => {
+                assert_eq!(code, 500);
+                assert_eq!(message, "boom");
+                assert_eq!(error_detail.as_deref(), Some("stacktrace"));
+                assert_eq!(correlation_id.as_deref(), Some("cid-1"));
+                assert!(aggregated_errors.is_none());
+            }
+            other => panic!("expected ApiError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn is_token_expired_only_for_access_token_expired() {
+        assert!(ApiError::AccessTokenExpired.is_token_expired());
+        assert!(!ApiError::RefreshTokenExpired.is_token_expired());
+        assert!(!ApiError::NoTokensAvailable.is_token_expired());
+    }
+
+    #[test]
+    fn requires_login_for_login_and_refresh_expiry() {
+        assert!(ApiError::LoginRequired("x".into()).requires_login());
+        assert!(ApiError::RefreshTokenExpired.requires_login());
+        assert!(!ApiError::AccessTokenExpired.requires_login());
+    }
+
+    #[test]
+    fn display_includes_code_and_message() {
+        let err = ApiError::ApiError {
+            code: 42,
+            message: "nope".to_string(),
+            error_detail: None,
+            correlation_id: None,
+            aggregated_errors: None,
+        };
+        assert_eq!(err.to_string(), "API error (code 42): nope");
+    }
+}
