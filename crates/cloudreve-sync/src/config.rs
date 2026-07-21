@@ -156,8 +156,9 @@ impl ConfigManager {
         if let Some(parent) = self.config_path.parent() {
             if !parent.exists() {
                 fs::create_dir_all(parent).context("Failed to create config directory")?;
-                crate::utils::secure_fs::restrict_dir(parent)?;
             }
+            // Tighten even a pre-existing directory that predates this hardening.
+            crate::utils::secure_fs::restrict_dir(parent)?;
         }
 
         let config = self.config.read().map_err(|e| {

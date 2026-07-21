@@ -11,10 +11,34 @@ use std::path::Path;
 /// hardening (with the default `0644` umask) is tightened on the next save.
 pub fn write_private<P: AsRef<Path>, C: AsRef<[u8]>>(path: P, contents: C) -> Result<()> {
     let path = path.as_ref();
-    std::fs::write(path, contents)
-        .with_context(|| format!("Failed to write file {}", path.display()))?;
-    restrict_file(path)?;
-    Ok(())
+
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        // Create the file with 0600 from the start so it never exists with
+        // loose permissions (avoids a TOCTOU window between write and chmod).
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("Failed to open file {}", path.display()))?;
+        f.write_all(contents.as_ref())
+            .with_context(|| format!("Failed to write file {}", path.display()))?;
+        // OpenOptions::mode only applies when the file is created; tighten an
+        // existing file that predates this hardening.
+        restrict_file(path)?;
+        return Ok(());
+    }
+
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents)
+            .with_context(|| format!("Failed to write file {}", path.display()))?;
+        Ok(())
+    }
 }
 
 /// Restrict an existing file to owner-only read/write (`0600`) on Unix.
