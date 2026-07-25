@@ -1,16 +1,17 @@
-name: Beta Release
+name: Release
 
+# One workflow for every release. Whether a tag is a prerelease is derived from
+# the tag itself (semver: anything with a `-` suffix), so a beta can never be
+# published as the "latest" release that the auto-updater points at.
 on:
   push:
     tags:
-      - 'v*-beta*'
-      - 'v*-alpha*'
+      - 'v*'
   workflow_dispatch:
     inputs:
-      version:
-        description: 'Version tag (e.g. v0.1.0-beta.1)'
+      tag:
+        description: 'Existing tag to (re)build, e.g. v0.2.0-beta.1'
         required: true
-        default: 'v0.1.0-beta.1'
 
 jobs:
   create-release:
@@ -19,21 +20,27 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       release_id: ${{ steps.create.outputs.id }}
+      tag: ${{ steps.meta.outputs.tag }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6.0.2
         with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
           fetch-depth: 0
 
-      - name: Create git tag (workflow_dispatch only)
-        if: github.event_name == 'workflow_dispatch'
+      - name: Resolve release metadata
+        id: meta
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag ${{ github.event.inputs.version }} || true
-          git push origin ${{ github.event.inputs.version }} || true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          # Semver: a prerelease is anything carrying a `-` suffix (-alpha, -beta,
+          # -rc). GitHub excludes prereleases from `releases/latest`, which is the
+          # URL the updater polls, so this flag is what keeps stable users off betas.
+          if [[ "$TAG" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Generate changelog
         uses: orhun/git-cliff-action@v4
@@ -45,29 +52,34 @@ jobs:
           OUTPUT: /tmp/release-notes.md
           GITHUB_REPO: ${{ github.repository }}
 
+      # Appended here rather than through the action's `body` + `append_body`:
+      # when the release is created fresh, `body_path` wins and `body` is dropped
+      # silently — which is why no release so far has ever shown these notes.
+      - name: Append installation notes
+        run: |
+          cat >> /tmp/release-notes.md <<'EOF'
+
+          ---
+
+          ### Installation (macOS, Apple Silicon)
+          1. Download the `.dmg` and drag Cloudreve to Applications
+          2. **First launch**: right-click -> Open -> Run `xattr -cr /Applications/Cloudreve.app`
+
+          ### Installation (Linux, x86_64)
+          - `.AppImage`: `chmod +x Cloudreve*.AppImage && ./Cloudreve*.AppImage`
+            This is the only Linux format that can auto-update itself.
+          - `.deb`: `sudo dpkg -i *.deb` — updates must be installed manually.
+          EOF
+
       - name: Create GitHub Release
         id: create
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ github.event.inputs.version || github.ref_name }}
-          name: 'Cloudreve Desktop ${{ github.event.inputs.version || github.ref_name }}'
-          prerelease: false
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: 'Cloudreve Desktop ${{ steps.meta.outputs.tag }}'
+          prerelease: ${{ steps.meta.outputs.prerelease }}
           draft: false
           body_path: /tmp/release-notes.md
-          append_body: true
-          body: |
-
-            ---
-
-            ### Installation (macOS)
-            1. Download the `.dmg` for your architecture (Apple Silicon → `aarch64`, Intel → `x86_64`)
-            2. Open the `.dmg` and drag Cloudreve to Applications
-            3. **First launch**: right-click → Open → Open (required because the app is not signed)
-               Or run: `xattr -cr /Applications/Cloudreve.app`
-
-            ### Installation (Linux)
-            - `.AppImage`: make executable and run (`chmod +x *.AppImage && ./Cloudreve*.AppImage`)
-            - `.deb`: `sudo dpkg -i *.deb`
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -91,6 +103,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ needs.create-release.outputs.tag }}
 
       - name: Install Node.js
         uses: actions/setup-node@v6.4.0
@@ -124,9 +138,16 @@ jobs:
 
       - name: Set app version from tag
         run: |
-          VERSION="${{ github.event.inputs.version || github.ref_name }}"
+          VERSION="${{ needs.create-release.outputs.tag }}"
           VERSION="${VERSION#v}"
-          jq --arg v "$VERSION" '.version = $v' src-tauri/tauri.conf.json > tmp.json && mv tmp.json src-tauri/tauri.conf.json
+          # Two sources to patch: the bundle version shown to users and compared by
+          # the updater, and the crate version that `CARGO_PKG_VERSION` bakes into
+          # the User-Agent sent to every Cloudreve server.
+          jq --arg v "$VERSION" '.version = $v' src-tauri/tauri.conf.json > tmp.json
+          mv tmp.json src-tauri/tauri.conf.json
+          sed -i.bak -E "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
+          rm Cargo.toml.bak
+          grep -q "^version = \"$VERSION\"$" Cargo.toml
 
       - name: Install frontend dependencies
         working-directory: ui

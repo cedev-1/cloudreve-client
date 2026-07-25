@@ -1,7 +1,7 @@
 # Cloudreve MacOS & Linux Desktop Client
 
 > [!IMPORTANT]
-> For the moment it's a beta version : [v0.2.0-beta.1](https://github.com/cedev-1/cloudreve-client/releases/tag/v0.2.0-beta.1)
+> This client is still young — grab the [latest release](https://github.com/cedev-1/cloudreve-client/releases/latest).
 
 > [!WARNING]
 > Cloudreve server version **4.16.1** has a bug where OAuth scope enforcement blocks desktop clients from accessing `/user/me` and other user endpoints ([details](https://github.com/cloudreve/cloudreve/issues/3471)). Please upgrade to **4.17.0**.
