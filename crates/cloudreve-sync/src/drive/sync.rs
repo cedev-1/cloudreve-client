@@ -485,13 +485,28 @@ async fn list_remote_recursive(mount: &Mount, base: &CrUri) -> Result<Vec<FileRe
 }
 
 /// Walk local directory and collect all file paths (excluding directories).
+///
+/// Refuses to scan a root that is not a reachable directory. An ejected volume,
+/// an unmounted share or a deleted folder would otherwise scan as empty, and the
+/// 3-way merge would read that as the user having deleted every file: the whole
+/// inventory gets purged, local-only files are re-uploaded when the volume comes
+/// back, and edits made in the meantime are re-registered against the remote
+/// etag and never uploaded. An empty *reachable* folder stays legitimate.
 fn walk_local(root: &PathBuf) -> Result<Vec<PathBuf>> {
+    if !root.is_dir() {
+        anyhow::bail!(
+            "Sync folder is not reachable: {} (deleted, or its volume is not mounted)",
+            root.display()
+        );
+    }
     let mut files = Vec::new();
     walk_dir_recursive(root, &mut files)?;
     Ok(files)
 }
 
 fn walk_dir_recursive(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+    // Only the root is a hard requirement; a subdirectory removed mid-walk is
+    // ordinary churn, not a reason to abort the whole sync.
     if !dir.is_dir() {
         return Ok(());
     }
