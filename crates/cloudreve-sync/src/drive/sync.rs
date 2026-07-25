@@ -1,7 +1,9 @@
 use crate::drive::mounts::Mount;
-use crate::drive::utils::remote_path_to_local_relative_path;
+use crate::drive::utils::{is_partial_download, remote_path_to_local_relative_path};
 use crate::inventory::{MetadataEntry, FileMetadata};
 use crate::tasks::TaskPayload;
+use crate::utils::disk_space;
+use crate::utils::toast::send_low_disk_space_toast;
 use anyhow::{Context, Result};
 use cloudreve_api::{
     api::explorer::ExplorerApi,
@@ -85,6 +87,41 @@ pub fn group_fs_events(events: Vec<DebouncedEvent>) -> GroupedFsEvents {
 /// - `(false, false, true)` : new remote file → download
 /// - `(false, true, true)` : exists on both sides, not yet tracked → mark as synced in DB
 /// - `(true, true, true)` : already in sync, SSE handles live changes
+/// Total size of the remote files that have no local copy yet — the bytes a
+/// sync would have to write to disk. Saturates rather than wrapping so an
+/// absurd remote size can never look small.
+fn bytes_to_download(
+    remote_map: &HashMap<PathBuf, &FileResponse>,
+    local_set: &HashSet<PathBuf>,
+) -> u64 {
+    remote_map
+        .iter()
+        .filter(|(rel, _)| !local_set.contains(*rel))
+        .fold(0u64, |acc, (_, f)| acc.saturating_add(f.size.max(0) as u64))
+}
+
+/// Notify the user when `needed` bytes will not fit on the sync volume.
+async fn warn_if_sync_will_not_fit(mount: &Mount, local_root: &PathBuf, needed: u64) {
+    if needed == 0 {
+        return;
+    }
+    match disk_space::available_space_for(local_root) {
+        Ok(available) if !disk_space::fits_on_volume(needed, available) => {
+            let name = mount.get_config().await.name;
+            send_low_disk_space_toast(&mount.id, &name, needed, available);
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(
+                target: "drive::sync",
+                id = %mount.id,
+                error = %e,
+                "Failed to query available disk space"
+            );
+        }
+    }
+}
+
 pub async fn full_sync(mount: &Mount, local_root: &PathBuf, remote_path: &str) -> Result<()> {
     if mount.is_paused() {
         tracing::info!(target: "drive::sync", id = %mount.id, "Sync skipped: drive is paused");
@@ -135,6 +172,12 @@ pub async fn full_sync(mount: &Mount, local_root: &PathBuf, remote_path: &str) -
                 .map(|r| (r.to_path_buf(), e))
         })
         .collect();
+
+    // Warn up front if the whole sync cannot fit. This does not stop the sync:
+    // whatever fits is still worth downloading, and the per-file guard in the
+    // download task is the hard stop. Without this warning the user would only
+    // see files failing one by one with no explanation.
+    warn_if_sync_will_not_fit(mount, local_root, bytes_to_download(&remote_map, &local_set)).await;
 
     // 4. Union of all known paths
     let all_paths: HashSet<PathBuf> = remote_map
