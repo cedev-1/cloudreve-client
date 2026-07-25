@@ -5,3 +5,9 @@ members = [
     "crates/cloudreve-sync",
     "src-tauri",
 ]
+
+# Single source of truth for the Rust side. `CARGO_PKG_VERSION` is baked into the
+# User-Agent sent to every Cloudreve server (crates/cloudreve-sync/src/lib.rs), so
+# a crate left behind quietly reports the wrong client version.
+[workspace.package]
+version = "0.2.0-beta.1"
