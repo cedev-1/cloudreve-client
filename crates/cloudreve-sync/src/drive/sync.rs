@@ -6,9 +6,10 @@ use crate::utils::disk_space;
 use crate::utils::toast::send_low_disk_space_toast;
 use anyhow::{Context, Result};
 use cloudreve_api::{
-    api::explorer::ExplorerApi,
+    api::explorer::ExplorerApiExt,
     models::{
-        explorer::{FileResponse, ListFileService, file_type},
+        common::ListAllRes,
+        explorer::{FileResponse, ListResponse, file_type},
         uri::CrUri,
     },
 };
@@ -415,32 +416,68 @@ async fn should_ignore(mount: &Mount, path: &Path) -> bool {
     matcher.is_match(path)
 }
 
+/// Page size used for the very first request. The server advertises its own
+/// limit in `props.max_page_size`, but that only arrives *with* a response, so
+/// the first call has to guess conservatively.
+const INITIAL_PAGE_SIZE: i32 = 100;
+
 /// List all remote files recursively starting from `base`.
+///
+/// Every directory is read to its last page. Cloudreve paginates either by
+/// offset or by cursor depending on the storage policy; `list_files_all` handles
+/// both and reports whether more remains. Stopping early would not just miss
+/// files: an already-synced file that fell past the boundary would look deleted
+/// from the server, lose its inventory row, and get re-uploaded on the next pass.
 async fn list_remote_recursive(mount: &Mount, base: &CrUri) -> Result<Vec<FileResponse>> {
     let mut all = Vec::new();
     let mut dirs = vec![base.clone()];
+    // Learned from the first response, then reused for every later directory.
+    let mut server_page_size: Option<i32> = None;
 
     while let Some(dir) = dirs.pop() {
-        let listing = mount
-            .cr_client
-            .list_files(&ListFileService {
-                uri: dir.to_string(),
-                page: None,
-                page_size: Some(500),
-                order_by: None,
-                order_direction: None,
-                next_page_token: None,
-            })
-            .await
-            .context("Failed to list remote directory")?;
+        let uri = dir.to_string();
+        // Frozen for the whole directory: changing the page size mid-listing
+        // would shift the offset windows and skip or duplicate entries.
+        let page_size = server_page_size.unwrap_or(INITIAL_PAGE_SIZE);
+        let mut previous: Option<ListAllRes<ListResponse>> = None;
+        let mut last_position: Option<(i32, Option<String>)> = None;
 
-        for item in listing.files {
-            if item.file_type == file_type::FOLDER {
-                if let Ok(child_uri) = CrUri::new(&item.path) {
-                    dirs.push(child_uri);
-                }
+        loop {
+            let mut response = mount
+                .cr_client
+                .list_files_all(previous.as_ref(), &uri, page_size)
+                .await
+                .context("Failed to list remote directory")?;
+
+            if server_page_size.is_none() && response.res.props.max_page_size > 0 {
+                server_page_size = Some(response.res.props.max_page_size);
             }
-            all.push(item);
+
+            for item in std::mem::take(&mut response.res.files) {
+                if item.file_type == file_type::FOLDER {
+                    if let Ok(child_uri) = CrUri::new(&item.path) {
+                        dirs.push(child_uri);
+                    }
+                }
+                all.push(item);
+            }
+
+            if !response.more {
+                break;
+            }
+
+            // A server that keeps announcing more pages while handing back the
+            // same position would loop forever; fail loudly instead.
+            let position = (
+                response.res.pagination.page,
+                response.res.pagination.next_token.clone(),
+            );
+            if last_position.as_ref() == Some(&position) {
+                anyhow::bail!("Remote listing of {uri} is not advancing past page {}", position.0);
+            }
+            last_position = Some(position);
+
+            previous = Some(response);
         }
     }
 
