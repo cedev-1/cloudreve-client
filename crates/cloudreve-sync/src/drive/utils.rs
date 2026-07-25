@@ -1,10 +1,23 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use cloudreve_api::models::uri::CrUri;
 use url::Url;
 
 use crate::drive::mounts::DriveConfig;
+
+/// Prefix of a partial download. Downloads are staged next to their destination
+/// so the final move stays on one filesystem, which means the sync folder holds
+/// these files while they are being written.
+pub const PARTIAL_DOWNLOAD_PREFIX: &str = ".cloudreve-part-";
+
+/// Whether `path` is a partial download staged by the client. Such a file is
+/// half-written by definition and must never be scanned, tracked or uploaded.
+pub fn is_partial_download(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with(PARTIAL_DOWNLOAD_PREFIX))
+}
 
 pub fn local_path_to_cr_uri(path: PathBuf, root: PathBuf, remote_base: String) -> Result<CrUri> {
     let mut base = CrUri::new(&remote_base)?;

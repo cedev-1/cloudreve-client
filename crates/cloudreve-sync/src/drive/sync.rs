@@ -52,6 +52,11 @@ pub fn group_fs_events(events: Vec<DebouncedEvent>) -> GroupedFsEvents {
 
     for event in events {
         for path in &event.paths {
+            // Our own partial downloads live in the sync folder; reacting to
+            // them would upload a half-written file back to the server.
+            if is_partial_download(path) {
+                continue;
+            }
             match event.kind {
                 EventKind::Remove(_) => {
                     changed.remove(path);
@@ -458,7 +463,8 @@ fn walk_dir_recursive(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
         let path = entry.path();
         if path.is_dir() {
             walk_dir_recursive(&path, files)?;
-        } else {
+        } else if !is_partial_download(&path) {
+            // A download in flight is not a local file the user created.
             files.push(path);
         }
     }
@@ -476,6 +482,67 @@ mod tests {
 
     fn ev(kind: EventKind, path: &str) -> DebouncedEvent {
         DebouncedEvent::new(Event::new(kind).add_path(PathBuf::from(path)), Instant::now())
+    }
+
+    /// Partial downloads live inside the sync folder while they are being
+    /// written. Treating one as a local change would upload a half-written
+    /// file back to the server.
+    #[test]
+    fn partial_downloads_are_not_reported_as_local_changes() {
+        let grouped = group_fs_events(vec![
+            ev(EventKind::Create(CreateKind::File), "/sync/.cloudreve-part-abc123"),
+            ev(EventKind::Modify(ModifyKind::Any), "/sync/.cloudreve-part-abc123"),
+            ev(EventKind::Create(CreateKind::File), "/sync/real.txt"),
+        ]);
+
+        assert_eq!(grouped.changed, vec![PathBuf::from("/sync/real.txt")]);
+    }
+
+    /// Nor may a partial download be picked up by the local scan: full_sync
+    /// would see an untracked local file and upload it.
+    #[test]
+    fn the_local_scan_skips_partial_downloads() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("real.txt"), b"x").unwrap();
+        std::fs::write(dir.path().join(".cloudreve-part-abc123"), b"x").unwrap();
+
+        let found = walk_local(&dir.path().to_path_buf()).unwrap();
+
+        assert_eq!(found, vec![dir.path().join("real.txt")]);
+    }
+
+    fn sized(size: i64) -> FileResponse {
+        FileResponse { size, ..Default::default() }
+    }
+
+    /// Only files missing locally have to be written to disk.
+    #[test]
+    fn files_already_present_locally_do_not_count_towards_the_download_size() {
+        let here = sized(300);
+        let missing = sized(700);
+        let remote = HashMap::from([
+            (PathBuf::from("here.bin"), &here),
+            (PathBuf::from("missing.bin"), &missing),
+        ]);
+        let local = HashSet::from([PathBuf::from("here.bin")]);
+
+        assert_eq!(bytes_to_download(&remote, &local), 700);
+    }
+
+    /// A remote far larger than u64 can express must not wrap around to a
+    /// small number and defeat the guard.
+    #[test]
+    fn absurd_remote_sizes_saturate_instead_of_overflowing() {
+        let a = sized(i64::MAX);
+        let b = sized(i64::MAX);
+        let c = sized(i64::MAX);
+        let remote = HashMap::from([
+            (PathBuf::from("a"), &a),
+            (PathBuf::from("b"), &b),
+            (PathBuf::from("c"), &c),
+        ]);
+
+        assert_eq!(bytes_to_download(&remote, &HashSet::new()), u64::MAX);
     }
 
     /// An editor that saves via "write temp + delete + recreate" must end up

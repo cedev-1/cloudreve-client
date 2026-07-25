@@ -348,8 +348,16 @@ impl<'a> DownloadTask<'a> {
             std::fs::create_dir_all(parent).context("failed to create parent directory")?;
         }
 
-        // Download to temp file
-        let temp_path = std::env::temp_dir().join(format!("cloudreve_dl_{}", self.task.task_id));
+        // Stage the download next to its destination rather than in the system
+        // temp dir: a sync folder on another volume (external drive, second SSD,
+        // separate /home partition) cannot be reached by a rename from there.
+        // The `.cloudreve-part-` prefix keeps the local scan and the FS watcher
+        // from mistaking a half-written file for a user change.
+        let temp_path = local_path.with_file_name(format!(
+            "{}{}",
+            crate::drive::utils::PARTIAL_DOWNLOAD_PREFIX,
+            self.task.task_id
+        ));
         if temp_path.exists() {
             std::fs::remove_file(&temp_path).ok();
         }
