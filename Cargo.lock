@@ -753,7 +753,7 @@ dependencies = [
 
 [[package]]
 name = "cloudreve-api"
-version = "0.2.0-beta.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -774,7 +774,7 @@ dependencies = [
 
 [[package]]
 name = "cloudreve-desktop"
-version = "0.2.0-beta.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -811,7 +811,7 @@ dependencies = [
 
 [[package]]
 name = "cloudreve-sync"
-version = "0.2.0-beta.1"
+version = "0.3.0"
 dependencies = [
  "aes",
  "anyhow",
