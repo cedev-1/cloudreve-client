@@ -56,6 +56,10 @@ grep -q "^version = \"$VERSION\"\$" Cargo.toml \
 [[ "$(jq -r .version src-tauri/tauri.conf.json)" == "$VERSION" ]] \
   || { echo "error: failed to patch the version in tauri.conf.json" >&2; exit 1; }
 
+# Cargo.lock pins the workspace members by version too. Left alone it would still
+# name the previous release, so the tag would ship a lockfile contradicting it.
+cargo update --workspace --offline -q
+
 git add Cargo.toml Cargo.lock src-tauri/tauri.conf.json
 git commit -m "chore(release): $TAG"
 git tag "$TAG"
