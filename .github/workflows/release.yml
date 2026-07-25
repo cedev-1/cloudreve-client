@@ -71,14 +71,19 @@ jobs:
           - `.deb`: `sudo dpkg -i *.deb` — updates must be installed manually.
           EOF
 
-      - name: Create GitHub Release
+      # Created as a draft on purpose. A published release is immediately what
+      # `releases/latest` resolves to, so a visible one with no assets yet means
+      # every client polling for an update gets a 404 for the whole build. A draft
+      # is invisible until the `publish` job flips it, and a failed build simply
+      # leaves it unpublished instead of breaking the update channel.
+      - name: Create draft release
         id: create
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.meta.outputs.tag }}
           name: 'Cloudreve Desktop ${{ steps.meta.outputs.tag }}'
           prerelease: ${{ steps.meta.outputs.prerelease }}
-          draft: false
+          draft: true
           body_path: /tmp/release-notes.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -163,3 +168,17 @@ jobs:
           releaseId: ${{ needs.create-release.outputs.release_id }}
           includeUpdaterJson: true
           args: ${{ matrix.args }}
+
+  # Only reached when every build succeeded, so the release becomes visible with
+  # its full set of bundles and a `latest.json` that points at files that exist.
+  publish:
+    needs: [create-release, build]
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish the release
+        run: gh release edit "$TAG" --draft=false --repo "$GITHUB_REPOSITORY"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.create-release.outputs.tag }}
