@@ -25,7 +25,7 @@ use crate::{
     events::SummaryNotifier,
     inventory::{local_mtime_secs, ConflictState, FileMetadata, InventoryDb, MetadataEntry},
     tasks::queue::QueuedTask,
-    utils::toast::send_conflict_toast,
+    utils::{disk_space, toast::send_conflict_toast},
 };
 
 use super::types::TaskProgress;
@@ -307,6 +307,22 @@ impl<'a> DownloadTask<'a> {
         }
 
         let file_size = file_info.size as u64;
+
+        // Never let a mirror of a remote larger than the local volume fill the
+        // disk. Failing the task keeps the error visible instead of writing
+        // until the machine breaks.
+        let available = disk_space::available_space_for(&local_path)
+            .context("failed to query available disk space")?;
+        if !disk_space::fits_on_volume(file_size, available) {
+            anyhow::bail!(
+                "not enough disk space for {}: needs {} bytes, {} available (keeping {} bytes reserved)",
+                local_path.display(),
+                file_size,
+                available,
+                disk_space::RESERVED_BYTES
+            );
+        }
+
         self.remote_file_info = Some(file_info);
 
         // Get download URL

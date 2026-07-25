@@ -25,6 +25,61 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 pub const REMOTE_BASE: &str = "cloudreve://my/sync";
 
+/// A real, temporary HFS+ volume backed by RAM, detached on drop.
+///
+/// Lets tests exercise behavior that only shows up on a separate filesystem
+/// (free space limits, cross-device moves) instead of the single temp volume
+/// every other test shares. macOS only: building a filesystem on Linux needs
+/// root, which a test suite must not require.
+#[cfg(target_os = "macos")]
+pub struct RamDisk {
+    device: String,
+    pub mount_point: PathBuf,
+}
+
+#[cfg(target_os = "macos")]
+impl RamDisk {
+    /// Returns `None` when the volume cannot be created (no `hdiutil`,
+    /// restricted CI sandbox, ...) so callers can skip rather than fail on
+    /// something unrelated to the behavior under test.
+    pub fn new(size_mb: u64, label: &str) -> Option<Self> {
+        use std::process::Command;
+
+        let sectors = size_mb * 1024 * 1024 / 512;
+        let attach = Command::new("hdiutil")
+            .args(["attach", "-nomount", &format!("ram://{sectors}")])
+            .output()
+            .ok()?;
+        if !attach.status.success() {
+            return None;
+        }
+        let device = String::from_utf8_lossy(&attach.stdout).trim().to_string();
+        if device.is_empty() {
+            return None;
+        }
+
+        let format = Command::new("diskutil")
+            .args(["erasevolume", "HFS+", label, &device])
+            .output()
+            .ok()?;
+        if !format.status.success() {
+            let _ = Command::new("hdiutil").args(["detach", "-force", &device]).output();
+            return None;
+        }
+
+        Some(Self { device, mount_point: PathBuf::from(format!("/Volumes/{label}")) })
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for RamDisk {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("hdiutil")
+            .args(["detach", "-force", &self.device])
+            .output();
+    }
+}
+
 pub struct TestEnv {
     pub server: MockServer,
     pub mount: Arc<Mount>,
@@ -41,16 +96,28 @@ impl TestEnv {
     }
 
     pub async fn with_max_file_size(max_file_size_mb: u64) -> Self {
-        Self::build(max_file_size_mb, Vec::new()).await
+        Self::build(max_file_size_mb, Vec::new(), None).await
     }
 
     pub async fn with_ignore_patterns(patterns: Vec<String>) -> Self {
-        Self::build(1024, patterns).await
+        Self::build(1024, patterns, None).await
     }
 
-    async fn build(max_file_size_mb: u64, ignore_patterns: Vec<String>) -> Self {
+    /// Put the sync folder on a caller-chosen volume, so tests can exercise the
+    /// disk space guard against real free-space numbers.
+    pub async fn with_sync_dir(sync_dir: PathBuf, max_file_size_mb: u64) -> Self {
+        Self::build(max_file_size_mb, Vec::new(), Some(sync_dir)).await
+    }
+
+    async fn build(
+        max_file_size_mb: u64,
+        ignore_patterns: Vec<String>,
+        sync_dir_override: Option<PathBuf>,
+    ) -> Self {
         let tmp = TempDir::new().expect("create temp dir");
-        let sync_dir = tmp.path().join("sync");
+        // The inventory DB deliberately stays in the temp dir: on an overridden
+        // sync volume it would eat into the very free space under test.
+        let sync_dir = sync_dir_override.unwrap_or_else(|| tmp.path().join("sync"));
         std::fs::create_dir_all(&sync_dir).expect("create sync dir");
 
         let inventory = Arc::new(
