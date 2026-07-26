@@ -479,13 +479,26 @@ impl Mount {
         crate::drive::sync::full_sync(self, &sync_path, &remote_path).await
     }
 
+    /// Install a freshly spawned worker, stopping the one it replaces.
+    ///
+    /// Dropping a `JoinHandle` DETACHES its task rather than aborting it, so
+    /// overwriting the slot on its own would leave the previous worker running
+    /// forever and unreachable: `pause()` and `shutdown()` can only abort the
+    /// handle still stored here. `resume_drive` re-spawns these workers
+    /// unconditionally, so this is reached whenever a drive is resumed twice.
+    async fn replace_worker(slot: &Mutex<Option<JoinHandle<()>>>, new: JoinHandle<()>) {
+        if let Some(previous) = slot.lock().await.replace(new) {
+            previous.abort();
+        }
+    }
+
     /// Spawn the remote event processor (SSE)
     pub async fn spawn_remote_event_processor(self: &Arc<Self>, mount: Arc<Self>) {
         let s = self.clone();
         let handle = tokio::spawn(async move {
             s.process_remote_events(mount).await;
         });
-        *self.remote_event_handle.lock().await = Some(handle);
+        Self::replace_worker(&self.remote_event_handle, handle).await;
     }
 
     /// Spawn a task to periodically refresh drive properties (quota, etc.)
@@ -499,7 +512,7 @@ impl Mount {
                 }
             }
         });
-        *self.props_refresh_handle.lock().await = Some(handle);
+        Self::replace_worker(&self.props_refresh_handle, handle).await;
     }
 
     /// Spawn a periodic full sync every 5 minutes to catch changes
@@ -514,7 +527,7 @@ impl Mount {
                 let _ = command_tx.send(MountCommand::FullSync);
             }
         });
-        *self.periodic_sync_handle.lock().await = Some(handle);
+        Self::replace_worker(&self.periodic_sync_handle, handle).await;
     }
 
     async fn refresh_drive_props(&self) -> Result<()> {
