@@ -150,14 +150,14 @@ pub async fn full_sync(mount: &Mount, local_root: &PathBuf, remote_path: &str) -
         .collect();
 
     // 2. Local state
-    let local_files = walk_local(local_root)?;
+    let local_files = walk_local(local_root.clone()).await?;
     let local_set: HashSet<PathBuf> = local_files
         .iter()
         .filter_map(|p| p.strip_prefix(local_root).ok().map(|r| r.to_path_buf()))
         .collect();
 
     // 3. DB state (last known synced state)
-    let db_entries = mount.inventory.query_all_for_drive(&mount.id)?;
+    let db_entries = load_db_entries(mount.inventory.clone(), mount.id.clone()).await?;
     let db_set: HashSet<PathBuf> = db_entries
         .iter()
         .filter(|e| !e.is_folder)
@@ -484,6 +484,19 @@ async fn list_remote_recursive(mount: &Mount, base: &CrUri) -> Result<Vec<FileRe
     Ok(all)
 }
 
+/// Read the last-known synced state for a drive, off the runtime thread.
+///
+/// Diesel is a synchronous driver and this query loads every row for the drive,
+/// so on a large inventory it holds whichever thread calls it for the duration.
+async fn load_db_entries(
+    inventory: std::sync::Arc<crate::inventory::InventoryDb>,
+    drive_id: String,
+) -> Result<Vec<FileMetadata>> {
+    tokio::task::spawn_blocking(move || inventory.query_all_for_drive(&drive_id))
+        .await
+        .context("Inventory read panicked")?
+}
+
 /// Walk local directory and collect all file paths (excluding directories).
 ///
 /// Refuses to scan a root that is not a reachable directory. An ejected volume,
@@ -492,16 +505,25 @@ async fn list_remote_recursive(mount: &Mount, base: &CrUri) -> Result<Vec<FileRe
 /// inventory gets purged, local-only files are re-uploaded when the volume comes
 /// back, and edits made in the meantime are re-registered against the remote
 /// etag and never uploaded. An empty *reachable* folder stays legitimate.
-fn walk_local(root: &PathBuf) -> Result<Vec<PathBuf>> {
-    if !root.is_dir() {
-        anyhow::bail!(
-            "Sync folder is not reachable: {} (deleted, or its volume is not mounted)",
-            root.display()
-        );
-    }
-    let mut files = Vec::new();
-    walk_dir_recursive(root, &mut files)?;
-    Ok(files)
+///
+/// Runs on the blocking pool. Every `read_dir`/`is_dir` here is a synchronous
+/// syscall, and on a large sync folder the walk takes long enough that doing it
+/// on a runtime thread stalls every other task on that thread — downloads,
+/// uploads and the UI's status polling included.
+async fn walk_local(root: PathBuf) -> Result<Vec<PathBuf>> {
+    tokio::task::spawn_blocking(move || {
+        if !root.is_dir() {
+            anyhow::bail!(
+                "Sync folder is not reachable: {} (deleted, or its volume is not mounted)",
+                root.display()
+            );
+        }
+        let mut files = Vec::new();
+        walk_dir_recursive(&root, &mut files)?;
+        Ok(files)
+    })
+    .await
+    .context("Local walk panicked")?
 }
 
 fn walk_dir_recursive(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
@@ -552,13 +574,13 @@ mod tests {
 
     /// Nor may a partial download be picked up by the local scan: full_sync
     /// would see an untracked local file and upload it.
-    #[test]
-    fn the_local_scan_skips_partial_downloads() {
+    #[tokio::test]
+    async fn the_local_scan_skips_partial_downloads() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("real.txt"), b"x").unwrap();
         std::fs::write(dir.path().join(".cloudreve-part-abc123"), b"x").unwrap();
 
-        let found = walk_local(&dir.path().to_path_buf()).unwrap();
+        let found = walk_local(dir.path().to_path_buf()).await.unwrap();
 
         assert_eq!(found, vec![dir.path().join("real.txt")]);
     }
@@ -635,5 +657,58 @@ mod tests {
 
         assert_eq!(grouped.changed.len(), 1);
         assert!(grouped.deleted.is_empty());
+    }
+
+    /// The local walk must not run on the runtime thread.
+    ///
+    /// A single-threaded runtime only polls other tasks when the current one
+    /// yields. So a task spawned just before the walk can only have run if the
+    /// walk reached an await point — which is exactly what offloading to the
+    /// blocking pool provides. Called inline, the walk never yields and the flag
+    /// stays false however long it takes. No timing involved: the assertion
+    /// distinguishes the two implementations outright.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_local_walk_yields_to_the_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
+
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = ran.clone();
+        tokio::spawn(async move {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let files = walk_local(dir.path().to_path_buf()).await.unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert!(
+            ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the local walk blocked the runtime: a concurrently spawned task never got to run"
+        );
+    }
+
+    /// Same requirement for the inventory read. Diesel is a synchronous driver:
+    /// `query_all_for_drive` loads every row for the drive and holds the calling
+    /// thread for the whole query.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_inventory_read_yields_to_the_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = std::sync::Arc::new(
+            crate::inventory::InventoryDb::with_path(dir.path().join("meta.db")).unwrap(),
+        );
+
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = ran.clone();
+        tokio::spawn(async move {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let entries = load_db_entries(db, Uuid::new_v4().to_string()).await.unwrap();
+
+        assert!(entries.is_empty());
+        assert!(
+            ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the inventory read blocked the runtime: a concurrently spawned task never got to run"
+        );
     }
 }
