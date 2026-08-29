@@ -191,6 +191,18 @@ impl TestEnv {
         cloudreve_sync::drive::sync::full_sync(&self.mount, &self.sync_dir, REMOTE_BASE).await
     }
 
+    /// Simulate the app being relaunched: rebuild the Mount over the same
+    /// inventory database and config, exactly like the next boot would.
+    /// Whatever startup does with the tasks left in the database has happened
+    /// by the time this returns.
+    pub async fn restart_mount(&mut self) {
+        let config = self.mount.get_config().await;
+        let (manager_tx, manager_rx) = mpsc::unbounded_channel();
+        let notifier = Arc::new(SummaryNotifier::new(Arc::new(EventBroadcaster::new(16))));
+        self.mount = Arc::new(Mount::new(config, self.inventory.clone(), manager_tx, notifier).await);
+        self._manager_rx = manager_rx;
+    }
+
     /// Absolute path of a file inside the local sync directory.
     pub fn local_path(&self, rel: &str) -> PathBuf {
         self.sync_dir.join(rel)

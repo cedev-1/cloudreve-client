@@ -114,7 +114,7 @@ impl HeartbeatManager {
                         // Re-enqueue offline tasks on all drives
                         let read_guard = drives.read().await;
                         for mount in read_guard.values() {
-                            if let Err(e) = mount.task_queue.re_enqueue_offline_tasks() {
+                            if let Err(e) = mount.re_enqueue_offline_tasks().await {
                                 tracing::warn!(
                                     target: "heartbeat",
                                     drive_id = %mount.id,

@@ -218,6 +218,7 @@ impl Mount {
             event_blocker.clone(),
             config.max_file_size_mb,
             summary_notifier,
+            &ignore_matcher,
         ).await;
         let id = config.id.clone();
 
@@ -356,7 +357,7 @@ impl Mount {
                 MountCommand::FullSync => {
                     let mount_clone = mount.clone();
                     spawn(async move {
-                        if let Err(e) = mount_clone.task_queue.re_enqueue_offline_tasks() {
+                        if let Err(e) = mount_clone.re_enqueue_offline_tasks().await {
                             tracing::warn!(target: "drive::mounts", error = %e, "Failed to re-enqueue offline tasks");
                         }
                         let _lock = mount_clone.sync_lock.lock().await;
@@ -411,11 +412,7 @@ impl Mount {
                     if !path.exists() || path.is_dir() {
                         continue;
                     }
-                    let ignored = {
-                        let matcher = self.ignore_matcher.read().await;
-                        matcher.is_match(&path)
-                    };
-                    if ignored {
+                    if self.is_ignored(&path).await {
                         continue;
                     }
                     // Check file size against drive limit before uploading
@@ -451,7 +448,7 @@ impl Mount {
             }
             SyncMode::RemoteChanged => {
                 for path in local_paths {
-                    if path.is_dir() {
+                    if path.is_dir() || self.is_ignored(&path).await {
                         continue;
                     }
                     tracing::debug!(target: "drive::mounts", path = %path.display(), "Enqueuing download for remote change");
@@ -468,6 +465,17 @@ impl Mount {
         }
 
         Ok(())
+    }
+
+    /// Whether this path is excluded from syncing, in either direction.
+    pub async fn is_ignored(&self, path: &std::path::Path) -> bool {
+        self.ignore_matcher.read().await.is_match(path)
+    }
+
+    /// Replay the tasks parked while offline, dropping the ones now ignored.
+    pub async fn re_enqueue_offline_tasks(&self) -> Result<usize> {
+        let matcher = self.ignore_matcher.read().await.clone();
+        self.task_queue.re_enqueue_offline_tasks(&matcher)
     }
 
     async fn perform_full_sync(&self) -> Result<()> {
@@ -586,6 +594,11 @@ impl Mount {
     }
 
     pub async fn update_ignore_patterns(&self, patterns: Vec<String>) -> Result<()> {
+        // Refuse the whole list rather than half-apply it: this is the
+        // Settings save path, the one place the user can fix the typo. The
+        // startup path (`Mount::new`) stays tolerant instead — a bad line in
+        // the persisted config must never switch the defaults off.
+        crate::drive::ignore::validate_patterns(&patterns)?;
         let sync_path = self.config.read().await.sync_path.clone();
         let new_matcher = IgnoreMatcher::new(&patterns, sync_path.clone())
             .unwrap_or_else(|_| IgnoreMatcher::empty(sync_path));

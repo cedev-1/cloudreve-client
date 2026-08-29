@@ -195,6 +195,10 @@ pub async fn full_sync(mount: &Mount, local_root: &PathBuf, remote_path: &str) -
 
     let drive_uuid = Uuid::parse_str(&mount.id).ok();
 
+    // One snapshot for the whole merge: a Settings save landing mid-loop must
+    // not apply the new rules to half the tree and the old ones to the rest.
+    let ignore = mount.ignore_matcher.read().await.clone();
+
     // A file with an active upload session has no downloadable entity yet
     // (the listing shows it, but downloading it fails with "Entity not exist").
     let is_uploading = |f: &FileResponse| {
@@ -209,6 +213,22 @@ pub async fn full_sync(mount: &Mount, local_root: &PathBuf, remote_path: &str) -
         let in_local = local_set.contains(rel);
         let in_db = db_set.contains(rel);
         let path_str = local_path.to_str().unwrap_or("").to_string();
+
+        // Ignored paths are excluded from the merge entirely, whatever their
+        // state. Checking only the "new file" branches would leave anything
+        // already in the inventory churning forever: the (true, true, true)
+        // branch below compares etags and would keep pulling down a `.DS_Store`
+        // every time another machine's Finder rewrote it.
+        //
+        // A tracked row is left in place, dormant — NOT deleted. It is the
+        // only memory of what was last synced: without it, a file edited
+        // while a pattern covered it comes back through the
+        // (false, true, true) arm once the pattern is removed and gets
+        // stamped "in sync" as-is, silently dropping the edit (and any
+        // pending conflict_state with it).
+        if ignore.is_match(&local_path) {
+            continue;
+        }
 
         match (in_db, in_local, in_remote) {
             // Deleted locally (still on server) → forget it, don't re-download, don't touch server
@@ -234,9 +254,6 @@ pub async fn full_sync(mount: &Mount, local_root: &PathBuf, remote_path: &str) -
             }
             // New local file → upload
             (false, true, false) => {
-                if should_ignore(mount, &local_path).await {
-                    continue;
-                }
                 if let Ok(meta) = std::fs::metadata(&local_path) {
                     if !mount.is_file_size_allowed(meta.len()).await {
                         tracing::debug!(
@@ -252,9 +269,6 @@ pub async fn full_sync(mount: &Mount, local_root: &PathBuf, remote_path: &str) -
             }
             // New remote file → download
             (false, false, true) => {
-                if should_ignore(mount, &local_path).await {
-                    continue;
-                }
                 if let Some(rf) = remote_map.get(rel) {
                     if is_uploading(rf) {
                         tracing::debug!(
@@ -408,12 +422,6 @@ pub async fn full_sync(mount: &Mount, local_root: &PathBuf, remote_path: &str) -
 
     tracing::info!(target: "drive::sync", id = %mount.id, "Full sync complete");
     Ok(())
-}
-
-/// Check if a path should be ignored based on the drive's ignore patterns.
-async fn should_ignore(mount: &Mount, path: &Path) -> bool {
-    let matcher = mount.ignore_matcher.read().await;
-    matcher.is_match(path)
 }
 
 /// Page size used for the very first request. The server advertises its own

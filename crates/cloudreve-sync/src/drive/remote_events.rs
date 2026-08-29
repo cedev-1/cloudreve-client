@@ -188,7 +188,7 @@ impl Mount {
                     }
                     FileEvent::Resumed => {
                         self.set_event_push_subscribed(true).await;
-                        if let Err(e) = self.task_queue.re_enqueue_offline_tasks() {
+                        if let Err(e) = self.re_enqueue_offline_tasks().await {
                             tracing::warn!(target: "drive::remote_events", error = %e, "Failed to re-enqueue offline tasks on resume");
                         }
                         // The server replayed every event missed while we were
@@ -201,7 +201,7 @@ impl Mount {
                     }
                     FileEvent::Subscribed => {
                         self.set_event_push_subscribed(true).await;
-                        if let Err(e) = self.task_queue.re_enqueue_offline_tasks() {
+                        if let Err(e) = self.re_enqueue_offline_tasks().await {
                             tracing::warn!(target: "drive::remote_events", error = %e, "Failed to re-enqueue offline tasks on subscribe");
                         }
                         tracing::info!(target: "drive::remote_events", "New subscription, triggering full sync");

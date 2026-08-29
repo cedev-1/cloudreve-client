@@ -1,4 +1,5 @@
 use crate::drive::event_blocker::EventBlocker;
+use crate::drive::ignore::IgnoreMatcher;
 use crate::events::SummaryNotifier;
 use crate::inventory::{InventoryDb, NewTaskRecord, TaskRecord, TaskStatus, TaskUpdate};
 use crate::tasks::download::DownloadTask;
@@ -82,6 +83,7 @@ impl TaskQueue {
         event_blocker: EventBlocker,
         max_file_size_mb: u64,
         notifier: Arc<SummaryNotifier>,
+        ignore: &IgnoreMatcher,
     ) -> Arc<Self> {
         let drive_id = drive_id.into();
         let max_concurrent = config.max_concurrent.max(1);
@@ -111,7 +113,7 @@ impl TaskQueue {
         });
 
         queue.spawn_dispatcher(command_rx).await;
-        if let Err(err) = queue.resume_incomplete_tasks().await {
+        if let Err(err) = queue.resume_incomplete_tasks(ignore).await {
             warn!(
                 target: "tasks::queue",
                 drive = %queue.drive_id,
@@ -294,7 +296,12 @@ impl TaskQueue {
     /// Re-enqueue all pending tasks that are waiting for network reconnection.
     /// Clears the `offline_waiting` flag and dispatches them for execution.
     /// Called when the SSE connection is restored.
-    pub fn re_enqueue_offline_tasks(&self) -> Result<usize> {
+    ///
+    /// Parked tasks outlive the process, so this list can contain paths queued
+    /// by an older version that had no ignore rules — or paths the user has
+    /// excluded since. They are cancelled rather than skipped: a skipped task
+    /// keeps its `offline_waiting` flag and comes back at every reconnection.
+    pub fn re_enqueue_offline_tasks(&self, ignore: &IgnoreMatcher) -> Result<usize> {
         let records = self.inventory.list_tasks(
             Some(&self.drive_id),
             Some(&[TaskStatus::Pending]),
@@ -309,6 +316,33 @@ impl TaskQueue {
                 .unwrap_or(false);
 
             if !is_offline {
+                continue;
+            }
+
+            if ignore.is_match(&record.local_path) {
+                info!(
+                    target: "tasks::queue",
+                    drive = %self.drive_id,
+                    task_id = %record.id,
+                    path = %record.local_path,
+                    "Cancelling parked task: its path is now ignored"
+                );
+                if let Err(err) = self.inventory.update_task(
+                    &record.id,
+                    TaskUpdate {
+                        status: Some(TaskStatus::Cancelled),
+                        custom_state: Some(None),
+                        ..Default::default()
+                    },
+                ) {
+                    warn!(
+                        target: "tasks::queue",
+                        drive = %self.drive_id,
+                        task_id = %record.id,
+                        error = ?err,
+                        "Failed to cancel parked task for an ignored path"
+                    );
+                }
                 continue;
             }
 
@@ -896,7 +930,15 @@ impl TaskQueue {
         self.task_paths.remove(task_id);
     }
 
-    async fn resume_incomplete_tasks(self: &Arc<Self>) -> Result<()> {
+    /// Replay the tasks the previous run left behind, at startup.
+    ///
+    /// This is the twin of `re_enqueue_offline_tasks`, one boot earlier: an
+    /// upload interrupted by quitting the app comes back through here, before
+    /// any reconnection event ever fires. It needs the same filter — a junk
+    /// task queued by an older version would otherwise be pushed to the
+    /// server at the very next launch. Cancelled, not skipped, so it does not
+    /// return at every boot.
+    async fn resume_incomplete_tasks(self: &Arc<Self>, ignore: &IgnoreMatcher) -> Result<()> {
         let records = self.inventory.list_tasks(
             Some(&self.drive_id),
             Some(&[TaskStatus::Pending, TaskStatus::Running]),
@@ -908,6 +950,33 @@ impl TaskQueue {
 
         let mut resumed = 0usize;
         for record in records {
+            if ignore.is_match(&record.local_path) {
+                info!(
+                    target: "tasks::queue",
+                    drive = %self.drive_id,
+                    task_id = %record.id,
+                    path = %record.local_path,
+                    "Cancelling leftover task at startup: its path is now ignored"
+                );
+                if let Err(err) = self.inventory.update_task(
+                    &record.id,
+                    TaskUpdate {
+                        status: Some(TaskStatus::Cancelled),
+                        custom_state: Some(None),
+                        ..Default::default()
+                    },
+                ) {
+                    warn!(
+                        target: "tasks::queue",
+                        drive = %self.drive_id,
+                        task_id = %record.id,
+                        error = ?err,
+                        "Failed to cancel leftover task for an ignored path"
+                    );
+                }
+                continue;
+            }
+
             if record.status == TaskStatus::Running {
                 if let Err(err) = self.inventory.update_task(
                     &record.id,
