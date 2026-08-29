@@ -234,6 +234,21 @@ impl VfsTestEnv {
             .insert(format!("{REMOTE_BASE}/{subdir}"), files);
     }
 
+    /// Adds one more file to the root listing (accumulating, unlike
+    /// `set_remote_files` which replaces the whole listing) and registers its
+    /// content for download in the same call — the common case of building up
+    /// a multi-file fixture one file at a time.
+    pub async fn add_remote_file(&self, name: &str, content: Vec<u8>, etag: &str) {
+        {
+            let mut files = self.files.lock().unwrap();
+            files
+                .entry(REMOTE_BASE.to_string())
+                .or_default()
+                .push(remote_file(name, content.len() as i64, etag));
+        }
+        self.serve_file_content(name, &content).await;
+    }
+
     /// Total number of `GET /api/v4/file` (listing) requests served so far.
     pub fn list_request_count(&self) -> usize {
         self.list_requests.load(Ordering::SeqCst)
@@ -345,6 +360,25 @@ pub async fn fetch_download_url(env: &VfsTestEnv, name: &str) -> String {
         .url
         .clone();
     env.client().rewrite_url_origin(&raw)
+}
+
+/// Total size in bytes of every regular file under `dir`, recursing into
+/// subdirectories — used to check the on-disk cache footprint against a
+/// configured cap without knowing the cache's internal layout.
+pub fn dir_size(dir: &Path) -> u64 {
+    let mut total = 0u64;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            total += dir_size(&path);
+        } else if let Ok(meta) = entry.metadata() {
+            total += meta.len();
+        }
+    }
+    total
 }
 
 /// Parse a single-range `Range: bytes=a-b` header into an inclusive

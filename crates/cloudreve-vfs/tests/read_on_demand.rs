@@ -78,3 +78,32 @@ async fn a_read_past_the_end_returns_the_truncated_tail() {
     assert_eq!(vfs.read(h, 6, 100).await.unwrap().as_ref(), b"file");
     assert_eq!(vfs.read(h, 500, 100).await.unwrap().len(), 0);
 }
+
+/// The cap is enforced through the facade, not just inside cache.rs:
+/// reading a 4th file under a 3-file cap evicts the coldest CLOSED file.
+#[tokio::test]
+async fn the_cache_cap_holds_through_real_reads() {
+    let env = VfsTestEnv::new().await;
+    let mb = 1024 * 1024;
+    for (name, byte) in [("a.bin", 1u8), ("b.bin", 2), ("c.bin", 3), ("d.bin", 4)] {
+        env.add_remote_file(name, vec![byte; mb], &format!("e-{name}")).await;
+    }
+    let vfs = Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(),
+                       3 * mb as u64).unwrap();
+    for name in ["a.bin", "b.bin", "c.bin", "d.bin"] {
+        let node = vfs.tree().lookup(vfs.tree().root(), name).await.unwrap().unwrap().0;
+        let h = vfs.open(node).await.unwrap();
+        vfs.read(h, 0, mb as u32).await.unwrap();
+        vfs.close(h).await.unwrap();
+    }
+    env.wait_for_downloads_to_settle().await;
+    let disk: u64 = common::dir_size(env.cache_dir());
+    assert!(disk <= 3 * mb as u64 + 64 * 1024,
+        "cache dir holds {disk} bytes, cap was {}", 3 * mb);
+    // a.bin was evicted: reading it again must hit the network once more.
+    let before = env.download_requests("a.bin").len();
+    let node = vfs.tree().lookup(vfs.tree().root(), "a.bin").await.unwrap().unwrap().0;
+    let h = vfs.open(node).await.unwrap();
+    vfs.read(h, 0, 1024).await.unwrap();
+    assert!(env.download_requests("a.bin").len() > before);
+}
