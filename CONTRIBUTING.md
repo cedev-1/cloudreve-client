@@ -137,6 +137,55 @@ The UI is translated in 11 languages under `ui/public/locales/<lng>/common.json`
 - Link related issues (`Fixes #123`).
 - Screenshots are appreciated for UI changes.
 
+## Releasing
+
+Everything is driven by the git tag. There is no flag to tick anywhere else.
+
+```bash
+./scripts/release.sh 0.4.0          # stable
+./scripts/release.sh 0.4.0-beta.1   # prerelease
+```
+
+The script bumps the version in `Cargo.toml` (workspace) and
+`src-tauri/tauri.conf.json`, commits, and creates the tag. It stops there and
+prints the `git push` command — pushing the tag is what publishes the release, so
+that step stays manual.
+
+```bash
+git push origin main v0.4.0
+```
+
+Pushing the tag runs [`.github/workflows/release.yml`](.github/workflows/release.yml):
+git-cliff turns the commits since the previous tag into release notes, a **draft**
+release is created, macOS (Apple Silicon) and Linux (x86_64) runners attach the
+bundles plus the signed `latest.json` the updater reads, and only then is the draft
+published.
+
+Nothing is visible until every build has succeeded. A failed build leaves an
+unpublished draft rather than an empty release that `releases/latest` would send
+the updater to.
+
+### Stable vs prerelease
+
+A version carrying a `-` suffix is a prerelease, per semver:
+
+| Tag | GitHub | Auto-update |
+|-----|--------|-------------|
+| `v0.4.0` | Latest | offered to everyone |
+| `v0.4.0-beta.1`, `v1.0.0-rc.1` | prerelease | not offered |
+
+The updater polls `releases/latest`, which GitHub never resolves to a prerelease.
+So a beta reaches only the people who download it by hand — which is the point,
+but it also means **shipping only prereleases leaves existing users stranded on
+the last stable one**.
+
+> [!WARNING]
+> macOS builds are not signed or notarized yet. Gatekeeper blocks the first launch
+> (right-click → Open), and the updater cannot install an unsigned build, so macOS
+> users must update by hand until a signing identity is set up. On Linux only the
+> AppImage can update itself; the `.deb` is manual.
+
+
 ## Reporting bugs
 
 Open an issue with:
