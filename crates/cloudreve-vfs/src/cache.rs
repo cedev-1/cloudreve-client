@@ -206,7 +206,20 @@ impl BlockCache {
         Ok(Some(Bytes::from(buf)))
     }
 
-    pub fn write_block(&mut self, key: &FileKey, block_idx: u64, data: &[u8]) -> Result<()> {
+    /// `pinned` communicates the caller's intent for this entry — pass
+    /// `true` when writing on behalf of a currently open file.
+    ///
+    /// It must be applied to a freshly created entry *before*
+    /// `evict_if_over_budget` ever runs, not after `write_block` returns:
+    /// the eviction sweep below runs inside this same call, and a brand
+    /// new entry starts out unpinned by construction. A caller that writes
+    /// first and calls `pin()` afterward (the natural-looking order) can
+    /// have its own entry deleted out from under it in that gap — self-
+    /// eviction on the very first block of a fresh (or etag-reset) file,
+    /// reachable whenever a small `max_bytes` is already over budget with
+    /// nothing else evictable. `an_open_files_first_write_never_evicts_itself`
+    /// pins this down.
+    pub fn write_block(&mut self, key: &FileKey, block_idx: u64, data: &[u8], pinned: bool) -> Result<()> {
         let hash = hash_key(&key.remote_path);
 
         if self.entries.get(&hash).is_some_and(|e| e.etag != key.etag) {
@@ -236,7 +249,7 @@ impl BlockCache {
         let entry = self.entries.entry(hash.clone()).or_insert_with(|| Entry {
             etag: key.etag.clone(),
             blocks: BTreeSet::new(),
-            pinned: false,
+            pinned: false, // set below, uniformly for a fresh or pre-existing entry
             last_used_unix: 0,
             seq: 0,
         });
@@ -244,6 +257,18 @@ impl BlockCache {
         entry.blocks.insert(block_idx);
         entry.last_used_unix = now_unix();
         entry.seq = seq;
+        // Applied here — to the entry that now definitely exists, whether
+        // this call just created it or it was already there — and still
+        // before `evict_if_over_budget()` below, which is the whole point:
+        // a brand new entry must never be visible to eviction as unpinned,
+        // not even for the instant between this method creating it and a
+        // caller's own separate `pin()` call after it returns. Never
+        // unpins: `pinned: false` means "no opinion", not "unpin", so an
+        // explicit `unpin()` call elsewhere is never undone by an
+        // unrelated write.
+        if pinned {
+            entry.pinned = true;
+        }
 
         let entry = self.entries.get(&hash).expect("just inserted/updated above");
         self.write_meta(&hash, entry)?;
@@ -407,7 +432,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut c = BlockCache::open(dir.path(), 100 * BLOCK_SIZE).unwrap();
         let payload = vec![7u8; BLOCK_SIZE as usize];
-        c.write_block(&key("a", "e1"), 3, &payload).unwrap();
+        c.write_block(&key("a", "e1"), 3, &payload, false).unwrap();
         assert_eq!(c.read_block(&key("a", "e1"), 3).unwrap().unwrap().as_ref(), &payload[..]);
         assert!(c.read_block(&key("a", "e1"), 2).unwrap().is_none(), "unwritten block");
     }
@@ -416,7 +441,7 @@ mod tests {
     fn a_new_etag_invalidates_every_cached_block_of_the_file() {
         let dir = TempDir::new().unwrap();
         let mut c = BlockCache::open(dir.path(), 100 * BLOCK_SIZE).unwrap();
-        c.write_block(&key("a", "e1"), 0, &[1u8; 1024]).unwrap();
+        c.write_block(&key("a", "e1"), 0, &[1u8; 1024], false).unwrap();
         assert!(
             c.read_block(&key("a", "e2"), 0).unwrap().is_none(),
             "the server rewrote the file: old bytes must not be served"
@@ -428,7 +453,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         {
             let mut c = BlockCache::open(dir.path(), 100 * BLOCK_SIZE).unwrap();
-            c.write_block(&key("a", "e1"), 0, &[9u8; 512]).unwrap();
+            c.write_block(&key("a", "e1"), 0, &[9u8; 512], false).unwrap();
         }
         let mut c = BlockCache::open(dir.path(), 100 * BLOCK_SIZE).unwrap();
         assert_eq!(c.read_block(&key("a", "e1"), 0).unwrap().unwrap().as_ref(), &[9u8; 512][..]);
@@ -439,8 +464,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut c = BlockCache::open(dir.path(), 100 * BLOCK_SIZE).unwrap();
         let full_block = vec![5u8; BLOCK_SIZE as usize];
-        c.write_block(&key("a", "e1"), 0, &full_block).unwrap();
-        c.write_block(&key("a", "e1"), 1, &full_block).unwrap();
+        c.write_block(&key("a", "e1"), 0, &full_block, false).unwrap();
+        c.write_block(&key("a", "e1"), 1, &full_block, false).unwrap();
 
         // Simulate a crash mid-write: meta.json still lists block 0 as a
         // full BLOCK_SIZE block, but the data file on disk got truncated
@@ -474,8 +499,36 @@ mod tests {
         // And the cache is usable again: re-downloading and rewriting the
         // block must round-trip normally.
         let fresh = vec![6u8; BLOCK_SIZE as usize];
-        c.write_block(&key("a", "e1"), 0, &fresh).unwrap();
+        c.write_block(&key("a", "e1"), 0, &fresh, false).unwrap();
         assert_eq!(c.read_block(&key("a", "e1"), 0).unwrap().unwrap().as_ref(), &fresh[..]);
+    }
+
+    #[test]
+    fn an_open_files_first_write_never_evicts_itself() {
+        let dir = TempDir::new().unwrap();
+        // Smaller than a single block, so a fresh entry is already over
+        // budget the instant its first block lands — with nothing else in
+        // the cache to evict instead. A pinned overrun like this is
+        // accepted (pinning is a hard guarantee; eviction just stops when
+        // nothing unpinned is left, see `evict_if_over_budget`), so both
+        // blocks below must survive despite the cache staying over budget.
+        let mut c = BlockCache::open(dir.path(), BLOCK_SIZE / 2).unwrap();
+
+        // Pin-aware write: the entry is created already pinned, atomically
+        // with the eviction check inside this same call — not via a
+        // separate `pin()` after `write_block` returns, which would be too
+        // late (see the doc comment on `write_block`).
+        c.write_block(&key("open-file", "e1"), 0, &[1u8; BLOCK_SIZE as usize], true).unwrap();
+        c.write_block(&key("open-file", "e1"), 1, &[2u8; BLOCK_SIZE as usize], true).unwrap();
+
+        assert!(
+            c.read_block(&key("open-file", "e1"), 0).unwrap().is_some(),
+            "the file's own first write self-evicted its entry"
+        );
+        assert!(
+            c.read_block(&key("open-file", "e1"), 1).unwrap().is_some(),
+            "the file's own second write self-evicted its entry"
+        );
     }
 
     #[test]
@@ -483,12 +536,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut c = BlockCache::open(dir.path(), 3 * BLOCK_SIZE).unwrap();
         let one_block = vec![1u8; BLOCK_SIZE as usize];
-        c.write_block(&key("old", "e"), 0, &one_block).unwrap();
-        c.write_block(&key("pinned", "e"), 0, &one_block).unwrap();
+        c.write_block(&key("old", "e"), 0, &one_block, false).unwrap();
+        c.write_block(&key("pinned", "e"), 0, &one_block, false).unwrap();
         c.pin(&key("pinned", "e"));
-        c.write_block(&key("recent", "e"), 0, &one_block).unwrap();
+        c.write_block(&key("recent", "e"), 0, &one_block, false).unwrap();
         c.read_block(&key("old", "e"), 0).unwrap(); // old is now MRU
-        c.write_block(&key("new", "e"), 0, &one_block).unwrap(); // must evict someone
+        c.write_block(&key("new", "e"), 0, &one_block, false).unwrap(); // must evict someone
         assert!(c.read_block(&key("old", "e"), 0).unwrap().is_some(), "recently used, kept");
         assert!(c.read_block(&key("pinned", "e"), 0).unwrap().is_some(), "pinned, kept");
         assert!(c.read_block(&key("recent", "e"), 0).unwrap().is_none(), "LRU victim");

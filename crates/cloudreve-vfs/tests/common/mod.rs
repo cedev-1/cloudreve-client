@@ -32,6 +32,7 @@ pub fn uri_of(name: &str) -> String {
 type FilesState = Arc<Mutex<HashMap<String, Vec<Value>>>>;
 type ContentStore = Arc<Mutex<HashMap<String, Vec<u8>>>>;
 type RequestLog = Arc<Mutex<HashMap<String, Vec<Option<String>>>>>;
+type BytesServedLog = Arc<Mutex<HashMap<String, u64>>>;
 
 pub struct VfsTestEnv {
     pub server: MockServer,
@@ -40,6 +41,8 @@ pub struct VfsTestEnv {
     files: FilesState,
     contents: ContentStore,
     requests: RequestLog,
+    bytes_served: BytesServedLog,
+    download_request_count: Arc<AtomicUsize>,
     list_requests: Arc<AtomicUsize>,
 }
 
@@ -63,6 +66,8 @@ impl VfsTestEnv {
         let files: FilesState = Arc::new(Mutex::new(HashMap::new()));
         let contents: ContentStore = Arc::new(Mutex::new(HashMap::new()));
         let requests: RequestLog = Arc::new(Mutex::new(HashMap::new()));
+        let bytes_served: BytesServedLog = Arc::new(Mutex::new(HashMap::new()));
+        let download_request_count = Arc::new(AtomicUsize::new(0));
         let list_requests = Arc::new(AtomicUsize::new(0));
 
         // Listing endpoint: path-aware, keyed by the `uri` query param exactly
@@ -135,9 +140,12 @@ impl VfsTestEnv {
         {
             let contents = contents.clone();
             let requests = requests.clone();
+            let bytes_served = bytes_served.clone();
+            let download_request_count = download_request_count.clone();
             Mock::given(method("GET"))
                 .and(path_regex(r"^/vfs-download/.+$"))
                 .respond_with(move |req: &Request| {
+                    download_request_count.fetch_add(1, Ordering::SeqCst);
                     let name = req
                         .url
                         .path()
@@ -165,12 +173,27 @@ impl VfsTestEnv {
                     if let Some((start, end)) =
                         range_header.as_deref().and_then(|h| parse_range(h, len))
                     {
+                        let body = content[start..=end].to_vec();
+                        *bytes_served.lock().unwrap().entry(name.clone()).or_default() +=
+                            body.len() as u64;
                         return ResponseTemplate::new(206)
                             .insert_header("Accept-Ranges", "bytes")
                             .insert_header("Content-Range", format!("bytes {start}-{end}/{len}"))
-                            .set_body_bytes(content[start..=end].to_vec());
+                            .set_body_bytes(body);
                     }
 
+                    // A Range header that fails to parse as satisfiable (e.g.
+                    // start past the end of the file) gets a real 416, exactly
+                    // like the production server — tests exercising EOF must
+                    // see the same response shape a real out-of-range GET
+                    // would produce, not a silent full-body fallback.
+                    if range_header.is_some() {
+                        return ResponseTemplate::new(416)
+                            .insert_header("Content-Range", format!("bytes */{len}"));
+                    }
+
+                    *bytes_served.lock().unwrap().entry(name.clone()).or_default() +=
+                        content.len() as u64;
                     ResponseTemplate::new(200)
                         .insert_header("Accept-Ranges", "bytes")
                         .set_body_bytes(content)
@@ -186,6 +209,8 @@ impl VfsTestEnv {
             files,
             contents,
             requests,
+            bytes_served,
+            download_request_count,
             list_requests,
         }
     }
@@ -240,6 +265,35 @@ impl VfsTestEnv {
 
     pub fn cache_dir(&self) -> &Path {
         self.cache_dir.path()
+    }
+
+    /// Total bytes actually returned in response bodies by `name`'s download
+    /// endpoint across every request so far (ranged or whole-body).
+    pub fn total_bytes_served(&self, name: &str) -> u64 {
+        self.bytes_served.lock().unwrap().get(name).copied().unwrap_or(0)
+    }
+
+    /// Blocks until no new download request has landed for 200ms, so a test
+    /// can observe the fire-and-forget readahead spawned by a read without
+    /// racing it. Panics if downloads are still arriving after 5s — readahead
+    /// that never quiesces is a bug, not something worth waiting out forever.
+    pub async fn wait_for_downloads_to_settle(&self) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut last_count = self.download_request_count.load(Ordering::SeqCst);
+        let mut last_change = tokio::time::Instant::now();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let count = self.download_request_count.load(Ordering::SeqCst);
+            let now = tokio::time::Instant::now();
+            if count != last_count {
+                last_count = count;
+                last_change = now;
+            }
+            if now.duration_since(last_change) >= std::time::Duration::from_millis(200) {
+                return;
+            }
+            assert!(now < deadline, "downloads never settled (still arriving after 5s)");
+        }
     }
 }
 
