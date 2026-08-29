@@ -1,0 +1,279 @@
+//! Shared test harness: an authenticated `cloudreve_api::Client` talking to a
+//! wiremock server standing in for the Cloudreve API, plus a range-aware
+//! download endpoint every read-path test in this crate relies on.
+//!
+//! Each integration test file compiles this module independently and only
+//! uses part of the harness, so dead_code warnings are suppressed.
+#![allow(dead_code)]
+
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+use cloudreve_api::api::ExplorerApi;
+use cloudreve_api::models::explorer::FileURLService;
+use cloudreve_api::models::user::Token;
+use cloudreve_api::{Client, ClientConfig};
+use serde_json::{json, Value};
+use tempfile::TempDir;
+use wiremock::matchers::{method, path, path_regex};
+use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+pub const REMOTE_BASE: &str = "cloudreve://my/sync";
+
+/// Full `cloudreve://` uri of a root-level file/dir under [`REMOTE_BASE`].
+pub fn uri_of(name: &str) -> String {
+    format!("{REMOTE_BASE}/{name}")
+}
+
+type FilesState = Arc<Mutex<Vec<Value>>>;
+type ContentStore = Arc<Mutex<HashMap<String, Vec<u8>>>>;
+type RequestLog = Arc<Mutex<HashMap<String, Vec<Option<String>>>>>;
+
+pub struct VfsTestEnv {
+    pub server: MockServer,
+    client: Arc<Client>,
+    cache_dir: TempDir,
+    files: FilesState,
+    contents: ContentStore,
+    requests: RequestLog,
+}
+
+impl VfsTestEnv {
+    pub async fn new() -> Self {
+        let server = MockServer::start().await;
+        let cache_dir = TempDir::new().expect("create cache dir");
+
+        let client_config = ClientConfig::new(server.uri()).with_client_id("test-client");
+        let client = Client::new(client_config);
+        client
+            .load_tokens(&Token {
+                access_token: "test-access-token".to_string(),
+                refresh_token: "test-refresh-token".to_string(),
+                access_expires: "2099-01-01T00:00:00Z".to_string(),
+                refresh_expires: "2099-01-01T00:00:00Z".to_string(),
+            })
+            .await;
+        let client = Arc::new(client);
+
+        let files: FilesState = Arc::new(Mutex::new(Vec::new()));
+        let contents: ContentStore = Arc::new(Mutex::new(HashMap::new()));
+        let requests: RequestLog = Arc::new(Mutex::new(HashMap::new()));
+
+        // Listing endpoint: always reflects whatever `set_remote_files` last stored,
+        // so a single mount survives repeated calls without needing `server.reset()`.
+        {
+            let files = files.clone();
+            Mock::given(method("GET"))
+                .and(path("/api/v4/file"))
+                .respond_with(move |_req: &Request| {
+                    let files = files.lock().unwrap().clone();
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "code": 0,
+                        "msg": "",
+                        "data": {
+                            "files": files,
+                            "pagination": { "page": 1, "page_size": 500, "total_items": 0 },
+                            "props": {
+                                "max_page_size": 10000,
+                                "order_by_options": ["name"],
+                                "order_direction_options": ["asc"],
+                            },
+                        },
+                    }))
+                })
+                .mount(&server)
+                .await;
+        }
+
+        // Download-URL endpoint: mirrors `POST /api/v4/file/url`. Reads the
+        // requested uri out of the request body and points the returned URL
+        // back at this same mock server, keyed by file name.
+        {
+            let base = server.uri();
+            Mock::given(method("POST"))
+                .and(path("/api/v4/file/url"))
+                .respond_with(move |req: &Request| {
+                    let request: FileURLService =
+                        req.body_json().expect("decode FileURLService request body");
+                    let uri = request.uris.first().cloned().unwrap_or_default();
+                    let name = uri.rsplit('/').next().unwrap_or_default();
+                    let download_url = format!("{base}/vfs-download/{name}");
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "code": 0,
+                        "msg": "",
+                        "data": {
+                            "urls": [{ "url": download_url }],
+                            "expires": "2099-01-01T00:00:00Z",
+                        },
+                    }))
+                })
+                .mount(&server)
+                .await;
+        }
+
+        // Download content endpoint: honors `Range: bytes=a-b` with a 206 and
+        // the exact slice, and records every hit so tests can assert on the
+        // exact ranges a caller requested.
+        {
+            let contents = contents.clone();
+            let requests = requests.clone();
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/vfs-download/.+$"))
+                .respond_with(move |req: &Request| {
+                    let name = req
+                        .url
+                        .path()
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or_default()
+                        .to_string();
+                    let range_header = req
+                        .headers
+                        .get("Range")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.to_string());
+                    requests
+                        .lock()
+                        .unwrap()
+                        .entry(name.clone())
+                        .or_default()
+                        .push(range_header.clone());
+
+                    let Some(content) = contents.lock().unwrap().get(&name).cloned() else {
+                        return ResponseTemplate::new(404);
+                    };
+                    let len = content.len();
+
+                    if let Some((start, end)) =
+                        range_header.as_deref().and_then(|h| parse_range(h, len))
+                    {
+                        return ResponseTemplate::new(206)
+                            .insert_header("Accept-Ranges", "bytes")
+                            .insert_header("Content-Range", format!("bytes {start}-{end}/{len}"))
+                            .set_body_bytes(content[start..=end].to_vec());
+                    }
+
+                    ResponseTemplate::new(200)
+                        .insert_header("Accept-Ranges", "bytes")
+                        .set_body_bytes(content)
+                })
+                .mount(&server)
+                .await;
+        }
+
+        Self {
+            server,
+            client,
+            cache_dir,
+            files,
+            contents,
+            requests,
+        }
+    }
+
+    /// Configure the mock listing endpoint to return these files.
+    pub async fn set_remote_files(&self, files: Vec<Value>) {
+        *self.files.lock().unwrap() = files;
+    }
+
+    /// Register file content behind the mocked download flow: both the
+    /// `/api/v4/file/url` lookup and the download endpoint itself serve `name`.
+    pub async fn serve_file_content(&self, name: &str, content: &[u8]) {
+        self.contents
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), content.to_vec());
+    }
+
+    /// The `Range` header of every recorded hit against `name`'s download
+    /// endpoint, in request order (`None` when a request carried no `Range`).
+    pub fn download_requests(&self, name: &str) -> Vec<Option<String>> {
+        self.requests
+            .lock()
+            .unwrap()
+            .get(name)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn client(&self) -> Arc<Client> {
+        self.client.clone()
+    }
+
+    pub fn cache_dir(&self) -> &Path {
+        self.cache_dir.path()
+    }
+}
+
+/// Build the JSON for a remote file as the Cloudreve list API would return it.
+pub fn remote_file(name: &str, size: i64, etag: &str) -> Value {
+    json!({
+        "type": 0,
+        "id": format!("file-{name}"),
+        "name": name,
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-02T00:00:00Z",
+        "size": size,
+        "path": format!("{REMOTE_BASE}/{name}"),
+        "primary_entity": etag,
+    })
+}
+
+/// Build the JSON for a remote directory as the Cloudreve list API would
+/// return it.
+pub fn remote_dir(name: &str) -> Value {
+    json!({
+        "type": 1,
+        "id": format!("dir-{name}"),
+        "name": name,
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-02T00:00:00Z",
+        "size": 0,
+        "path": format!("{REMOTE_BASE}/{name}"),
+    })
+}
+
+/// Resolve the download URL for `name` exactly the way
+/// `crates/cloudreve-sync/src/tasks/download.rs` does: request a signed URL
+/// for the file's uri, then rewrite its origin to this client's base URL.
+pub async fn fetch_download_url(env: &VfsTestEnv, name: &str) -> String {
+    let request = FileURLService {
+        uris: vec![uri_of(name)],
+        ..Default::default()
+    };
+    let res = env
+        .client()
+        .get_file_url(&request)
+        .await
+        .expect("get_file_url");
+    let raw = res
+        .urls
+        .first()
+        .expect("no download url in response")
+        .url
+        .clone();
+    env.client().rewrite_url_origin(&raw)
+}
+
+/// Parse a single-range `Range: bytes=a-b` header into an inclusive
+/// `(start, end)` byte range, clamped to `content_len`. Returns `None` for
+/// anything this harness does not need to support (missing range, multi-range,
+/// malformed, out of bounds).
+fn parse_range(header: &str, content_len: usize) -> Option<(usize, usize)> {
+    let spec = header.strip_prefix("bytes=")?;
+    if spec.contains(',') {
+        return None;
+    }
+    let (start_str, end_str) = spec.split_once('-')?;
+    let start: usize = start_str.parse().ok()?;
+    let end: usize = if end_str.is_empty() {
+        content_len.saturating_sub(1)
+    } else {
+        end_str.parse().ok()?
+    };
+    if start > end || end >= content_len {
+        return None;
+    }
+    Some((start, end))
+}
