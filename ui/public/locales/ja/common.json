@@ -109,6 +109,7 @@
     "ignorePatterns": "除外パターン",
     "ignorePatternsTitle": "除外パターンの編集",
     "ignorePatternsDescription": "gitignore 形式のパターンを1行に1つずつ入力してください。一致したファイルは同期されません。",
+    "ignorePatternsBuiltIn": "設定に関わらず、常に無視されます:",
     "ignorePatternsPlaceholder": "*.log\nnode_modules\n*.tmp",
     "ignorePatternsError": "パターンが無効です：{{message}}",
     "save": "保存",

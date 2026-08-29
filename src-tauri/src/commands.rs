@@ -140,6 +140,14 @@ pub async fn get_ignore_patterns(
     app_state.drive_manager.get_ignore_patterns(&drive_id).await.map_err(|e| e.to_string())
 }
 
+/// The junk patterns applied to every drive on top of the user's own list.
+/// They are not stored in the drive config, so the UI has no other way to show
+/// them — and a file silently not syncing with no visible rule looks like a bug.
+#[tauri::command]
+pub fn get_default_ignore_patterns() -> Vec<String> {
+    cloudreve_sync::drive::ignore::default_patterns()
+}
+
 #[tauri::command]
 pub async fn set_ignore_patterns(
     state: State<'_, AppStateHandle>,
@@ -563,4 +571,27 @@ pub async fn get_user_profile(state: State<'_, AppStateHandle>) -> CommandResult
         avatar_url,
         profile_url,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    /// The Settings dialog displays whatever this command returns, and nothing
+    /// else describes the built-in rules. Wiring it to the drive's own list, or
+    /// to an empty vector, would put the defaults back out of sight — a file
+    /// that stops syncing then has no visible cause anywhere in the app.
+    ///
+    /// That the list is complete and faithful to what the engine applies is
+    /// pinned in `cloudreve_sync::drive::ignore`; what is checked here is that
+    /// this boundary hands that list over at all.
+    #[test]
+    fn the_settings_dialog_is_given_the_built_in_rules() {
+        let shown = super::get_default_ignore_patterns();
+
+        for expected in [".DS_Store", "Thumbs.db", ".Spotlight-V100"] {
+            assert!(
+                shown.iter().any(|p| p == expected),
+                "the dialog is never told about `{expected}`: {shown:?}"
+            );
+        }
+    }
 }

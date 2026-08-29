@@ -109,6 +109,7 @@
     "ignorePatterns": "Ignore Patterns",
     "ignorePatternsTitle": "Edit Ignore Patterns",
     "ignorePatternsDescription": "Enter gitignore-style patterns, one per line. Matching files will not be synced.",
+    "ignorePatternsBuiltIn": "Always ignored, whatever you configure:",
     "ignorePatternsPlaceholder": "*.log\nnode_modules\n*.tmp",
     "ignorePatternsError": "Invalid patterns: {{message}}",
     "driveSettingsTitle": "Drive Settings",

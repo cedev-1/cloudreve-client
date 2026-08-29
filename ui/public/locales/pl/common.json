@@ -109,6 +109,7 @@
     "ignorePatterns": "Wzorce wykluczeń",
     "ignorePatternsTitle": "Edytuj wzorce wykluczeń",
     "ignorePatternsDescription": "Wprowadź wzorce w stylu gitignore, po jednym w wierszu. Pasujące pliki nie będą synchronizowane.",
+    "ignorePatternsBuiltIn": "Zawsze ignorowane, niezależnie od ustawień:",
     "ignorePatternsPlaceholder": "*.log\nnode_modules\n*.tmp",
     "ignorePatternsError": "Nieprawidłowe wzorce: {{message}}",
     "save": "Zapisz",

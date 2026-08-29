@@ -109,6 +109,7 @@
     "ignorePatterns": "제외 패턴",
     "ignorePatternsTitle": "제외 패턴 편집",
     "ignorePatternsDescription": "gitignore 스타일의 패턴을 한 줄에 하나씩 입력하세요. 일치하는 파일은 동기화되지 않습니다.",
+    "ignorePatternsBuiltIn": "설정과 관계없이 항상 무시됩니다:",
     "ignorePatternsPlaceholder": "*.log\nnode_modules\n*.tmp",
     "ignorePatternsError": "잘못된 패턴: {{message}}",
     "save": "저장",

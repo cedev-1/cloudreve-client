@@ -109,6 +109,7 @@
     "ignorePatterns": "Ignoriermuster",
     "ignorePatternsTitle": "Ignoriermuster bearbeiten",
     "ignorePatternsDescription": "Geben Sie gitignore-Muster ein, eines pro Zeile. Übereinstimmende Dateien werden nicht synchronisiert.",
+    "ignorePatternsBuiltIn": "Immer ignoriert, unabhängig von Ihren Einstellungen:",
     "ignorePatternsPlaceholder": "*.log\nnode_modules\n*.tmp",
     "ignorePatternsError": "Ungültige Muster: {{message}}",
     "save": "Speichern",

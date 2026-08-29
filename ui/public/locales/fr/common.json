@@ -109,6 +109,7 @@
     "ignorePatterns": "Filtres d'exclusion",
     "ignorePatternsTitle": "Modifier les filtres d'exclusion",
     "ignorePatternsDescription": "Saisissez des motifs de type gitignore, un par ligne. Les fichiers correspondants ne seront pas synchronisés.",
+    "ignorePatternsBuiltIn": "Toujours ignorés, quels que soient vos réglages :",
     "ignorePatternsPlaceholder": "*.log\nnode_modules\n*.tmp",
     "ignorePatternsError": "Motifs invalides : {{message}}",
     "driveSettingsTitle": "Paramètres du drive",

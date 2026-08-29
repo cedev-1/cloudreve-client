@@ -109,6 +109,7 @@
     "ignorePatterns": "Patrones de exclusión",
     "ignorePatternsTitle": "Editar patrones de exclusión",
     "ignorePatternsDescription": "Ingrese patrones estilo gitignore, uno por línea. Los archivos que coincidan no se sincronizarán.",
+    "ignorePatternsBuiltIn": "Siempre ignorados, sea cual sea su configuración:",
     "ignorePatternsPlaceholder": "*.log\nnode_modules\n*.tmp",
     "ignorePatternsError": "Patrones no válidos: {{message}}",
     "save": "Guardar",

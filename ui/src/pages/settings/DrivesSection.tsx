@@ -62,6 +62,7 @@ export default function DrivesSection() {
   const [maxFileSize, setMaxFileSize] = useState<number>(3072);
   const [saving, setSaving] = useState(false);
   const [patternsError, setPatternsError] = useState<string | null>(null);
+  const [defaultPatterns, setDefaultPatterns] = useState<string[]>([]);
 
   const fetchDrives = useCallback(async () => {
     if (isFetchingRef.current) return;
@@ -141,8 +142,15 @@ export default function DrivesSection() {
 
   const handleEditIgnorePatterns = async (driveId: string) => {
     try {
-      const patterns = await invoke<string[]>("get_ignore_patterns", { driveId });
-      const maxMb = await invoke<number>("get_drive_max_file_size", { driveId });
+      const [patterns, maxMb] = await Promise.all([
+        invoke<string[]>("get_ignore_patterns", { driveId }),
+        invoke<number>("get_drive_max_file_size", { driveId }),
+      ]);
+      // The built-in list is informational: failing to fetch it must not
+      // keep the dialog from opening.
+      invoke<string[]>("get_default_ignore_patterns")
+        .then(setDefaultPatterns)
+        .catch(() => setDefaultPatterns([]));
       setPatternsText(patterns.join("\n"));
       setMaxFileSize(Number(maxMb) || 3072);
       setPatternsError(null);
@@ -486,6 +494,32 @@ export default function DrivesSection() {
               },
             }}
           />
+          {defaultPatterns.length > 0 && (
+            <Box sx={{ mb: 2 }}>
+              <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+                {t("settings.ignorePatternsBuiltIn")}
+              </Typography>
+              <Box
+                sx={{
+                  display: "flex",
+                  flexWrap: "wrap",
+                  gap: 0.5,
+                  p: 1,
+                  borderRadius: 1,
+                  bgcolor: "action.hover",
+                  fontFamily: "monospace",
+                  fontSize: 12,
+                  color: "text.secondary",
+                }}
+              >
+                {defaultPatterns.map((pattern) => (
+                  <Box key={pattern} component="span" sx={{ px: 0.5 }}>
+                    {pattern}
+                  </Box>
+                ))}
+              </Box>
+            </Box>
+          )}
           <TextField
             type="number"
             fullWidth

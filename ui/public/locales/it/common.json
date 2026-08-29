@@ -109,6 +109,7 @@
     "ignorePatterns": "Filtri di esclusione",
     "ignorePatternsTitle": "Modifica filtri di esclusione",
     "ignorePatternsDescription": "Inserisci pattern in stile gitignore, uno per riga. I file corrispondenti non verranno sincronizzati.",
+    "ignorePatternsBuiltIn": "Sempre ignorati, qualunque sia la tua configurazione:",
     "ignorePatternsPlaceholder": "*.log\nnode_modules\n*.tmp",
     "ignorePatternsError": "Pattern non validi: {{message}}",
     "save": "Salva",

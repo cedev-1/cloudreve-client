@@ -343,6 +343,7 @@ pub fn run() {
             commands::add_drive,
             commands::remove_drive,
             commands::get_ignore_patterns,
+            commands::get_default_ignore_patterns,
             commands::set_ignore_patterns,
             commands::get_drive_max_file_size,
             commands::set_drive_max_file_size,

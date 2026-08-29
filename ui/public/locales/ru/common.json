@@ -109,6 +109,7 @@
     "ignorePatterns": "Шаблоны исключения",
     "ignorePatternsTitle": "Редактировать шаблоны исключения",
     "ignorePatternsDescription": "Введите шаблоны в стиле gitignore, по одному на строку. Совпадающие файлы не будут синхронизироваться.",
+    "ignorePatternsBuiltIn": "Всегда игнорируются, независимо от настроек:",
     "ignorePatternsPlaceholder": "*.log\nnode_modules\n*.tmp",
     "ignorePatternsError": "Недопустимые шаблоны: {{message}}",
     "save": "Сохранить",

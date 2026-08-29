@@ -109,6 +109,7 @@
     "ignorePatterns": "忽略规则",
     "ignorePatternsTitle": "编辑忽略规则",
     "ignorePatternsDescription": "输入 gitignore 风格的匹配规则，每行一条。匹配的文件将不会被同步。",
+    "ignorePatternsBuiltIn": "无论如何设置，始终忽略：",
     "ignorePatternsPlaceholder": "*.log\nnode_modules\n*.tmp",
     "ignorePatternsError": "规则无效：{{message}}",
     "save": "保存",
