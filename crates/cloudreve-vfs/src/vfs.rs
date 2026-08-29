@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use bytes::{Bytes, BytesMut};
@@ -33,6 +34,19 @@ pub const READAHEAD_BLOCKS: u64 = 4;
 /// overrides it. 10 GiB is generous for a laptop's spare disk without
 /// being effectively unbounded.
 pub const DEFAULT_CACHE_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+
+/// Total attempts made for one ranged GET before giving up, per spec §7:
+/// "retry with backoff, then EIO" on a transient download failure
+/// (transport error or unexpected/5xx status). A 403 (expired signed URL)
+/// is handled orthogonally by `fetch_range_with_retry`'s own one-time URL
+/// refresh and never consumes a retry from this budget.
+pub const FETCH_RETRIES: u32 = 3;
+
+/// Backoff slept before each retry of a ranged GET, indexed by retry
+/// number (the first retry sleeps `FETCH_RETRY_BACKOFF[0]`, and so on).
+/// Per spec §7.
+pub const FETCH_RETRY_BACKOFF: [Duration; 2] =
+    [Duration::from_millis(100), Duration::from_millis(500)];
 
 /// User-Agent presented on every request the vfs's own `reqwest::Client`
 /// makes. Field-verified against the real Cloudreve instance (Task 0's
@@ -159,7 +173,13 @@ impl Vfs {
     pub async fn read(&self, h: FileHandle, offset: u64, len: u32) -> Result<Bytes> {
         let of = self.open_file(h).await?;
 
-        if offset >= of.size {
+        // A zero-length read is a legal POSIX call (NFS3/FUSE frontends in
+        // phase 3 forward it verbatim), and `offset` alone can legitimately
+        // sit anywhere up to EOF for one. Must be handled before the EOF
+        // clamp below even touches block math: with `len == 0`,
+        // `offset + len - 1` underflows (`u64`), which panics rather than
+        // just computing a wrong index.
+        if offset >= of.size || len == 0 {
             return Ok(Bytes::new());
         }
         let len = (len as u64).min(of.size - offset);
@@ -344,7 +364,7 @@ async fn fetch_range_with_retry(
     end: u64,
 ) -> Result<Bytes> {
     let url = of.download_url.read().await.clone();
-    match fetch_range(http, &url, start, end).await? {
+    match fetch_range_with_backoff(http, &url, start, end).await? {
         FetchOutcome::Data(bytes) => return Ok(bytes),
         FetchOutcome::RangeNotSatisfiable => return Ok(Bytes::new()),
         FetchOutcome::Forbidden => {}
@@ -354,10 +374,42 @@ async fn fetch_range_with_retry(
         .await
         .context("failed to refresh an expired download URL after a 403")?;
     *of.download_url.write().await = fresh.clone();
-    match fetch_range(http, &fresh, start, end).await? {
+    match fetch_range_with_backoff(http, &fresh, start, end).await? {
         FetchOutcome::Data(bytes) => Ok(bytes),
         FetchOutcome::RangeNotSatisfiable => Ok(Bytes::new()),
         FetchOutcome::Forbidden => bail!("download url still forbidden after one refresh"),
+    }
+}
+
+/// Performs one ranged GET with up to [`FETCH_RETRIES`] attempts total,
+/// sleeping [`FETCH_RETRY_BACKOFF`] between them. Only a transport-level
+/// failure or an unexpected/5xx status (an `Err` from `fetch_range`) is
+/// retried; a well-formed 403/416/200/206 outcome returns immediately and
+/// never consumes an attempt from this budget — a 403 is handled by the
+/// caller's own one-time URL refresh, orthogonal to this backoff. Once
+/// attempts are exhausted, the last error propagates up through
+/// `Vfs::read`, which phase 3's NFS/FUSE frontends map to `EIO` per spec
+/// §7 ("retry with backoff, then EIO").
+async fn fetch_range_with_backoff(
+    http: &reqwest::Client,
+    url: &str,
+    start: u64,
+    end: u64,
+) -> Result<FetchOutcome> {
+    let mut attempt = 0u32;
+    loop {
+        match fetch_range(http, url, start, end).await {
+            Ok(outcome) => return Ok(outcome),
+            Err(err) => {
+                attempt += 1;
+                if attempt >= FETCH_RETRIES {
+                    return Err(err);
+                }
+                let backoff = FETCH_RETRY_BACKOFF[(attempt - 1) as usize];
+                tracing::warn!(%err, attempt, ?backoff, "vfs: ranged GET failed, retrying");
+                tokio::time::sleep(backoff).await;
+            }
+        }
     }
 }
 

@@ -107,3 +107,82 @@ async fn the_cache_cap_holds_through_real_reads() {
     vfs.read(h, 0, 1024).await.unwrap();
     assert!(env.download_requests("a.bin").len() > before);
 }
+
+/// A zero-length read is a legal POSIX call (NFS3/FUSE frontends forward it
+/// verbatim), at any offset up to EOF — not just offset 0. It must never
+/// panic, and since nothing is actually requested, it must not touch the
+/// network either.
+#[tokio::test]
+async fn a_zero_length_read_returns_empty_without_panicking() {
+    let env = VfsTestEnv::new().await;
+    let body: Vec<u8> = (0..=255u8).cycle().take(3 * 1024 * 1024).collect();
+    env.set_remote_files(vec![remote_file("z.bin", body.len() as i64, "e1")]).await;
+    env.serve_file_content("z.bin", &body).await;
+
+    let vfs = Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(),
+                       DEFAULT_CACHE_MAX_BYTES).unwrap();
+    let node = vfs.tree().lookup(vfs.tree().root(), "z.bin").await.unwrap().unwrap().0;
+    let h = vfs.open(node).await.unwrap();
+
+    let before = env.download_requests("z.bin").len();
+    assert_eq!(vfs.read(h, 0, 0).await.unwrap().as_ref(), b"", "zero-length read at offset 0");
+    assert_eq!(
+        vfs.read(h, 2 * 1024 * 1024 + 500, 0).await.unwrap().as_ref(),
+        b"",
+        "zero-length read at a mid-file offset whose block isn't cached"
+    );
+    assert_eq!(
+        env.download_requests("z.bin").len(),
+        before,
+        "a zero-length read must never hit the network"
+    );
+    vfs.close(h).await.unwrap();
+}
+
+/// Spec §7: a transient (transport/5xx) download error is retried with
+/// backoff rather than surfacing on the first failure.
+#[tokio::test]
+async fn a_transient_download_error_is_retried_then_served() {
+    let env = VfsTestEnv::new().await;
+    let body = vec![3u8; 4096];
+    env.set_remote_files(vec![remote_file("flaky.bin", body.len() as i64, "e1")]).await;
+    env.serve_file_content("flaky.bin", &body).await;
+    env.fail_downloads_n_times("flaky.bin", 2, 500).await;
+
+    let vfs = Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(),
+                       DEFAULT_CACHE_MAX_BYTES).unwrap();
+    let node = vfs.tree().lookup(vfs.tree().root(), "flaky.bin").await.unwrap().unwrap().0;
+    let h = vfs.open(node).await.unwrap();
+
+    let bytes = vfs.read(h, 0, 4096).await.unwrap();
+    assert_eq!(bytes.as_ref(), &body[..]);
+    assert_eq!(
+        env.download_requests("flaky.bin").len(),
+        3,
+        "expected 2 failed attempts followed by 1 successful one"
+    );
+}
+
+/// Spec §7: once retries are exhausted, the error surfaces to the caller
+/// (phase 3 maps it to EIO) instead of hanging or panicking.
+#[tokio::test]
+async fn a_persistent_download_error_surfaces_after_bounded_retries() {
+    let env = VfsTestEnv::new().await;
+    let body = vec![3u8; 4096];
+    env.set_remote_files(vec![remote_file("dead.bin", body.len() as i64, "e1")]).await;
+    env.serve_file_content("dead.bin", &body).await;
+    env.fail_downloads_n_times("dead.bin", 1000, 500).await; // effectively "always fails"
+
+    let vfs = Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(),
+                       DEFAULT_CACHE_MAX_BYTES).unwrap();
+    let node = vfs.tree().lookup(vfs.tree().root(), "dead.bin").await.unwrap().unwrap().0;
+    let h = vfs.open(node).await.unwrap();
+
+    let result = vfs.read(h, 0, 4096).await;
+    assert!(result.is_err(), "a persistently failing download must surface an error, not hang or panic");
+    assert_eq!(
+        env.download_requests("dead.bin").len(),
+        3,
+        "expected exactly FETCH_RETRIES total attempts before giving up"
+    );
+}

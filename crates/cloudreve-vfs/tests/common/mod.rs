@@ -263,6 +263,46 @@ impl VfsTestEnv {
             .insert(name.to_string(), content.to_vec());
     }
 
+    /// Makes `name`'s download endpoint answer `status` (e.g. 500) for the
+    /// first `times` requests against it, then fall through to the normal
+    /// range-aware responder mounted by `new()` — used to exercise the
+    /// ranged-fetch retry-with-backoff path (spec §7) without a second,
+    /// disconnected request log: every hit here is recorded through the
+    /// same `requests`/`download_request_count` state as a real download
+    /// hit, so `download_requests(name).len()` counts both the injected
+    /// failures and the eventual real attempt(s).
+    ///
+    /// Mounted at a higher priority (lower number) than the default-
+    /// priority responder from `new()` so it is checked first regardless
+    /// of mount order; wiremock stops matching it once `times` requests
+    /// have been served, letting the normal responder take back over.
+    pub async fn fail_downloads_n_times(&self, name: &str, times: u64, status: u16) {
+        let requests = self.requests.clone();
+        let download_request_count = self.download_request_count.clone();
+        let name = name.to_string();
+        Mock::given(method("GET"))
+            .and(path(format!("/vfs-download/{name}")))
+            .respond_with(move |req: &Request| {
+                download_request_count.fetch_add(1, Ordering::SeqCst);
+                let range_header = req
+                    .headers
+                    .get("Range")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
+                requests
+                    .lock()
+                    .unwrap()
+                    .entry(name.clone())
+                    .or_default()
+                    .push(range_header);
+                ResponseTemplate::new(status)
+            })
+            .up_to_n_times(times)
+            .with_priority(1)
+            .mount(&self.server)
+            .await;
+    }
+
     /// The `Range` header of every recorded hit against `name`'s download
     /// endpoint, in request order (`None` when a request carried no `Range`).
     pub fn download_requests(&self, name: &str) -> Vec<Option<String>> {

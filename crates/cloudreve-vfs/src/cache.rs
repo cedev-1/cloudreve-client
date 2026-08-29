@@ -110,12 +110,24 @@ impl BlockCache {
             let hash = dir_entry.file_name().to_string_lossy().into_owned();
             let meta_path = dir_entry.path().join("meta.json");
             let Ok(raw) = fs::read(&meta_path) else {
-                continue; // no meta.json: not a cache entry (or mid-write, being conservative)
+                // No meta.json (fresh dir, or a crash before write_meta's
+                // rename ever landed one): the data directory, if any, is
+                // unusable without its etag/block index and would
+                // otherwise sit on disk forever, invisible to
+                // `used_bytes`/eviction. Delete the whole entry rather than
+                // just skipping it.
+                delete_orphaned_entry_dir(&hash, &dir_entry.path());
+                continue;
             };
             let meta: MetaFile = match serde_json::from_slice(&raw) {
                 Ok(meta) => meta,
                 Err(err) => {
                     tracing::warn!(hash = %hash, %err, "cache: dropping unreadable meta.json");
+                    // Same reasoning as the missing-meta.json case above: a
+                    // meta.json that fails to parse (torn by a crash, or
+                    // otherwise corrupt) leaves its data unusable, so the
+                    // whole entry directory must go, not just be skipped.
+                    delete_orphaned_entry_dir(&hash, &dir_entry.path());
                     continue;
                 }
             };
@@ -364,7 +376,18 @@ impl BlockCache {
         };
         let json = serde_json::to_vec(&meta)?; // machine-only file, no need for pretty-printing
         let path = self.meta_path(hash);
-        fs::write(&path, json).with_context(|| format!("failed to write {}", path.display()))
+        // Write-temp-then-rename: a crash between the write and the rename
+        // leaves either the previous meta.json (untouched) or a stray
+        // `.tmp` file behind, but never a torn/partially-written
+        // `meta.json` — `fs::rename` within the same directory is atomic,
+        // unlike a direct `fs::write`, which a crash mid-syscall can leave
+        // truncated and unparseable.
+        let tmp_path = self.entry_dir(hash).join("meta.json.tmp");
+        fs::write(&tmp_path, json)
+            .with_context(|| format!("failed to write {}", tmp_path.display()))?;
+        fs::rename(&tmp_path, &path).with_context(|| {
+            format!("failed to rename {} to {}", tmp_path.display(), path.display())
+        })
     }
 
     /// Drops one block index from an entry's in-memory set AND from its
@@ -412,6 +435,16 @@ impl BlockCache {
 fn hash_key(remote_path: &str) -> String {
     let digest = Sha256::digest(remote_path.as_bytes());
     digest[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Deletes an entry directory found unusable during `open()`'s scan (its
+/// meta.json is missing or unparseable). Best-effort: a failure to delete
+/// only logs, it must never fail `open()` itself — the entry is already
+/// being treated as not part of the cache either way.
+fn delete_orphaned_entry_dir(hash: &str, dir: &Path) {
+    if let Err(err) = fs::remove_dir_all(dir) {
+        tracing::warn!(hash = %hash, %err, "cache: failed to delete an orphaned entry directory");
+    }
 }
 
 fn now_unix() -> i64 {
@@ -501,6 +534,31 @@ mod tests {
         let fresh = vec![6u8; BLOCK_SIZE as usize];
         c.write_block(&key("a", "e1"), 0, &fresh, false).unwrap();
         assert_eq!(c.read_block(&key("a", "e1"), 0).unwrap().unwrap().as_ref(), &fresh[..]);
+    }
+
+    #[test]
+    fn an_entry_with_a_torn_meta_is_deleted_on_open_not_leaked() {
+        let dir = TempDir::new().unwrap();
+        {
+            let mut c = BlockCache::open(dir.path(), 100 * BLOCK_SIZE).unwrap();
+            c.write_block(&key("a", "e1"), 0, &[1u8; 1024], false).unwrap();
+        }
+        let hash = hash_key("a");
+        let entry_dir = dir.path().join(&hash);
+        // Simulate a crash that left meta.json torn: garbage bytes rather
+        // than the JSON `write_meta` would have produced.
+        std::fs::write(entry_dir.join("meta.json"), b"not valid json {{{").unwrap();
+
+        let mut c = BlockCache::open(dir.path(), 100 * BLOCK_SIZE).unwrap();
+        assert!(
+            c.read_block(&key("a", "e1"), 0).unwrap().is_none(),
+            "a torn meta.json must never serve the data next to it"
+        );
+        assert!(
+            !entry_dir.exists(),
+            "an entry whose meta.json couldn't be read must be deleted on open, \
+             not left on disk unaccounted for by used_bytes/eviction"
+        );
     }
 
     #[test]
