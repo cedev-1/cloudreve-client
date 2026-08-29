@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/cloudreve-api",
     "crates/cloudreve-sync",
+    "crates/cloudreve-vfs",
     "src-tauri",
 ]
 
