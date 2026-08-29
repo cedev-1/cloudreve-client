@@ -3,17 +3,26 @@
 //! A directory's children only exist in memory once something actually
 //! reads that directory. Mounting a drive with millions of files is
 //! therefore instant: the cost is paid per directory visited, never up
-//! front for the whole tree. No TTL/invalidation yet — a directory listed
-//! once stays cached for the lifetime of the `VfsTree` (see phase-1 task 4).
+//! front for the whole tree. A directory listing is cached for
+//! [`LISTING_TTL`], and can be forgotten early via [`VfsTree::invalidate_path`]
+//! once phase 4 wires up SSE.
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use cloudreve_api::api::explorer::ExplorerApiExt;
 use cloudreve_api::models::common::ListAllRes;
 use cloudreve_api::models::explorer::{file_type, ListResponse};
 use tokio::sync::RwLock;
+
+/// How long a directory listing is trusted before `readdir` will hit the
+/// network again on its own. Short enough that a stale view of a
+/// server-side change (not yet caught by SSE/invalidation) self-heals fast;
+/// long enough that a Finder-style burst of readdir calls on the same
+/// directory costs exactly one HTTP request.
+pub const LISTING_TTL: Duration = Duration::from_secs(5);
 
 /// Opaque handle to a node in the tree. Allocated once per (parent, name)
 /// pair and stable for the lifetime of the `VfsTree`, so frontends (NFS on
@@ -54,6 +63,10 @@ struct Inner {
     /// the "not read yet" signal `readdir`/`lookup` use to decide whether a
     /// network round-trip is needed.
     children: HashMap<NodeId, Vec<NodeId>>,
+    /// When each directory's `children` entry was last populated. Consulted
+    /// alongside `children`: a directory can be present but stale, in which
+    /// case it is treated the same as "not read yet".
+    listed_at: HashMap<NodeId, Instant>,
     /// Ids assigned to (parent, name) pairs, kept even if the directory is
     /// ever re-listed, so a node's id never changes for the tree's lifetime.
     known_children: HashMap<(NodeId, String), NodeId>,
@@ -84,6 +97,7 @@ impl VfsTree {
             inner: RwLock::new(Inner {
                 attrs,
                 children: HashMap::new(),
+                listed_at: HashMap::new(),
                 known_children: HashMap::new(),
                 next_id: 2, // NodeId(1) is the root.
             }),
@@ -128,13 +142,21 @@ impl VfsTree {
         Ok(self.inner.read().await.attrs.get(&node).cloned())
     }
 
-    /// Fetches and caches a directory's children the first time it is read.
-    /// A directory that is already cached returns immediately: this is the
-    /// whole point of the tree being lazy — a directory is listed at most
-    /// once, ever, no matter how many times it is subsequently read.
+    /// Fetches and caches a directory's children the first time it is read,
+    /// and again whenever the cached copy has outlived [`LISTING_TTL`]. A
+    /// directory that is already cached and still fresh returns immediately:
+    /// this is the whole point of the tree being lazy — a burst of reads on
+    /// the same directory costs at most one network round-trip.
     async fn ensure_listed(&self, dir: NodeId) -> Result<()> {
-        if self.inner.read().await.children.contains_key(&dir) {
-            return Ok(());
+        {
+            let inner = self.inner.read().await;
+            let fresh = inner
+                .listed_at
+                .get(&dir)
+                .is_some_and(|listed_at| listed_at.elapsed() < LISTING_TTL);
+            if inner.children.contains_key(&dir) && fresh {
+                return Ok(());
+            }
         }
 
         let remote_path = {
@@ -165,8 +187,13 @@ impl VfsTree {
 
         let mut inner = self.inner.write().await;
         // Another concurrent call for the same directory won the race while
-        // we were awaiting the network: nothing left to do.
-        if inner.children.contains_key(&dir) {
+        // we were awaiting the network and its result is still fresh:
+        // nothing left to do.
+        let fresh = inner
+            .listed_at
+            .get(&dir)
+            .is_some_and(|listed_at| listed_at.elapsed() < LISTING_TTL);
+        if inner.children.contains_key(&dir) && fresh {
             return Ok(());
         }
 
@@ -193,7 +220,59 @@ impl VfsTree {
             child_ids.push(id);
         }
         inner.children.insert(dir, child_ids);
+        inner.listed_at.insert(dir, Instant::now());
         Ok(())
+    }
+
+    /// Forget the cached listing containing this remote path (and the
+    /// entry's attributes), so the next readdir/lookup refetches. Called by
+    /// the SSE hookup in phase 4 and after writes in phase 2.
+    pub async fn invalidate_path(&self, remote_path: &str) {
+        let Some((parent_path, _name)) = remote_path.rsplit_once('/') else {
+            return;
+        };
+
+        let mut inner = self.inner.write().await;
+
+        // The directory that listed this entry: drop its cached children so
+        // the next readdir/lookup on it goes back to the network.
+        if let Some(dir_id) = inner
+            .attrs
+            .iter()
+            .find(|(_, attr)| attr.is_dir && attr.remote_path == parent_path)
+            .map(|(id, _)| *id)
+        {
+            inner.children.remove(&dir_id);
+            inner.listed_at.remove(&dir_id);
+        }
+
+        // The entry's own attributes, if already known: drop them too, so a
+        // direct getattr can't serve a stale copy before the parent is
+        // relisted (getattr never triggers a listing on its own).
+        if let Some(entry_id) = inner
+            .attrs
+            .iter()
+            .find(|(_, attr)| attr.remote_path == remote_path)
+            .map(|(id, _)| *id)
+        {
+            inner.attrs.remove(&entry_id);
+        }
+    }
+
+    /// Force a directory's cached listing to be treated as expired,
+    /// regardless of when it was actually populated. Test-only: production
+    /// code relies on wall-clock TTL expiry, not this shortcut. Currently
+    /// unused — neither of this task's tests needs it (freshness relies on
+    /// TTL not expiring within a fast test; invalidation goes through
+    /// `invalidate_path`) — kept for the next test that needs to force
+    /// expiry without waiting out `LISTING_TTL`.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    async fn force_expire(&self, dir: NodeId) {
+        let mut inner = self.inner.write().await;
+        if let Some(listed_at) = inner.listed_at.get_mut(&dir) {
+            *listed_at = Instant::now() - LISTING_TTL - Duration::from_secs(1);
+        }
     }
 }
 

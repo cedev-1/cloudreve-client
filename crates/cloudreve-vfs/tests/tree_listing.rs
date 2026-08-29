@@ -37,3 +37,31 @@ async fn node_ids_are_stable_across_lookups() {
     let second = tree.lookup(tree.root(), "a.txt").await.unwrap().unwrap().0;
     assert_eq!(first, second);
 }
+
+/// Finder calls readdir in bursts; each burst must cost one HTTP call.
+#[tokio::test]
+async fn a_fresh_listing_is_not_refetched() {
+    let env = VfsTestEnv::new().await;
+    env.set_remote_files(vec![remote_file("a.txt", 1, "e1")]).await;
+    let tree = VfsTree::new(env.client(), common::REMOTE_BASE.into());
+    tree.readdir(tree.root()).await.unwrap();
+    tree.readdir(tree.root()).await.unwrap();
+    tree.readdir(tree.root()).await.unwrap();
+    assert_eq!(env.list_request_count(), 1, "a fresh listing must be served from memory");
+}
+
+/// A server-side change (SSE, phase 4) must become visible immediately.
+#[tokio::test]
+async fn invalidating_a_path_forces_a_refetch() {
+    let env = VfsTestEnv::new().await;
+    env.set_remote_files(vec![remote_file("a.txt", 1, "e1")]).await;
+    let tree = VfsTree::new(env.client(), common::REMOTE_BASE.into());
+    tree.readdir(tree.root()).await.unwrap();
+
+    env.set_remote_files(vec![remote_file("a.txt", 99, "e2")]).await;
+    tree.invalidate_path(&common::uri_of("a.txt")).await;
+
+    let listing = tree.readdir(tree.root()).await.unwrap();
+    assert_eq!(listing[0].1.size, 99, "stale attributes served after invalidation");
+    assert_eq!(env.list_request_count(), 2);
+}
