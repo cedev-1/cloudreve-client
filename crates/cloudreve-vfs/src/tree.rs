@@ -1,1 +1,207 @@
-//! Inode tree.
+//! Lazy virtual tree.
+//!
+//! A directory's children only exist in memory once something actually
+//! reads that directory. Mounting a drive with millions of files is
+//! therefore instant: the cost is paid per directory visited, never up
+//! front for the whole tree. No TTL/invalidation yet — a directory listed
+//! once stays cached for the lifetime of the `VfsTree` (see phase-1 task 4).
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use cloudreve_api::api::explorer::ExplorerApiExt;
+use cloudreve_api::models::common::ListAllRes;
+use cloudreve_api::models::explorer::{file_type, ListResponse};
+use tokio::sync::RwLock;
+
+/// Opaque handle to a node in the tree. Allocated once per (parent, name)
+/// pair and stable for the lifetime of the `VfsTree`, so frontends (NFS on
+/// macOS, FUSE on Linux) can cache by id across repeated lookups.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NodeId(pub u64);
+
+/// The tree always has exactly one root, allocated up front — before any
+/// listing happens — so `VfsTree::root()` never needs to be fallible.
+const ROOT: NodeId = NodeId(1);
+
+/// Everything a caller needs to know about a node without listing it.
+#[derive(Debug, Clone)]
+pub struct NodeAttr {
+    pub name: String,
+    /// Full `cloudreve://…` uri, exactly as returned by the server's `path`
+    /// field (or, for the root, the tree's configured remote base).
+    pub remote_path: String,
+    pub size: u64,
+    pub mtime_secs: i64,
+    pub is_dir: bool,
+    /// Empty for directories: Cloudreve only versions file content.
+    pub etag: String,
+}
+
+/// Page size for listing a single directory. Unlike `list_remote_recursive`'s
+/// whole-drive walk, there is no cross-directory page-size negotiation to do
+/// here: each call targets exactly one directory and fully drains it before
+/// returning, so any reasonable size works.
+const PAGE_SIZE: i32 = 200;
+
+/// All mutable tree state, behind one lock so a listing that allocates new
+/// ids and one that only reads an already-cached directory can't observe
+/// each other half-updated.
+struct Inner {
+    attrs: HashMap<NodeId, NodeAttr>,
+    /// Present once a directory has been listed; a missing entry is exactly
+    /// the "not read yet" signal `readdir`/`lookup` use to decide whether a
+    /// network round-trip is needed.
+    children: HashMap<NodeId, Vec<NodeId>>,
+    /// Ids assigned to (parent, name) pairs, kept even if the directory is
+    /// ever re-listed, so a node's id never changes for the tree's lifetime.
+    known_children: HashMap<(NodeId, String), NodeId>,
+    next_id: u64,
+}
+
+pub struct VfsTree {
+    client: Arc<cloudreve_api::Client>,
+    inner: RwLock<Inner>,
+}
+
+impl VfsTree {
+    pub fn new(client: Arc<cloudreve_api::Client>, remote_base: String) -> Self {
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            ROOT,
+            NodeAttr {
+                name: String::new(),
+                remote_path: remote_base,
+                size: 0,
+                mtime_secs: 0,
+                is_dir: true,
+                etag: String::new(),
+            },
+        );
+        Self {
+            client,
+            inner: RwLock::new(Inner {
+                attrs,
+                children: HashMap::new(),
+                known_children: HashMap::new(),
+                next_id: 2, // NodeId(1) is the root.
+            }),
+        }
+    }
+
+    pub fn root(&self) -> NodeId {
+        ROOT
+    }
+
+    /// Lists a directory, fetching it from the server on first read and
+    /// serving every later call from the cache built by that first read.
+    pub async fn readdir(&self, dir: NodeId) -> Result<Vec<(NodeId, NodeAttr)>> {
+        self.ensure_listed(dir).await?;
+        let inner = self.inner.read().await;
+        let ids = inner.children.get(&dir).cloned().unwrap_or_default();
+        Ok(ids
+            .into_iter()
+            .filter_map(|id| inner.attrs.get(&id).cloned().map(|attr| (id, attr)))
+            .collect())
+    }
+
+    /// Resolves one child by name, listing the parent first if needed.
+    pub async fn lookup(&self, parent: NodeId, name: &str) -> Result<Option<(NodeId, NodeAttr)>> {
+        self.ensure_listed(parent).await?;
+        let inner = self.inner.read().await;
+        let Some(ids) = inner.children.get(&parent) else {
+            return Ok(None);
+        };
+        Ok(ids.iter().find_map(|id| {
+            inner
+                .attrs
+                .get(id)
+                .filter(|attr| attr.name == name)
+                .map(|attr| (*id, attr.clone()))
+        }))
+    }
+
+    /// Reads a node's own attributes. Never triggers a listing: `node` must
+    /// already be known, e.g. from an earlier `readdir`/`lookup`.
+    pub async fn getattr(&self, node: NodeId) -> Result<Option<NodeAttr>> {
+        Ok(self.inner.read().await.attrs.get(&node).cloned())
+    }
+
+    /// Fetches and caches a directory's children the first time it is read.
+    /// A directory that is already cached returns immediately: this is the
+    /// whole point of the tree being lazy — a directory is listed at most
+    /// once, ever, no matter how many times it is subsequently read.
+    async fn ensure_listed(&self, dir: NodeId) -> Result<()> {
+        if self.inner.read().await.children.contains_key(&dir) {
+            return Ok(());
+        }
+
+        let remote_path = {
+            let inner = self.inner.read().await;
+            inner
+                .attrs
+                .get(&dir)
+                .context("readdir/lookup on an unknown node")?
+                .remote_path
+                .clone()
+        };
+
+        let mut files = Vec::new();
+        let mut previous: Option<ListAllRes<ListResponse>> = None;
+        loop {
+            let mut page = self
+                .client
+                .list_files_all(previous.as_ref(), &remote_path, PAGE_SIZE)
+                .await
+                .context("failed to list remote directory")?;
+            files.extend(std::mem::take(&mut page.res.files));
+            let more = page.more;
+            previous = Some(page);
+            if !more {
+                break;
+            }
+        }
+
+        let mut inner = self.inner.write().await;
+        // Another concurrent call for the same directory won the race while
+        // we were awaiting the network: nothing left to do.
+        if inner.children.contains_key(&dir) {
+            return Ok(());
+        }
+
+        let mut child_ids = Vec::with_capacity(files.len());
+        for f in files {
+            let key = (dir, f.name.clone());
+            let id = if let Some(&existing) = inner.known_children.get(&key) {
+                existing
+            } else {
+                let id = NodeId(inner.next_id);
+                inner.next_id += 1;
+                inner.known_children.insert(key, id);
+                id
+            };
+            let attr = NodeAttr {
+                name: f.name,
+                remote_path: f.path,
+                size: f.size.max(0) as u64,
+                mtime_secs: parse_rfc3339(&f.updated_at),
+                is_dir: f.file_type == file_type::FOLDER,
+                etag: f.primary_entity.unwrap_or_default(),
+            };
+            inner.attrs.insert(id, attr);
+            child_ids.push(id);
+        }
+        inner.children.insert(dir, child_ids);
+        Ok(())
+    }
+}
+
+/// Parses a server timestamp the same way `drive::sync` does: on failure —
+/// which should not happen against a well-behaved server — degrade to
+/// epoch 0 rather than aborting the whole listing over one bad clock string.
+fn parse_rfc3339(s: &str) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.timestamp())
+        .unwrap_or(0)
+}

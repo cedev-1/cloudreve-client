@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cloudreve_api::api::ExplorerApi;
@@ -26,7 +27,9 @@ pub fn uri_of(name: &str) -> String {
     format!("{REMOTE_BASE}/{name}")
 }
 
-type FilesState = Arc<Mutex<Vec<Value>>>;
+/// Files to serve for a listing, keyed by the full remote directory uri
+/// (e.g. `REMOTE_BASE` for the root, `"{REMOTE_BASE}/photos"` for a subdir).
+type FilesState = Arc<Mutex<HashMap<String, Vec<Value>>>>;
 type ContentStore = Arc<Mutex<HashMap<String, Vec<u8>>>>;
 type RequestLog = Arc<Mutex<HashMap<String, Vec<Option<String>>>>>;
 
@@ -37,6 +40,7 @@ pub struct VfsTestEnv {
     files: FilesState,
     contents: ContentStore,
     requests: RequestLog,
+    list_requests: Arc<AtomicUsize>,
 }
 
 impl VfsTestEnv {
@@ -56,23 +60,36 @@ impl VfsTestEnv {
             .await;
         let client = Arc::new(client);
 
-        let files: FilesState = Arc::new(Mutex::new(Vec::new()));
+        let files: FilesState = Arc::new(Mutex::new(HashMap::new()));
         let contents: ContentStore = Arc::new(Mutex::new(HashMap::new()));
         let requests: RequestLog = Arc::new(Mutex::new(HashMap::new()));
+        let list_requests = Arc::new(AtomicUsize::new(0));
 
-        // Listing endpoint: always reflects whatever `set_remote_files` last stored,
-        // so a single mount survives repeated calls without needing `server.reset()`.
+        // Listing endpoint: path-aware, keyed by the `uri` query param exactly
+        // as `ExplorerApiExt::list_files_all` sends it, so a directory only
+        // ever sees the files registered for *it* — never a sibling's list.
+        // Reflects whatever `set_remote_files`/`set_remote_files_at` last
+        // stored for that uri, so a single mount survives repeated calls
+        // without needing `server.reset()`.
         {
             let files = files.clone();
+            let list_requests = list_requests.clone();
             Mock::given(method("GET"))
                 .and(path("/api/v4/file"))
-                .respond_with(move |_req: &Request| {
-                    let files = files.lock().unwrap().clone();
+                .respond_with(move |req: &Request| {
+                    list_requests.fetch_add(1, Ordering::SeqCst);
+                    let uri = req
+                        .url
+                        .query_pairs()
+                        .find(|(k, _)| k == "uri")
+                        .map(|(_, v)| v.into_owned())
+                        .unwrap_or_default();
+                    let dir_files = files.lock().unwrap().get(&uri).cloned().unwrap_or_default();
                     ResponseTemplate::new(200).set_body_json(json!({
                         "code": 0,
                         "msg": "",
                         "data": {
-                            "files": files,
+                            "files": dir_files,
                             "pagination": { "page": 1, "page_size": 500, "total_items": 0 },
                             "props": {
                                 "max_page_size": 10000,
@@ -169,12 +186,32 @@ impl VfsTestEnv {
             files,
             contents,
             requests,
+            list_requests,
         }
     }
 
-    /// Configure the mock listing endpoint to return these files.
+    /// Configure the mock listing endpoint to return these files for the root
+    /// directory ([`REMOTE_BASE`]).
     pub async fn set_remote_files(&self, files: Vec<Value>) {
-        *self.files.lock().unwrap() = files;
+        self.files
+            .lock()
+            .unwrap()
+            .insert(REMOTE_BASE.to_string(), files);
+    }
+
+    /// Configure the mock listing endpoint to return these files for
+    /// `"{REMOTE_BASE}/{subdir}"`, independently of what the root (or any
+    /// other directory) returns.
+    pub async fn set_remote_files_at(&self, subdir: &str, files: Vec<Value>) {
+        self.files
+            .lock()
+            .unwrap()
+            .insert(format!("{REMOTE_BASE}/{subdir}"), files);
+    }
+
+    /// Total number of `GET /api/v4/file` (listing) requests served so far.
+    pub fn list_request_count(&self) -> usize {
+        self.list_requests.load(Ordering::SeqCst)
     }
 
     /// Register file content behind the mocked download flow: both the

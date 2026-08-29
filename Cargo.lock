@@ -853,10 +853,11 @@ dependencies = [
 
 [[package]]
 name = "cloudreve-vfs"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "chrono",
  "cloudreve-api",
  "reqwest 0.12.28",
  "serde",
