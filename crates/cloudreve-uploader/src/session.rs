@@ -1,7 +1,7 @@
 //! Upload session management and persistence
 
-use crate::uploader::ChunkProgress;
-use crate::uploader::providers::PolicyType;
+use crate::ChunkProgress;
+use crate::providers::PolicyType;
 use chrono::Utc;
 use cloudreve_api::models::explorer::{EncryptMetadata, UploadCredential};
 use serde::{Deserialize, Serialize};

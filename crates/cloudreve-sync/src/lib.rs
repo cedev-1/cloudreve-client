@@ -4,8 +4,12 @@ pub mod events;
 pub mod inventory;
 pub mod logging;
 pub mod tasks;
-pub mod uploader;
 pub mod utils;
+
+// The chunked uploader lives in its own crate so it can be shared with
+// cloudreve-vfs without a dependency cycle. Re-exported here so every
+// existing `cloudreve_sync::uploader::...` path keeps compiling.
+pub use cloudreve_uploader as uploader;
 
 // Re-export commonly used types
 pub use config::{AppConfig, ConfigManager};

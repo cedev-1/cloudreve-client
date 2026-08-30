@@ -813,13 +813,11 @@ dependencies = [
 name = "cloudreve-sync"
 version = "0.3.0"
 dependencies = [
- "aes",
  "anyhow",
- "base64 0.22.1",
  "bytes",
  "chrono",
  "cloudreve-api",
- "ctr",
+ "cloudreve-uploader",
  "dark-light",
  "dashmap",
  "diesel",
@@ -849,6 +847,27 @@ dependencies = [
  "url",
  "uuid",
  "wiremock",
+]
+
+[[package]]
+name = "cloudreve-uploader"
+version = "0.3.0"
+dependencies = [
+ "aes",
+ "anyhow",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "cloudreve-api",
+ "ctr",
+ "futures",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]

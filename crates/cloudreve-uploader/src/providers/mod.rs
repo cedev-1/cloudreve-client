@@ -6,8 +6,8 @@ mod qiniu;
 mod s3;
 mod upyun;
 
-use crate::uploader::chunk::ChunkInfo;
-use crate::uploader::session::UploadSession;
+use crate::chunk::ChunkInfo;
+use crate::session::UploadSession;
 use anyhow::Result;
 use bytes::Bytes;
 use cloudreve_api::Client as CrClient;
