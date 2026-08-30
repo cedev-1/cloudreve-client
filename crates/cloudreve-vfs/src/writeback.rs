@@ -277,6 +277,13 @@ impl DraftStore {
         self.entries.get(&hash16(remote_path)).map(|e| e.state.clone())
     }
 
+    /// The draft's last local write time, unix seconds. Used by the facade's
+    /// `getattr`/`readdir`/`lookup` overlay (D3): a drafted file's mtime
+    /// must reflect the local edit, not the server's last-known timestamp.
+    pub fn mtime_unix(&self, remote_path: &str) -> Option<i64> {
+        self.entries.get(&hash16(remote_path)).map(|e| e.last_write_unix)
+    }
+
     pub fn set_state(&mut self, remote_path: &str, s: DraftState) -> Result<()> {
         let hash = hash16(remote_path);
         let entry = self

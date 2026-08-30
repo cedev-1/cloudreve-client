@@ -305,6 +305,73 @@ impl VfsTree {
         }
     }
 
+    /// Inserts a local-only entry (created via `Vfs::create`, not yet
+    /// confirmed by any server listing) as a child of `parent`, so it is
+    /// immediately visible to lookups/readdir once the facade overlays it
+    /// (Task 7 — see `Vfs::readdir`/`lookup`). Reuses `known_children`'s
+    /// (parent, name) allocation scheme so the id stays stable if the
+    /// server later lists a file of the same name (e.g. once the pending
+    /// upload completes and the directory is re-listed): same id, no
+    /// frontend-visible churn.
+    ///
+    /// Deliberately does NOT touch `children`/`listed_at`: those drive
+    /// `ensure_listed`'s ghost-pruning diff, which must never see (and
+    /// therefore never prune) an entry that has no remote counterpart at
+    /// all — a purely local entry surviving indefinitely across re-lists is
+    /// the whole point.
+    #[doc(hidden)]
+    pub async fn insert_local_entry(&self, parent: NodeId, name: &str) -> Result<NodeId> {
+        let mut inner = self.inner.write().await;
+        let parent_path = inner
+            .attrs
+            .get(&parent)
+            .context("insert_local_entry: unknown parent")?
+            .remote_path
+            .clone();
+
+        let key = (parent, name.to_string());
+        let id = if let Some(&existing) = inner.known_children.get(&key) {
+            existing
+        } else {
+            let id = NodeId(inner.next_id);
+            inner.next_id += 1;
+            inner.known_children.insert(key, id);
+            id
+        };
+        inner.attrs.insert(
+            id,
+            NodeAttr {
+                name: name.to_string(),
+                remote_path: format!("{parent_path}/{name}"),
+                size: 0,
+                // The facade overlays the draft's real mtime (D3); this is
+                // just the placeholder for an entry with no draft yet.
+                mtime_secs: 0,
+                is_dir: false,
+                etag: String::new(),
+            },
+        );
+        Ok(id)
+    }
+
+    /// Every child of `parent` known to the tree by (parent, name)
+    /// allocation, regardless of whether it is part of `parent`'s current
+    /// listing — the facade uses this (Task 7) to overlay locally-created
+    /// entries (via `insert_local_entry`) onto `readdir`'s server-backed
+    /// result without ever mutating `children`/`listed_at` itself. A ghost
+    /// pruned by `ensure_listed` is gone from `known_children` too (see
+    /// `remove_subtree`), so this never resurrects a deleted entry.
+    #[doc(hidden)]
+    pub async fn known_children_of(&self, parent: NodeId) -> Vec<(NodeId, NodeAttr)> {
+        let inner = self.inner.read().await;
+        inner
+            .known_children
+            .iter()
+            .filter(|((p, _), _)| *p == parent)
+            .filter_map(|(_, id)| inner.attrs.get(id).map(|attr| (*id, attr.clone())))
+            .collect()
+    }
+
     /// Force a directory's cached listing to be treated as expired,
     /// regardless of when it was actually populated. Test-only: production
     /// code relies on wall-clock TTL expiry, not this shortcut. Currently

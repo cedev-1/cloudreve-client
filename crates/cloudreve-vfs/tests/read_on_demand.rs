@@ -27,7 +27,7 @@ async fn reading_a_slice_downloads_only_that_slice_plus_readahead() {
     env.set_remote_files(vec![remote_file("video.mp4", body.len() as i64, "e1")]).await;
     env.serve_file_content("video.mp4", &body).await;
 
-    let vfs = Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(),
+    let (vfs, _rx) = Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(),
                        DEFAULT_CACHE_MAX_BYTES).unwrap();
     let node = vfs.tree().lookup(vfs.tree().root(), "video.mp4").await.unwrap().unwrap().0;
     let h = vfs.open(node).await.unwrap();
@@ -49,7 +49,7 @@ async fn a_cached_block_is_served_without_any_http_request() {
     env.set_remote_files(vec![remote_file("doc.pdf", body.len() as i64, "e1")]).await;
     env.serve_file_content("doc.pdf", &body).await;
 
-    let vfs = Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(),
+    let (vfs, _rx) = Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(),
                        DEFAULT_CACHE_MAX_BYTES).unwrap();
     let node = vfs.tree().lookup(vfs.tree().root(), "doc.pdf").await.unwrap().unwrap().0;
     let h = vfs.open(node).await.unwrap();
@@ -71,7 +71,7 @@ async fn a_read_past_the_end_returns_the_truncated_tail() {
     let body = b"short file".to_vec();
     env.set_remote_files(vec![remote_file("s.txt", body.len() as i64, "e1")]).await;
     env.serve_file_content("s.txt", &body).await;
-    let vfs = Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(),
+    let (vfs, _rx) = Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(),
                        DEFAULT_CACHE_MAX_BYTES).unwrap();
     let node = vfs.tree().lookup(vfs.tree().root(), "s.txt").await.unwrap().unwrap().0;
     let h = vfs.open(node).await.unwrap();
@@ -88,7 +88,7 @@ async fn the_cache_cap_holds_through_real_reads() {
     for (name, byte) in [("a.bin", 1u8), ("b.bin", 2), ("c.bin", 3), ("d.bin", 4)] {
         env.add_remote_file(name, vec![byte; mb], &format!("e-{name}")).await;
     }
-    let vfs = Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(),
+    let (vfs, _rx) = Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(),
                        3 * mb as u64).unwrap();
     for name in ["a.bin", "b.bin", "c.bin", "d.bin"] {
         let node = vfs.tree().lookup(vfs.tree().root(), name).await.unwrap().unwrap().0;
@@ -97,7 +97,7 @@ async fn the_cache_cap_holds_through_real_reads() {
         vfs.close(h).await.unwrap();
     }
     env.wait_for_downloads_to_settle().await;
-    let disk: u64 = common::dir_size(env.cache_dir());
+    let disk: u64 = common::dir_size(&env.blocks_dir());
     assert!(disk <= 3 * mb as u64 + 64 * 1024,
         "cache dir holds {disk} bytes, cap was {}", 3 * mb);
     // a.bin was evicted: reading it again must hit the network once more.
@@ -119,7 +119,7 @@ async fn a_zero_length_read_returns_empty_without_panicking() {
     env.set_remote_files(vec![remote_file("z.bin", body.len() as i64, "e1")]).await;
     env.serve_file_content("z.bin", &body).await;
 
-    let vfs = Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(),
+    let (vfs, _rx) = Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(),
                        DEFAULT_CACHE_MAX_BYTES).unwrap();
     let node = vfs.tree().lookup(vfs.tree().root(), "z.bin").await.unwrap().unwrap().0;
     let h = vfs.open(node).await.unwrap();
@@ -149,7 +149,7 @@ async fn a_transient_download_error_is_retried_then_served() {
     env.serve_file_content("flaky.bin", &body).await;
     env.fail_downloads_n_times("flaky.bin", 2, 500).await;
 
-    let vfs = Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(),
+    let (vfs, _rx) = Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(),
                        DEFAULT_CACHE_MAX_BYTES).unwrap();
     let node = vfs.tree().lookup(vfs.tree().root(), "flaky.bin").await.unwrap().unwrap().0;
     let h = vfs.open(node).await.unwrap();
@@ -173,7 +173,7 @@ async fn a_persistent_download_error_surfaces_after_bounded_retries() {
     env.serve_file_content("dead.bin", &body).await;
     env.fail_downloads_n_times("dead.bin", 1000, 500).await; // effectively "always fails"
 
-    let vfs = Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(),
+    let (vfs, _rx) = Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(),
                        DEFAULT_CACHE_MAX_BYTES).unwrap();
     let node = vfs.tree().lookup(vfs.tree().root(), "dead.bin").await.unwrap().unwrap().0;
     let h = vfs.open(node).await.unwrap();

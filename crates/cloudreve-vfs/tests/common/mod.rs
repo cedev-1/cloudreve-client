@@ -7,9 +7,10 @@
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use cloudreve_api::api::ExplorerApi;
 use cloudreve_api::models::explorer::{FileURLService, UploadSessionRequest};
@@ -47,6 +48,17 @@ type UploadChunksStore = Arc<Mutex<HashMap<String, BTreeMap<usize, Vec<u8>>>>>;
 /// `uploaded_content` can find the right session without the caller
 /// needing to track session ids itself.
 type LatestSessionForName = Arc<Mutex<HashMap<String, String>>>;
+/// Per-name call counter for `/api/v4/file/url`, doubling as the version
+/// number stamped onto the URL it hands back (`?v={n}`) — a real Cloudreve
+/// server issues a genuinely different signed URL on every call, and a
+/// mock that always returns the identical string can hide bugs where code
+/// under test never actually re-fetches a URL it claims to have refreshed.
+type FileUrlCalls = Arc<Mutex<HashMap<String, u32>>>;
+/// Download hits against `name`'s content endpoint, broken out by which
+/// `?v=` the request carried — lets a test tell "the original url" and
+/// "the refreshed url" apart even though both are served by the same mock.
+type DownloadHitsByVersion = Arc<Mutex<HashMap<(String, u32), u32>>>;
+type DownloadDelays = Arc<Mutex<HashMap<String, Duration>>>;
 
 pub struct VfsTestEnv {
     pub server: MockServer,
@@ -62,6 +74,9 @@ pub struct VfsTestEnv {
     latest_session_for_name: LatestSessionForName,
     upload_session_count: Arc<AtomicUsize>,
     upload_session_failures_remaining: Arc<AtomicUsize>,
+    file_url_calls: FileUrlCalls,
+    download_hits_by_version: DownloadHitsByVersion,
+    download_delays: DownloadDelays,
 }
 
 impl VfsTestEnv {
@@ -91,6 +106,9 @@ impl VfsTestEnv {
         let latest_session_for_name: LatestSessionForName = Arc::new(Mutex::new(HashMap::new()));
         let upload_session_count = Arc::new(AtomicUsize::new(0));
         let upload_session_failures_remaining = Arc::new(AtomicUsize::new(0));
+        let file_url_calls: FileUrlCalls = Arc::new(Mutex::new(HashMap::new()));
+        let download_hits_by_version: DownloadHitsByVersion = Arc::new(Mutex::new(HashMap::new()));
+        let download_delays: DownloadDelays = Arc::new(Mutex::new(HashMap::new()));
 
         // Listing endpoint: path-aware, keyed by the `uri` query param exactly
         // as `ExplorerApiExt::list_files_all` sends it, so a directory only
@@ -132,17 +150,29 @@ impl VfsTestEnv {
 
         // Download-URL endpoint: mirrors `POST /api/v4/file/url`. Reads the
         // requested uri out of the request body and points the returned URL
-        // back at this same mock server, keyed by file name.
+        // back at this same mock server, keyed by file name — and, unlike a
+        // naive mock, a genuinely different URL every call (`?v={n}`,
+        // per-name): a real Cloudreve server never reissues the identical
+        // signed URL twice, and code that only "refreshes" a URL in name
+        // (without a test able to tell) can hide real bugs (see the ledger
+        // debt test in write_back.rs for exactly this).
         {
             let base = server.uri();
+            let file_url_calls = file_url_calls.clone();
             Mock::given(method("POST"))
                 .and(path("/api/v4/file/url"))
                 .respond_with(move |req: &Request| {
                     let request: FileURLService =
                         req.body_json().expect("decode FileURLService request body");
                     let uri = request.uris.first().cloned().unwrap_or_default();
-                    let name = uri.rsplit('/').next().unwrap_or_default();
-                    let download_url = format!("{base}/vfs-download/{name}");
+                    let name = uri.rsplit('/').next().unwrap_or_default().to_string();
+                    let version = {
+                        let mut calls = file_url_calls.lock().unwrap();
+                        let entry = calls.entry(name.clone()).or_insert(0);
+                        *entry += 1;
+                        *entry
+                    };
+                    let download_url = format!("{base}/vfs-download/{name}?v={version}");
                     ResponseTemplate::new(200).set_body_json(json!({
                         "code": 0,
                         "msg": "",
@@ -157,13 +187,18 @@ impl VfsTestEnv {
         }
 
         // Download content endpoint: honors `Range: bytes=a-b` with a 206 and
-        // the exact slice, and records every hit so tests can assert on the
-        // exact ranges a caller requested.
+        // the exact slice, and records every hit (overall, and split out by
+        // `?v=` — see `DownloadHitsByVersion`) so tests can assert on the
+        // exact ranges/urls a caller requested. An artificial per-name delay
+        // (`slow_down_downloads`) can be layered on to widen a race window
+        // for concurrency tests.
         {
             let contents = contents.clone();
             let requests = requests.clone();
             let bytes_served = bytes_served.clone();
             let download_request_count = download_request_count.clone();
+            let download_hits_by_version = download_hits_by_version.clone();
+            let download_delays = download_delays.clone();
             Mock::given(method("GET"))
                 .and(path_regex(r"^/vfs-download/.+$"))
                 .respond_with(move |req: &Request| {
@@ -175,6 +210,12 @@ impl VfsTestEnv {
                         .next()
                         .unwrap_or_default()
                         .to_string();
+                    let version = extract_version(req);
+                    *download_hits_by_version
+                        .lock()
+                        .unwrap()
+                        .entry((name.clone(), version))
+                        .or_default() += 1;
                     let range_header = req
                         .headers
                         .get("Range")
@@ -187,6 +228,12 @@ impl VfsTestEnv {
                         .or_default()
                         .push(range_header.clone());
 
+                    let delay = download_delays.lock().unwrap().get(&name).copied();
+                    let with_delay = |resp: ResponseTemplate| match delay {
+                        Some(d) => resp.set_delay(d),
+                        None => resp,
+                    };
+
                     let Some(content) = contents.lock().unwrap().get(&name).cloned() else {
                         return ResponseTemplate::new(404);
                     };
@@ -198,10 +245,12 @@ impl VfsTestEnv {
                         let body = content[start..=end].to_vec();
                         *bytes_served.lock().unwrap().entry(name.clone()).or_default() +=
                             body.len() as u64;
-                        return ResponseTemplate::new(206)
-                            .insert_header("Accept-Ranges", "bytes")
-                            .insert_header("Content-Range", format!("bytes {start}-{end}/{len}"))
-                            .set_body_bytes(body);
+                        return with_delay(
+                            ResponseTemplate::new(206)
+                                .insert_header("Accept-Ranges", "bytes")
+                                .insert_header("Content-Range", format!("bytes {start}-{end}/{len}"))
+                                .set_body_bytes(body),
+                        );
                     }
 
                     // A Range header that fails to parse as satisfiable (e.g.
@@ -210,15 +259,19 @@ impl VfsTestEnv {
                     // see the same response shape a real out-of-range GET
                     // would produce, not a silent full-body fallback.
                     if range_header.is_some() {
-                        return ResponseTemplate::new(416)
-                            .insert_header("Content-Range", format!("bytes */{len}"));
+                        return with_delay(
+                            ResponseTemplate::new(416)
+                                .insert_header("Content-Range", format!("bytes */{len}")),
+                        );
                     }
 
                     *bytes_served.lock().unwrap().entry(name.clone()).or_default() +=
                         content.len() as u64;
-                    ResponseTemplate::new(200)
-                        .insert_header("Accept-Ranges", "bytes")
-                        .set_body_bytes(content)
+                    with_delay(
+                        ResponseTemplate::new(200)
+                            .insert_header("Accept-Ranges", "bytes")
+                            .set_body_bytes(content),
+                    )
                 })
                 .mount(&server)
                 .await;
@@ -238,6 +291,9 @@ impl VfsTestEnv {
             latest_session_for_name,
             upload_session_count,
             upload_session_failures_remaining,
+            file_url_calls,
+            download_hits_by_version,
+            download_delays,
         }
     }
 
@@ -467,11 +523,17 @@ impl VfsTestEnv {
     pub async fn fail_downloads_n_times(&self, name: &str, times: u64, status: u16) {
         let requests = self.requests.clone();
         let download_request_count = self.download_request_count.clone();
+        let download_hits_by_version = self.download_hits_by_version.clone();
         let name = name.to_string();
         Mock::given(method("GET"))
             .and(path(format!("/vfs-download/{name}")))
             .respond_with(move |req: &Request| {
                 download_request_count.fetch_add(1, Ordering::SeqCst);
+                *download_hits_by_version
+                    .lock()
+                    .unwrap()
+                    .entry((name.clone(), extract_version(req)))
+                    .or_default() += 1;
                 let range_header = req
                     .headers
                     .get("Range")
@@ -491,6 +553,90 @@ impl VfsTestEnv {
             .await;
     }
 
+    /// Like `fail_downloads_n_times`, but each successive call against
+    /// `name`'s download endpoint answers with the next status in
+    /// `statuses` instead of a single repeated one — used to exercise a
+    /// non-uniform failure sequence (e.g. a transient 500 followed by an
+    /// expired-url 403) that `fail_downloads_n_times` can't express. Once
+    /// every status in the list has been served once, the normal range-
+    /// aware responder from `new()` takes back over, exactly like
+    /// `fail_downloads_n_times`.
+    pub async fn fail_downloads_with_sequence(&self, name: &str, statuses: Vec<u16>) {
+        let requests = self.requests.clone();
+        let download_request_count = self.download_request_count.clone();
+        let download_hits_by_version = self.download_hits_by_version.clone();
+        let name_owned = name.to_string();
+        let call = Arc::new(AtomicUsize::new(0));
+        let n = statuses.len() as u64;
+        Mock::given(method("GET"))
+            .and(path(format!("/vfs-download/{name}")))
+            .respond_with(move |req: &Request| {
+                download_request_count.fetch_add(1, Ordering::SeqCst);
+                *download_hits_by_version
+                    .lock()
+                    .unwrap()
+                    .entry((name_owned.clone(), extract_version(req)))
+                    .or_default() += 1;
+                let range_header = req
+                    .headers
+                    .get("Range")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
+                requests
+                    .lock()
+                    .unwrap()
+                    .entry(name_owned.clone())
+                    .or_default()
+                    .push(range_header);
+                let idx = call.fetch_add(1, Ordering::SeqCst).min(statuses.len() - 1);
+                ResponseTemplate::new(statuses[idx])
+            })
+            .up_to_n_times(n)
+            .with_priority(1)
+            .mount(&self.server)
+            .await;
+    }
+
+    /// Total number of `POST /api/v4/file/url` calls made for `name` so
+    /// far — each one hands back a distinct `?v=` url (see `new()`'s
+    /// comment). A caller that "refreshes" a url after a 403 without
+    /// actually re-requesting one will leave this stuck, which is the
+    /// whole point of exposing it: it distinguishes a real refresh from a
+    /// mutation that merely retries the same url again.
+    pub fn file_url_request_count(&self, name: &str) -> usize {
+        self.file_url_calls
+            .lock()
+            .unwrap()
+            .get(name)
+            .copied()
+            .unwrap_or(0) as usize
+    }
+
+    /// Download hits against `name`'s content endpoint that carried
+    /// `?v={version}` specifically — lets a test tell the original url and
+    /// a refreshed one apart even though the same mock responder serves
+    /// both.
+    pub fn download_hits_for_version(&self, name: &str, version: u32) -> u32 {
+        self.download_hits_by_version
+            .lock()
+            .unwrap()
+            .get(&(name.to_string(), version))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Adds an artificial delay to every future response from `name`'s
+    /// download endpoint (only the default/success responder mounted by
+    /// `new()`, not an injected-failure one) — used to widen a race window
+    /// in concurrency tests (e.g. two writers materializing the same file
+    /// at once) without relying on scheduler luck alone.
+    pub fn slow_down_downloads(&self, name: &str, delay: Duration) {
+        self.download_delays
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), delay);
+    }
+
     /// The `Range` header of every recorded hit against `name`'s download
     /// endpoint, in request order (`None` when a request carried no `Range`).
     pub fn download_requests(&self, name: &str) -> Vec<Option<String>> {
@@ -508,6 +654,17 @@ impl VfsTestEnv {
 
     pub fn cache_dir(&self) -> &Path {
         self.cache_dir.path()
+    }
+
+    /// Root of the on-disk block cache — `Vfs::new` segregates it from
+    /// `drafts/` under `cache_dir` (D1's TRAP: `BlockCache::open` deletes
+    /// any directory lacking `meta.json`, so it must never be pointed at a
+    /// root that also holds draft directories). Tests measuring the
+    /// cache's on-disk footprint against its configured cap must measure
+    /// this subdir specifically, not the whole `cache_dir`, or draft bytes
+    /// would incorrectly count against the block-cache budget.
+    pub fn blocks_dir(&self) -> PathBuf {
+        self.cache_dir.path().join("blocks")
     }
 
     /// Total bytes actually returned in response bodies by `name`'s download
@@ -607,6 +764,18 @@ pub fn dir_size(dir: &Path) -> u64 {
         }
     }
     total
+}
+
+/// Reads the `?v=` query parameter off a download-endpoint request,
+/// defaulting to `1` for a url that somehow carries none (shouldn't happen
+/// given `new()` always stamps one, but a sane default beats a panic if it
+/// ever does).
+fn extract_version(req: &Request) -> u32 {
+    req.url
+        .query_pairs()
+        .find(|(k, _)| k == "v")
+        .and_then(|(_, v)| v.parse().ok())
+        .unwrap_or(1)
 }
 
 /// Parse a single-range `Range: bytes=a-b` header into an inclusive
