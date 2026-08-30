@@ -197,6 +197,31 @@ impl VfsTree {
             return Ok(());
         }
 
+        // Names present in this fresh listing: anything else previously
+        // known under `dir` is a ghost — deleted (or renamed) on the server
+        // since the last listing — and gets pruned below once the new ids
+        // are known, so `known_children`/`attrs` don't grow forever under
+        // churn.
+        let fresh_names: std::collections::HashSet<String> =
+            files.iter().map(|f| f.name.clone()).collect();
+
+        // Snapshot of `dir`'s previously known (name, id) children, taken
+        // before anything below is mutated. Diffing this local list against
+        // `fresh_names` costs O(children of dir) — never O(every
+        // known_children pair in the whole tree) — keeping the module's
+        // "cost is paid per directory visited" invariant intact even under
+        // churn. Sourced from `children`, not a scan of `known_children`:
+        // that is exactly why `invalidate_path` below only clears
+        // `listed_at`, not `children` — this list must still be here when a
+        // re-list was triggered by invalidation, not just by TTL expiry.
+        let old_children: Vec<(String, NodeId)> = inner
+            .children
+            .get(&dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| inner.attrs.get(id).map(|attr| (attr.name.clone(), *id)))
+            .collect();
+
         let mut child_ids = Vec::with_capacity(files.len());
         for f in files {
             let key = (dir, f.name.clone());
@@ -219,6 +244,22 @@ impl VfsTree {
             inner.attrs.insert(id, attr);
             child_ids.push(id);
         }
+
+        // Prune ghosts: any previously known child of `dir` absent from the
+        // fresh listing no longer exists remotely. Names still present
+        // above keep their NodeId untouched — only vanished names are
+        // removed here. When a pruned ghost is itself a directory, its
+        // whole in-memory subtree goes with it (see `remove_subtree`), or
+        // its descendants' `children`/`listed_at`/`known_children` entries
+        // would orphan forever, unreachable from the tree yet still
+        // resident.
+        for (name, ghost_id) in old_children {
+            if !fresh_names.contains(&name) {
+                inner.known_children.remove(&(dir, name));
+                remove_subtree(&mut inner, ghost_id);
+            }
+        }
+
         inner.children.insert(dir, child_ids);
         inner.listed_at.insert(dir, Instant::now());
         Ok(())
@@ -234,15 +275,20 @@ impl VfsTree {
 
         let mut inner = self.inner.write().await;
 
-        // The directory that listed this entry: drop its cached children so
-        // the next readdir/lookup on it goes back to the network.
+        // The directory that listed this entry: only its `listed_at` stamp
+        // is dropped, not `children` itself. Clearing `listed_at` alone
+        // already makes `ensure_listed`'s freshness check fail, forcing the
+        // next readdir/lookup back to the network — while leaving the last-
+        // known child list in place for `ensure_listed` to diff the fresh
+        // listing against when pruning ghosts (see its `old_children`
+        // snapshot). Removing `children` here too would erase that
+        // snapshot before the re-list ever runs.
         if let Some(dir_id) = inner
             .attrs
             .iter()
             .find(|(_, attr)| attr.is_dir && attr.remote_path == parent_path)
             .map(|(id, _)| *id)
         {
-            inner.children.remove(&dir_id);
             inner.listed_at.remove(&dir_id);
         }
 
@@ -274,6 +320,26 @@ impl VfsTree {
             *listed_at = Instant::now() - LISTING_TTL - Duration::from_secs(1);
         }
     }
+}
+
+/// Removes a pruned node's own bookkeeping and, when it was a directory,
+/// recurses into every already-listed descendant first — so a ghost
+/// directory takes its whole in-memory subtree down with it instead of
+/// leaving `children`/`listed_at`/`known_children` entries under it
+/// orphaned forever. Each `known_children` removal is a direct key lookup
+/// (parent id + name), never a scan of the map: cost is proportional to the
+/// size of the subtree actually resident in memory, not to the whole tree.
+fn remove_subtree(inner: &mut Inner, id: NodeId) {
+    if let Some(child_ids) = inner.children.remove(&id) {
+        for child_id in child_ids {
+            if let Some(name) = inner.attrs.get(&child_id).map(|attr| attr.name.clone()) {
+                inner.known_children.remove(&(id, name));
+            }
+            remove_subtree(inner, child_id);
+        }
+    }
+    inner.listed_at.remove(&id);
+    inner.attrs.remove(&id);
 }
 
 /// Parses a server timestamp the same way `drive::sync` does: on failure —
