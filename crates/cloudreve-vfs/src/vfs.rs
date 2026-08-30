@@ -138,9 +138,11 @@ impl Vfs {
     }
 
     /// Opens a node for reading: resolves its signed download URL once and
-    /// pins its cache entry so it can never be evicted while the handle is
-    /// live. `node` must already be known to the tree (from an earlier
-    /// `readdir`/`lookup`) and must not be a directory.
+    /// retains its cache entry so it can never be evicted while the handle
+    /// is live — even if this is the file's very first open and nothing
+    /// has been downloaded for it yet (see `BlockCache::retain`). `node`
+    /// must already be known to the tree (from an earlier `readdir`/
+    /// `lookup`) and must not be a directory.
     pub async fn open(&self, node: NodeId) -> Result<FileHandle> {
         let attr = self
             .tree
@@ -151,11 +153,7 @@ impl Vfs {
             bail!("cannot open a directory as a file");
         }
         let key = FileKey { remote_path: attr.remote_path.clone(), etag: attr.etag.clone() };
-
-        // Best-effort pin: a no-op until the entry actually exists on disk
-        // (nothing has been downloaded yet for a fresh file), which is why
-        // `fetch_and_cache_run` re-asserts it after writing each block.
-        self.cache.lock().await.pin(&key);
+        self.cache.lock().await.retain(&key);
 
         let download_url = fetch_download_url(&self.client, &key).await?;
         let open_file =
@@ -230,8 +228,11 @@ impl Vfs {
         Ok(out.freeze())
     }
 
-    /// Closes a handle opened by `open`, unpinning its cache entry so it
-    /// becomes eligible for eviction again like any other cached file.
+    /// Closes a handle opened by `open`, releasing its retain on the cache
+    /// entry. Only once every handle on this file has closed does the
+    /// entry become eligible for eviction again like any other cached
+    /// file — a second handle still open (e.g. another app previewing the
+    /// same file) keeps it pinned regardless of this one closing.
     pub async fn close(&self, h: FileHandle) -> Result<()> {
         let of = self
             .open_files
@@ -239,7 +240,7 @@ impl Vfs {
             .await
             .remove(&h.0)
             .context("close: file handle is not open")?;
-        self.cache.lock().await.unpin(&of.key);
+        self.cache.lock().await.release(&of.key);
         Ok(())
     }
 
@@ -341,12 +342,14 @@ async fn fetch_and_cache_run(
             break; // the server returned fewer bytes than asked: real EOF
         }
         let rel_end = (rel_start + BLOCK_SIZE as usize).min(data.len());
-        // `of` is always a currently open file (only `Vfs::read` and
-        // `readahead_fill` call this, both holding an open `OpenFile`), so
-        // every block written here must be pinned atomically with its
-        // creation — `write_block`'s own doc comment explains why a
-        // separate `pin()` call after this returned would be too late.
-        cache.write_block(&of.key, b, &data[rel_start..rel_end], true)?;
+        // No pin argument here anymore: `write_block` consults the cache's
+        // own retain count, which was already set by this handle's
+        // `Vfs::open`. That also fixes the phase-1 readahead-after-close
+        // leak — if `close`/`release` already ran by the time this
+        // (`tokio::spawn`ed) readahead write lands, the key is no longer
+        // retained and the block is correctly evictable rather than
+        // re-pinning a file nobody has open anymore.
+        cache.write_block(&of.key, b, &data[rel_start..rel_end])?;
     }
     Ok(())
 }

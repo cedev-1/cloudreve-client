@@ -63,7 +63,6 @@ struct Entry {
     /// time as they're read on demand, so most indices below the highest
     /// one ever written may legitimately be missing.
     blocks: BTreeSet<u64>,
-    pinned: bool,
     /// Persisted so recency order survives a restart (`open()` re-derives
     /// `seq` from this). Second resolution, so two accesses in the same
     /// wall-clock second are indistinguishable on disk — `seq` is what
@@ -85,6 +84,19 @@ pub struct BlockCache {
     /// is a pure function of the path), and using the hash means `open()`
     /// never needs to recover `remote_path` from disk.
     entries: HashMap<String, Entry>,
+    /// Live-handle refcounts, keyed by the same hash as `entries` but kept
+    /// as a wholly separate map: a `retain()` for a file with nothing
+    /// cached yet (a fresh open, before its first block ever lands) must
+    /// still be visible the instant `write_block` creates the entry, and
+    /// an `Entry`-embedded flag can't record that ahead of the `Entry`
+    /// existing. A hash present in this map always has a count > 0;
+    /// `release` removes the key rather than leaving a `0` around, so
+    /// `evict_if_over_budget` only ever has to ask "is this hash retained
+    /// at all", never compare a count. In memory only, on purpose: retains
+    /// model live handles for the current process, which restart always
+    /// closes, so unlike `blocks`/`etag` they are never written to
+    /// meta.json and never restored by `open()`.
+    retains: HashMap<String, u32>,
     next_seq: u64,
 }
 
@@ -136,7 +148,6 @@ impl BlockCache {
                 Entry {
                     etag: meta.etag,
                     blocks: meta.blocks.into_iter().collect(),
-                    pinned: false,
                     last_used_unix: meta.last_used_unix,
                     seq: 0, // assigned below, in last-used order
                 },
@@ -154,7 +165,10 @@ impl BlockCache {
         }
         let next_seq = entries.len() as u64;
 
-        Ok(Self { root: root.to_path_buf(), max_bytes, entries, next_seq })
+        // Retains are handle liveness, not persisted state: a fresh
+        // `open()` always starts with nothing retained, even if the
+        // process that crashed had files open (see the field doc above).
+        Ok(Self { root: root.to_path_buf(), max_bytes, entries, retains: HashMap::new(), next_seq })
     }
 
     /// None if the block is absent OR the stored etag differs (stale).
@@ -218,20 +232,18 @@ impl BlockCache {
         Ok(Some(Bytes::from(buf)))
     }
 
-    /// `pinned` communicates the caller's intent for this entry — pass
-    /// `true` when writing on behalf of a currently open file.
-    ///
-    /// It must be applied to a freshly created entry *before*
-    /// `evict_if_over_budget` ever runs, not after `write_block` returns:
-    /// the eviction sweep below runs inside this same call, and a brand
-    /// new entry starts out unpinned by construction. A caller that writes
-    /// first and calls `pin()` afterward (the natural-looking order) can
-    /// have its own entry deleted out from under it in that gap — self-
-    /// eviction on the very first block of a fresh (or etag-reset) file,
-    /// reachable whenever a small `max_bytes` is already over budget with
-    /// nothing else evictable. `an_open_files_first_write_never_evicts_itself`
+    /// Writes one block, creating the entry if needed. Whether that entry
+    /// is evictable is decided purely by `self.retains` (see its field
+    /// doc), never by an argument here — so a key retained *before* its
+    /// first block ever lands is already safe the moment this call creates
+    /// the entry, with no separate "pin the entry I just created" step
+    /// that could race the eviction sweep at the end of this same call.
+    /// That sweep runs inside this call, against a brand new entry, so the
+    /// atomicity is what makes self-eviction on a retained file's very
+    /// first write impossible even when `max_bytes` is already over budget
+    /// with nothing else to evict — `an_open_files_first_write_never_evicts_itself`
     /// pins this down.
-    pub fn write_block(&mut self, key: &FileKey, block_idx: u64, data: &[u8], pinned: bool) -> Result<()> {
+    pub fn write_block(&mut self, key: &FileKey, block_idx: u64, data: &[u8]) -> Result<()> {
         let hash = hash_key(&key.remote_path);
 
         if self.entries.get(&hash).is_some_and(|e| e.etag != key.etag) {
@@ -261,7 +273,6 @@ impl BlockCache {
         let entry = self.entries.entry(hash.clone()).or_insert_with(|| Entry {
             etag: key.etag.clone(),
             blocks: BTreeSet::new(),
-            pinned: false, // set below, uniformly for a fresh or pre-existing entry
             last_used_unix: 0,
             seq: 0,
         });
@@ -269,18 +280,6 @@ impl BlockCache {
         entry.blocks.insert(block_idx);
         entry.last_used_unix = now_unix();
         entry.seq = seq;
-        // Applied here — to the entry that now definitely exists, whether
-        // this call just created it or it was already there — and still
-        // before `evict_if_over_budget()` below, which is the whole point:
-        // a brand new entry must never be visible to eviction as unpinned,
-        // not even for the instant between this method creating it and a
-        // caller's own separate `pin()` call after it returns. Never
-        // unpins: `pinned: false` means "no opinion", not "unpin", so an
-        // explicit `unpin()` call elsewhere is never undone by an
-        // unrelated write.
-        if pinned {
-            entry.pinned = true;
-        }
 
         let entry = self.entries.get(&hash).expect("just inserted/updated above");
         self.write_meta(&hash, entry)?;
@@ -289,21 +288,32 @@ impl BlockCache {
         Ok(())
     }
 
-    /// Files currently open must never be evicted; phase 2 adds drafts here.
-    pub fn pin(&mut self, key: &FileKey) {
+    /// Registers a live file handle: while retained, this key's entry (or
+    /// the entry `write_block` creates for it later, if none exists yet)
+    /// is never evicted. Two handles on the same file (e.g. Finder holding
+    /// it open while Quick Look previews it) each get their own call, and
+    /// the entry survives until both release — see `release`. Deliberately
+    /// keyed on `remote_path` alone, not `key.etag`: a handle stays open
+    /// across whatever entry churn happens for that path (an etag change
+    /// mid-read replaces the entry via `remove_entry`, unaffected by this
+    /// task), matching how `OpenFile` in the facade fixes its `FileKey`
+    /// for the handle's whole lifetime.
+    pub fn retain(&mut self, key: &FileKey) {
         let hash = hash_key(&key.remote_path);
-        if let Some(entry) = self.entries.get_mut(&hash) {
-            if entry.etag == key.etag {
-                entry.pinned = true;
-            }
-        }
+        *self.retains.entry(hash).or_insert(0) += 1;
     }
 
-    pub fn unpin(&mut self, key: &FileKey) {
+    /// Drops one handle registered by `retain`. Only once the count reaches
+    /// zero (every handle closed) does the key stop being protected from
+    /// eviction — a still-live second handle must never see the entry
+    /// evicted out from under it just because a different handle closed
+    /// first.
+    pub fn release(&mut self, key: &FileKey) {
         let hash = hash_key(&key.remote_path);
-        if let Some(entry) = self.entries.get_mut(&hash) {
-            if entry.etag == key.etag {
-                entry.pinned = false;
+        if let std::collections::hash_map::Entry::Occupied(mut occ) = self.retains.entry(hash) {
+            *occ.get_mut() -= 1;
+            if *occ.get() == 0 {
+                occ.remove();
             }
         }
     }
@@ -334,17 +344,18 @@ impl BlockCache {
         }
     }
 
-    /// Deletes unpinned entries, oldest-`seq` (least recently used) first,
-    /// until total usage fits `max_bytes` again. Stops rather than errors
-    /// if everything left is pinned and still over budget: pinning is a
-    /// hard guarantee to the caller, so this cache trades staying over
-    /// budget for never evicting a file someone has open.
+    /// Deletes unretained entries, oldest-`seq` (least recently used)
+    /// first, until total usage fits `max_bytes` again. Stops rather than
+    /// errors if everything left is retained and still over budget:
+    /// a live handle is a hard guarantee to the caller, so this cache
+    /// trades staying over budget for never evicting a file someone has
+    /// open.
     fn evict_if_over_budget(&mut self) -> Result<()> {
         while self.used_bytes() > self.max_bytes {
             let victim = self
                 .entries
                 .iter()
-                .filter(|(_, entry)| !entry.pinned)
+                .filter(|(hash, _)| !self.retains.contains_key(*hash))
                 .min_by_key(|(_, entry)| entry.seq)
                 .map(|(hash, _)| hash.clone());
             match victim {
@@ -465,7 +476,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut c = BlockCache::open(dir.path(), 100 * BLOCK_SIZE).unwrap();
         let payload = vec![7u8; BLOCK_SIZE as usize];
-        c.write_block(&key("a", "e1"), 3, &payload, false).unwrap();
+        c.write_block(&key("a", "e1"), 3, &payload).unwrap();
         assert_eq!(c.read_block(&key("a", "e1"), 3).unwrap().unwrap().as_ref(), &payload[..]);
         assert!(c.read_block(&key("a", "e1"), 2).unwrap().is_none(), "unwritten block");
     }
@@ -474,7 +485,7 @@ mod tests {
     fn a_new_etag_invalidates_every_cached_block_of_the_file() {
         let dir = TempDir::new().unwrap();
         let mut c = BlockCache::open(dir.path(), 100 * BLOCK_SIZE).unwrap();
-        c.write_block(&key("a", "e1"), 0, &[1u8; 1024], false).unwrap();
+        c.write_block(&key("a", "e1"), 0, &[1u8; 1024]).unwrap();
         assert!(
             c.read_block(&key("a", "e2"), 0).unwrap().is_none(),
             "the server rewrote the file: old bytes must not be served"
@@ -486,7 +497,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         {
             let mut c = BlockCache::open(dir.path(), 100 * BLOCK_SIZE).unwrap();
-            c.write_block(&key("a", "e1"), 0, &[9u8; 512], false).unwrap();
+            c.write_block(&key("a", "e1"), 0, &[9u8; 512]).unwrap();
         }
         let mut c = BlockCache::open(dir.path(), 100 * BLOCK_SIZE).unwrap();
         assert_eq!(c.read_block(&key("a", "e1"), 0).unwrap().unwrap().as_ref(), &[9u8; 512][..]);
@@ -497,8 +508,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut c = BlockCache::open(dir.path(), 100 * BLOCK_SIZE).unwrap();
         let full_block = vec![5u8; BLOCK_SIZE as usize];
-        c.write_block(&key("a", "e1"), 0, &full_block, false).unwrap();
-        c.write_block(&key("a", "e1"), 1, &full_block, false).unwrap();
+        c.write_block(&key("a", "e1"), 0, &full_block).unwrap();
+        c.write_block(&key("a", "e1"), 1, &full_block).unwrap();
 
         // Simulate a crash mid-write: meta.json still lists block 0 as a
         // full BLOCK_SIZE block, but the data file on disk got truncated
@@ -532,7 +543,7 @@ mod tests {
         // And the cache is usable again: re-downloading and rewriting the
         // block must round-trip normally.
         let fresh = vec![6u8; BLOCK_SIZE as usize];
-        c.write_block(&key("a", "e1"), 0, &fresh, false).unwrap();
+        c.write_block(&key("a", "e1"), 0, &fresh).unwrap();
         assert_eq!(c.read_block(&key("a", "e1"), 0).unwrap().unwrap().as_ref(), &fresh[..]);
     }
 
@@ -541,7 +552,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         {
             let mut c = BlockCache::open(dir.path(), 100 * BLOCK_SIZE).unwrap();
-            c.write_block(&key("a", "e1"), 0, &[1u8; 1024], false).unwrap();
+            c.write_block(&key("a", "e1"), 0, &[1u8; 1024]).unwrap();
         }
         let hash = hash_key("a");
         let entry_dir = dir.path().join(&hash);
@@ -566,18 +577,20 @@ mod tests {
         let dir = TempDir::new().unwrap();
         // Smaller than a single block, so a fresh entry is already over
         // budget the instant its first block lands — with nothing else in
-        // the cache to evict instead. A pinned overrun like this is
-        // accepted (pinning is a hard guarantee; eviction just stops when
-        // nothing unpinned is left, see `evict_if_over_budget`), so both
-        // blocks below must survive despite the cache staying over budget.
+        // the cache to evict instead. A retained overrun like this is
+        // accepted (a live handle is a hard guarantee; eviction just stops
+        // when nothing unretained is left, see `evict_if_over_budget`), so
+        // both blocks below must survive despite the cache staying over
+        // budget.
         let mut c = BlockCache::open(dir.path(), BLOCK_SIZE / 2).unwrap();
 
-        // Pin-aware write: the entry is created already pinned, atomically
-        // with the eviction check inside this same call — not via a
-        // separate `pin()` after `write_block` returns, which would be too
-        // late (see the doc comment on `write_block`).
-        c.write_block(&key("open-file", "e1"), 0, &[1u8; BLOCK_SIZE as usize], true).unwrap();
-        c.write_block(&key("open-file", "e1"), 1, &[2u8; BLOCK_SIZE as usize], true).unwrap();
+        // Retained BEFORE the entry exists at all — the pending-retain
+        // case `write_block`'s doc comment describes: the entry gets
+        // created already unevictable the instant this call inserts it,
+        // not via a separate call after `write_block` returns.
+        c.retain(&key("open-file", "e1"));
+        c.write_block(&key("open-file", "e1"), 0, &[1u8; BLOCK_SIZE as usize]).unwrap();
+        c.write_block(&key("open-file", "e1"), 1, &[2u8; BLOCK_SIZE as usize]).unwrap();
 
         assert!(
             c.read_block(&key("open-file", "e1"), 0).unwrap().is_some(),
@@ -590,16 +603,49 @@ mod tests {
     }
 
     #[test]
+    // `1 * BLOCK_SIZE` is a no-op multiplication (clippy::identity_op), kept
+    // verbatim from the brief for the "budget expressed as N blocks" idiom
+    // shared with the `3 * BLOCK_SIZE` case elsewhere in this file.
+    #[allow(clippy::identity_op)]
+    fn two_handles_on_the_same_file_survive_the_first_close() {
+        let dir = TempDir::new().unwrap();
+        let mut c = BlockCache::open(dir.path(), 1 * BLOCK_SIZE).unwrap();
+        let k = key("shared", "e");
+        c.retain(&k); c.retain(&k);            // Finder + Quick Look
+        c.write_block(&k, 0, &vec![5u8; BLOCK_SIZE as usize]).unwrap();
+        c.release(&k);                          // first close
+        // Over-budget write of another file must NOT evict the still-open one.
+        c.write_block(&key("other", "e"), 0, &vec![6u8; BLOCK_SIZE as usize]).unwrap();
+        assert!(c.read_block(&k, 0).unwrap().is_some(), "evicted while a handle was still open");
+        c.release(&k);
+        c.write_block(&key("third", "e"), 0, &vec![7u8; BLOCK_SIZE as usize]).unwrap();
+        assert!(c.read_block(&k, 0).unwrap().is_none(), "still unevictable after the last close");
+    }
+
+    #[test]
+    #[allow(clippy::identity_op)] // see the comment on the test above
+    fn a_write_landing_after_the_last_release_is_evictable() {
+        // The phase-1 readahead-after-close leak, pinned dead.
+        let dir = TempDir::new().unwrap();
+        let mut c = BlockCache::open(dir.path(), 1 * BLOCK_SIZE).unwrap();
+        let k = key("closed", "e");
+        c.retain(&k); c.release(&k);            // opened and closed
+        c.write_block(&k, 0, &vec![8u8; BLOCK_SIZE as usize]).unwrap(); // late readahead
+        c.write_block(&key("next", "e"), 0, &vec![9u8; BLOCK_SIZE as usize]).unwrap();
+        assert!(c.read_block(&k, 0).unwrap().is_none(), "late readahead write re-pinned a closed file");
+    }
+
+    #[test]
     fn eviction_drops_the_least_recently_used_unpinned_file_first() {
         let dir = TempDir::new().unwrap();
         let mut c = BlockCache::open(dir.path(), 3 * BLOCK_SIZE).unwrap();
         let one_block = vec![1u8; BLOCK_SIZE as usize];
-        c.write_block(&key("old", "e"), 0, &one_block, false).unwrap();
-        c.write_block(&key("pinned", "e"), 0, &one_block, false).unwrap();
-        c.pin(&key("pinned", "e"));
-        c.write_block(&key("recent", "e"), 0, &one_block, false).unwrap();
+        c.write_block(&key("old", "e"), 0, &one_block).unwrap();
+        c.write_block(&key("pinned", "e"), 0, &one_block).unwrap();
+        c.retain(&key("pinned", "e"));
+        c.write_block(&key("recent", "e"), 0, &one_block).unwrap();
         c.read_block(&key("old", "e"), 0).unwrap(); // old is now MRU
-        c.write_block(&key("new", "e"), 0, &one_block, false).unwrap(); // must evict someone
+        c.write_block(&key("new", "e"), 0, &one_block).unwrap(); // must evict someone
         assert!(c.read_block(&key("old", "e"), 0).unwrap().is_some(), "recently used, kept");
         assert!(c.read_block(&key("pinned", "e"), 0).unwrap().is_some(), "pinned, kept");
         assert!(c.read_block(&key("recent", "e"), 0).unwrap().is_none(), "LRU victim");
