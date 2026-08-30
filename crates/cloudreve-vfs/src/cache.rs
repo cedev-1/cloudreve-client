@@ -225,9 +225,14 @@ impl BlockCache {
             }
         }
 
+        // Recency-only update: bump `seq`/`last_used_unix` in memory but do
+        // NOT persist meta.json here. The block SET didn't change, so there
+        // is nothing on disk that needs to change either — persisting would
+        // mean one meta.json rewrite per cached read, which is pure SSD wear
+        // for a hot file. meta.json is written only when the block set
+        // itself changes (write_block/drop_block/eviction); see `touch`'s
+        // doc for the resulting reopen trade-off.
         self.touch(&hash);
-        let entry = self.entries.get(&hash).expect("just touched");
-        self.write_meta(&hash, entry)?;
 
         Ok(Some(Bytes::from(buf)))
     }
@@ -331,10 +336,16 @@ impl BlockCache {
         self.entries.iter().map(|(hash, entry)| self.entry_bytes_on_disk(hash, entry)).sum()
     }
 
-    /// Bumps an entry's recency without touching disk. Split out of
-    /// `read_block` only so the borrow of `self.entries` needed to update
-    /// it ends before the caller re-borrows to read the entry back for
-    /// `write_meta`.
+    /// Bumps an entry's recency (`seq` and `last_used_unix`) in memory only
+    /// — deliberately never writes meta.json. `seq` is what eviction
+    /// actually orders by, and it never needs to survive a restart exactly:
+    /// `last_used_unix` is only persisted (and only accurate as of) the
+    /// last time the block SET changed (`write_block`/`drop_block`/
+    /// eviction), so a restart right after a long run of cache hits seeds
+    /// `seq` from a stale-ish timestamp. The result is early eviction being
+    /// slightly less accurate immediately after a restart — never data
+    /// loss or a wrong cache hit — which is a fine trade for not rewriting
+    /// meta.json on every cached read.
     fn touch(&mut self, hash: &str) {
         let seq = self.next_seq;
         self.next_seq += 1;
@@ -633,6 +644,22 @@ mod tests {
         c.write_block(&k, 0, &vec![8u8; BLOCK_SIZE as usize]).unwrap(); // late readahead
         c.write_block(&key("next", "e"), 0, &vec![9u8; BLOCK_SIZE as usize]).unwrap();
         assert!(c.read_block(&k, 0).unwrap().is_none(), "late readahead write re-pinned a closed file");
+    }
+
+    #[test]
+    fn cached_reads_do_not_rewrite_the_meta_file() {
+        let dir = TempDir::new().unwrap();
+        let mut c = BlockCache::open(dir.path(), 10 * BLOCK_SIZE).unwrap();
+        let k = key("hot", "e");
+        c.write_block(&k, 0, &[1u8; 1024]).unwrap();
+        let hash = hash_key("hot");
+        let meta = dir.path().join(&hash).join("meta.json");
+        let before = std::fs::metadata(&meta).unwrap().modified().unwrap();
+        for _ in 0..50 {
+            c.read_block(&k, 0).unwrap();
+        }
+        let after = std::fs::metadata(&meta).unwrap().modified().unwrap();
+        assert_eq!(before, after, "50 cached reads rewrote meta.json 50 times — SSD wear for nothing");
     }
 
     #[test]
