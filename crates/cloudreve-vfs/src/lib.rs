@@ -7,3 +7,4 @@
 pub mod cache;
 pub mod tree;
 pub mod vfs;
+pub mod writeback;
