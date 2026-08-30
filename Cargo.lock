@@ -878,6 +878,7 @@ dependencies = [
  "bytes",
  "chrono",
  "cloudreve-api",
+ "cloudreve-uploader",
  "reqwest 0.12.28",
  "serde",
  "serde_json",

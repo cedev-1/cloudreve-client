@@ -6,19 +6,25 @@
 //! uses part of the harness, so dead_code warnings are suppressed.
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cloudreve_api::api::ExplorerApi;
-use cloudreve_api::models::explorer::FileURLService;
+use cloudreve_api::models::explorer::{FileURLService, UploadSessionRequest};
 use cloudreve_api::models::user::Token;
 use cloudreve_api::{Client, ClientConfig};
 use serde_json::{json, Value};
 use tempfile::TempDir;
+use uuid::Uuid;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+/// Chunk size the mocked upload-session endpoint hands back. Deliberately
+/// small so even a short smoke-test file spans multiple chunks, exercising
+/// index-keyed reassembly rather than a single-shot upload.
+pub const UPLOAD_CHUNK_SIZE: i64 = 5;
 
 pub const REMOTE_BASE: &str = "cloudreve://my/sync";
 
@@ -33,6 +39,14 @@ type FilesState = Arc<Mutex<HashMap<String, Vec<Value>>>>;
 type ContentStore = Arc<Mutex<HashMap<String, Vec<u8>>>>;
 type RequestLog = Arc<Mutex<HashMap<String, Vec<Option<String>>>>>;
 type BytesServedLog = Arc<Mutex<HashMap<String, u64>>>;
+/// Bytes received per chunk index, keyed by upload session id. A `BTreeMap`
+/// keeps chunks in index order regardless of the (possibly concurrent)
+/// order the POSTs actually arrive in.
+type UploadChunksStore = Arc<Mutex<HashMap<String, BTreeMap<usize, Vec<u8>>>>>;
+/// Remote file name -> most recent upload session id created for it, so
+/// `uploaded_content` can find the right session without the caller
+/// needing to track session ids itself.
+type LatestSessionForName = Arc<Mutex<HashMap<String, String>>>;
 
 pub struct VfsTestEnv {
     pub server: MockServer,
@@ -44,6 +58,10 @@ pub struct VfsTestEnv {
     bytes_served: BytesServedLog,
     download_request_count: Arc<AtomicUsize>,
     list_requests: Arc<AtomicUsize>,
+    upload_chunks: UploadChunksStore,
+    latest_session_for_name: LatestSessionForName,
+    upload_session_count: Arc<AtomicUsize>,
+    upload_session_failures_remaining: Arc<AtomicUsize>,
 }
 
 impl VfsTestEnv {
@@ -69,6 +87,10 @@ impl VfsTestEnv {
         let bytes_served: BytesServedLog = Arc::new(Mutex::new(HashMap::new()));
         let download_request_count = Arc::new(AtomicUsize::new(0));
         let list_requests = Arc::new(AtomicUsize::new(0));
+        let upload_chunks: UploadChunksStore = Arc::new(Mutex::new(HashMap::new()));
+        let latest_session_for_name: LatestSessionForName = Arc::new(Mutex::new(HashMap::new()));
+        let upload_session_count = Arc::new(AtomicUsize::new(0));
+        let upload_session_failures_remaining = Arc::new(AtomicUsize::new(0));
 
         // Listing endpoint: path-aware, keyed by the `uri` query param exactly
         // as `ExplorerApiExt::list_files_all` sends it, so a directory only
@@ -212,6 +234,172 @@ impl VfsTestEnv {
             bytes_served,
             download_request_count,
             list_requests,
+            upload_chunks,
+            latest_session_for_name,
+            upload_session_count,
+            upload_session_failures_remaining,
+        }
+    }
+
+    /// Mounts the upload endpoints the real `cloudreve-uploader` protocol
+    /// uses for the "local" storage policy — the only policy this harness
+    /// speaks, and the one every session gets here because the mocked
+    /// session-create response never sets `storage_policy` (so
+    /// `UploadSession::new` defaults to `PolicyType::Local`, see
+    /// `crates/cloudreve-uploader/src/session.rs`):
+    ///
+    /// - `PUT /file/upload` creates a session, mirroring
+    ///   `ExplorerApi::create_upload_session`.
+    /// - `POST /file/upload/{session_id}/{chunk_index}` uploads one chunk,
+    ///   mirroring `ExplorerApi::upload_chunk_stream` — the call
+    ///   `providers::local::upload_chunk_local_generic` makes whenever the
+    ///   session has no `upload_urls` (i.e. never a slave-relay session).
+    ///
+    /// The local policy completes uploads automatically server-side (see
+    /// `providers::complete_upload`), so there is no completion/callback
+    /// endpoint to mock.
+    pub async fn expect_uploads(&self) {
+        // Session creation.
+        {
+            let upload_chunks = self.upload_chunks.clone();
+            let latest_session_for_name = self.latest_session_for_name.clone();
+            let upload_session_count = self.upload_session_count.clone();
+            let failures_remaining = self.upload_session_failures_remaining.clone();
+            Mock::given(method("PUT"))
+                .and(path("/api/v4/file/upload"))
+                .respond_with(move |req: &Request| {
+                    upload_session_count.fetch_add(1, Ordering::SeqCst);
+
+                    // Atomically claim one scheduled failure, if any, before
+                    // touching any state — a failed creation must not
+                    // register a session or a name mapping.
+                    let consumed_failure = failures_remaining
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                            n.checked_sub(1)
+                        })
+                        .is_ok();
+                    if consumed_failure {
+                        return ResponseTemplate::new(500).set_body_json(json!({
+                            "code": 500,
+                            "msg": "mock: injected upload session failure",
+                        }));
+                    }
+
+                    let request: UploadSessionRequest =
+                        req.body_json().expect("decode UploadSessionRequest body");
+                    let name = request
+                        .uri
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or_default()
+                        .to_string();
+                    let session_id = format!("mock-upload-session-{}", Uuid::new_v4());
+
+                    upload_chunks
+                        .lock()
+                        .unwrap()
+                        .insert(session_id.clone(), BTreeMap::new());
+                    latest_session_for_name
+                        .lock()
+                        .unwrap()
+                        .insert(name, session_id.clone());
+
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "code": 0,
+                        "msg": "",
+                        "data": {
+                            "session_id": session_id,
+                            "expires": 9_999_999_999i64,
+                            "chunk_size": UPLOAD_CHUNK_SIZE,
+                            "callback_secret": "",
+                            "uri": request.uri,
+                        },
+                    }))
+                })
+                .mount(&self.server)
+                .await;
+        }
+
+        // Chunk upload: `POST /file/upload/{session_id}/{chunk_index}`.
+        // Recorded by the index in the URL (not arrival order), exactly
+        // like the real server keys chunks — so reassembly is correct even
+        // if a storage policy with concurrency > 1 uploads out of order.
+        {
+            let upload_chunks = self.upload_chunks.clone();
+            Mock::given(method("POST"))
+                .and(path_regex(r"^/api/v4/file/upload/[^/]+/[0-9]+$"))
+                .respond_with(move |req: &Request| {
+                    let mut segments = req.url.path().rsplit('/');
+                    let chunk_index: usize = segments
+                        .next()
+                        .unwrap_or_default()
+                        .parse()
+                        .expect("chunk index segment must be numeric");
+                    let session_id = segments.next().unwrap_or_default().to_string();
+
+                    upload_chunks
+                        .lock()
+                        .unwrap()
+                        .entry(session_id)
+                        .or_default()
+                        .insert(chunk_index, req.body.clone());
+
+                    ResponseTemplate::new(200).set_body_json(json!({ "code": 0, "msg": "" }))
+                })
+                .mount(&self.server)
+                .await;
+        }
+    }
+
+    /// Bytes the mock actually received for `remote_name`, reassembled in
+    /// ascending chunk-index order from the most recent upload session
+    /// created for it. `None` if no session for that name ever received a
+    /// chunk.
+    pub fn uploaded_content(&self, remote_name: &str) -> Option<Vec<u8>> {
+        let session_id = self
+            .latest_session_for_name
+            .lock()
+            .unwrap()
+            .get(remote_name)
+            .cloned()?;
+        let chunks = self.upload_chunks.lock().unwrap();
+        let chunk_map = chunks.get(&session_id)?;
+        if chunk_map.is_empty() {
+            return None;
+        }
+        let mut content = Vec::new();
+        for bytes in chunk_map.values() {
+            content.extend_from_slice(bytes);
+        }
+        Some(content)
+    }
+
+    /// Total number of `PUT /file/upload` (session-creation) requests
+    /// received so far — successes and injected failures alike.
+    pub fn upload_session_count(&self) -> usize {
+        self.upload_session_count.load(Ordering::SeqCst)
+    }
+
+    /// Makes the next `n` upload-session-creation requests answer with a
+    /// server error instead of a credential, so tests can exercise the
+    /// uploader's session-creation failure path.
+    pub fn fail_next_upload_sessions(&self, n: usize) {
+        self.upload_session_failures_remaining
+            .fetch_add(n, Ordering::SeqCst);
+    }
+
+    /// Mutates the etag the mocked listing endpoint reports for `name`,
+    /// wherever it currently appears across every directory registered so
+    /// far. Used by conflict-detection tests that need the "remote" file to
+    /// look like it changed concurrently with a local upload.
+    pub async fn set_remote_etag(&self, name: &str, etag: &str) {
+        let mut files = self.files.lock().unwrap();
+        for dir_files in files.values_mut() {
+            for file in dir_files.iter_mut() {
+                if file.get("name").and_then(Value::as_str) == Some(name) {
+                    file["primary_entity"] = json!(etag);
+                }
+            }
         }
     }
 

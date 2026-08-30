@@ -19,3 +19,4 @@ sha2 = "0.10"
 wiremock = "0.6"
 tempfile = "3.8"
 uuid = { version = "1.6", features = ["v4"] }
+cloudreve-uploader = { path = "../cloudreve-uploader" }
