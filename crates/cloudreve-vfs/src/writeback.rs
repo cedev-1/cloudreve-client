@@ -568,7 +568,19 @@ impl WriteBackQueue {
                 .filter(|path| drafts.state(path) == Some(DraftState::Pending))
                 .collect()
         };
-        for path in &candidates {
+        self.enqueue_immediate(candidates)
+    }
+
+    /// Queues each of `paths` for immediate upload, bypassing the debounce
+    /// entirely — the shared tail of `retry_pending` (phase 4's reconnect
+    /// hook) and `Vfs::new`'s startup re-enqueue (Task 9: a draft still
+    /// `Pending` when the app last quit must not wait for anyone to notice
+    /// and call `retry_pending_uploads` by hand). Takes plain paths, not a
+    /// `DraftStore` lock, so `Vfs::new` can call it with paths read off the
+    /// just-opened store BEFORE that store is even wrapped in its `Arc<Mutex>`
+    /// — no lock, no await, needed at that call site.
+    pub(crate) fn enqueue_immediate(&self, paths: Vec<String>) -> usize {
+        for path in &paths {
             self.busy.fetch_add(1, Ordering::SeqCst);
             let _ = self
                 .events
@@ -577,7 +589,7 @@ impl WriteBackQueue {
             let path = path.clone();
             tokio::spawn(async move { this.run(path).await });
         }
-        candidates.len()
+        paths.len()
     }
 
     /// Resolves once nothing is armed, queued, or uploading. Polling rather

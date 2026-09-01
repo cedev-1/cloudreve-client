@@ -675,15 +675,19 @@ async fn uploads_drain_one_at_a_time() {
     );
 }
 
-/// Review finding 1 (durability): a reopen attempted while offline must
-/// never strand an acknowledged save. `open()` must not cancel the
-/// write-back debounce timer / flip the draft back to `Editing` until every
-/// fallible step it performs (the download-URL fetch) has actually
-/// succeeded — otherwise a failed reopen leaves the draft `Editing` with no
-/// timer and no handle, and `retry_pending_uploads` (which only re-arms
-/// `Pending` drafts) can never recover it.
+/// Review finding 1 (durability), superseded by Task 9's promoted fix: a
+/// reopen of a file that already has an active draft must never strand an
+/// acknowledged save. Originally this was guaranteed by ORDERING — `open()`
+/// only cancelled the write-back debounce timer / flipped the draft back to
+/// `Editing` after its fallible download-URL fetch had actually succeeded,
+/// so a failed fetch (e.g. offline) could never leave the draft `Editing`
+/// with no timer and no handle to close it again. Task 9 removes the
+/// fallible step itself: a drafted reopen never needs a download URL at
+/// all (drafted reads are served from the draft), so the fetch below is
+/// never even attempted, and the injected failure is never consumed —
+/// stranding is now impossible by construction, not merely by position.
 #[tokio::test]
-async fn a_failed_reopen_does_not_strand_a_pending_save() {
+async fn a_reopen_of_a_pending_draft_never_strands_it_even_if_offline() {
     let env = VfsTestEnv::new().await;
     env.expect_uploads().await;
     env.set_remote_files(vec![remote_file("offline.txt", 5, "e1")]).await;
@@ -694,29 +698,177 @@ async fn a_failed_reopen_does_not_strand_a_pending_save() {
             .unwrap();
     // Wide enough that the debounce timer armed by `close` below is still
     // very much alive (and thus still cancellable) at the moment the
-    // reopen is attempted — the whole point is to hit the failure path
-    // while there's something to strand.
+    // reopen is attempted.
     vfs.set_debounce_for_tests(Duration::from_millis(300));
 
     let node = vfs.tree().lookup(vfs.tree().root(), "offline.txt").await.unwrap().unwrap().0;
-    let h = vfs.open(node).await.unwrap();
+    let h = vfs.open(node).await.unwrap(); // 1st (and, per the assertion below, ONLY) file/url fetch.
     let saved = b"saved offline".to_vec();
     vfs.write(h, 0, &saved).await.unwrap();
     vfs.close(h).await.unwrap(); // Pending, debounce armed.
 
-    // Simulate being offline for exactly the reopen's download-URL fetch.
+    // Simulate being offline for exactly the fetch a reopen used to
+    // perform — the point of this test is that it no longer matters: a
+    // draft already exists, so `open()` skips the fetch and never even
+    // sees this injected failure.
     env.fail_next_file_url_requests(1);
     let reopen = vfs.open(node).await;
-    assert!(reopen.is_err(), "the reopen must fail while offline");
+    assert!(reopen.is_ok(), "reopening a drafted file must never need the network at all");
+    assert_eq!(
+        env.file_url_request_count("offline.txt"),
+        1,
+        "the reopen must not have attempted a second download-url fetch"
+    );
+    vfs.close(reopen.unwrap()).await.unwrap(); // Pending again, a fresh debounce armed.
 
-    // Back online: nothing further fails. The ORIGINAL debounce timer must
-    // still be armed (the fix never got far enough to cancel it) and must
-    // still deliver the acknowledged save.
     vfs.wait_for_writeback_idle().await;
 
     assert_eq!(
         env.uploaded_content("offline.txt"),
         Some(saved),
-        "an acknowledged save must always eventually upload, even after a failed reopen"
+        "an acknowledged save must always eventually upload"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Task 9: drafts survive a restart.
+// ---------------------------------------------------------------------
+
+/// Quit mid-upload, relaunch: the edit still reaches the server. A draft
+/// left `Pending` at shutdown (every upload attempt exhausted before the
+/// process died) must be re-enqueued at the very next `Vfs::new`, not left
+/// waiting for a manual `retry_pending_uploads` call nobody would think to
+/// make.
+#[tokio::test]
+async fn pending_drafts_upload_after_a_restart() {
+    let env = VfsTestEnv::new().await;
+    env.expect_uploads().await;
+    env.set_remote_files(vec![remote_file("resume.txt", 5, "e1")]).await;
+    env.serve_file_content("resume.txt", b"abcde").await;
+    // Every attempt across the whole first close's retry cycle fails, so
+    // the draft is genuinely parked `Pending` — nothing uploaded yet —
+    // when the app "quits" below.
+    env.fail_next_upload_sessions(UPLOAD_RETRIES as usize);
+
+    let saved = b"saved before quitting".to_vec();
+    {
+        let (vfs, mut rx) = Vfs::new(
+            env.client(),
+            common::REMOTE_BASE.into(),
+            env.cache_dir(),
+            DEFAULT_CACHE_MAX_BYTES,
+        )
+        .unwrap();
+        vfs.set_debounce_for_tests(Duration::from_millis(20));
+        vfs.set_retry_backoff_for_tests([Duration::from_millis(20), Duration::from_millis(20)]);
+
+        let node = vfs.tree().lookup(vfs.tree().root(), "resume.txt").await.unwrap().unwrap().0;
+        let h = vfs.open(node).await.unwrap();
+        vfs.write(h, 0, &saved).await.unwrap();
+        vfs.close(h).await.unwrap();
+
+        vfs.wait_for_writeback_idle().await;
+
+        let event = expect_event(&mut rx, |e| matches!(e, VfsEvent::UploadFailed { .. })).await;
+        assert!(
+            matches!(&event, VfsEvent::UploadFailed { will_retry: true, .. }),
+            "unexpected event: {event:?}"
+        );
+        assert_eq!(env.upload_session_count(), UPLOAD_RETRIES as usize);
+        assert_eq!(
+            env.uploaded_content("resume.txt"),
+            None,
+            "nothing must have uploaded before the (simulated) quit"
+        );
+        // `vfs` and `rx` drop here: simulates quitting the app entirely
+        // while the draft is still parked `Pending` on disk.
+    }
+
+    // The mock's injected-failure budget is exhausted: every upload-session
+    // creation from here on succeeds normally, simulating the network (or
+    // server) healing while the app was closed.
+    let (vfs2, _rx2) = Vfs::new(
+        env.client(),
+        common::REMOTE_BASE.into(),
+        env.cache_dir(),
+        DEFAULT_CACHE_MAX_BYTES,
+    )
+    .unwrap();
+
+    // Bounded rather than a bare `wait_for_writeback_idle`: if the restart
+    // never re-enqueues the pending draft, `busy` is 0 from the very start
+    // and an unbounded wait would return immediately without proving
+    // anything either way — the deadline instead gives the (possibly
+    // absent) re-enqueue a real chance to run and finish before the
+    // assertion below is checked.
+    let _ = tokio::time::timeout(Duration::from_secs(5), vfs2.wait_for_writeback_idle()).await;
+
+    assert_eq!(
+        env.uploaded_content("resume.txt"),
+        Some(saved),
+        "a draft still Pending at the last quit must upload after the next launch"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Promoted fix from Task 8's review: `open()` of a Pending LOCAL-ONLY
+// created draft must not fail trying to fetch a download URL for a path
+// the server has never heard of.
+// ---------------------------------------------------------------------
+
+/// A brand new file (`create`, no remote counterpart) can be reopened
+/// before its very first upload lands. Before this fix, `open()`
+/// unconditionally fetched a download URL, and a locally-created file has
+/// nothing on the server yet for that fetch to resolve — every
+/// save-close-reopen on a brand new file errored until the pending upload
+/// finally drained.
+#[tokio::test]
+async fn a_new_file_can_be_reopened_before_its_upload_lands() {
+    let env = VfsTestEnv::new().await;
+    env.expect_uploads().await;
+
+    let (vfs, _rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+    vfs.set_debounce_for_tests(Duration::from_millis(300));
+
+    let root = vfs.tree().root();
+    let (node, h1) = vfs.create(root, "brand-new.txt").await.unwrap();
+    let first_version = b"first version".to_vec();
+    vfs.write(h1, 0, &first_version).await.unwrap();
+    vfs.close(h1).await.unwrap(); // Pending, debounce armed; the upload has not landed yet.
+
+    // A real server has no `file/url` answer for a uri it has never heard
+    // of — simulated here the same way `a_reopen_of_a_pending_draft_never_
+    // strands_it_even_if_offline` simulates being offline for that same
+    // endpoint. Reopen well within the debounce window, exactly the
+    // save-close-reopen pattern a real editor performs.
+    env.fail_next_file_url_requests(1);
+    let (looked_up_node, _attr) = vfs.lookup(root, "brand-new.txt").await.unwrap().unwrap();
+    assert_eq!(looked_up_node, node);
+    let h2 = vfs
+        .open(looked_up_node)
+        .await
+        .expect("reopening a not-yet-uploaded new file must succeed");
+
+    let back = vfs.read(h2, 0, first_version.len() as u32).await.unwrap();
+    assert_eq!(
+        back.as_ref(),
+        &first_version[..],
+        "the reopened handle must read the draft's own bytes"
+    );
+
+    let second_version = b"second version, overwrites".to_vec();
+    vfs.truncate(h2, 0).await.unwrap();
+    vfs.write(h2, 0, &second_version).await.unwrap();
+    vfs.close(h2).await.unwrap(); // Pending again, a fresh debounce armed.
+
+    vfs.wait_for_writeback_idle().await;
+
+    assert_eq!(env.upload_session_count(), 1, "only one upload session should ever be created");
+    assert_eq!(
+        env.uploaded_content("brand-new.txt"),
+        Some(second_version),
+        "the eventual upload must carry the SECOND version's bytes"
     );
 }

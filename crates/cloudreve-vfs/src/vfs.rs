@@ -80,7 +80,14 @@ struct OpenFile {
     /// time a request comes back 403: the URL can expire mid-session, and
     /// re-opening the file just to keep reading would be a surprising
     /// frontend-visible failure for something recoverable in one retry.
-    download_url: RwLock<String>,
+    ///
+    /// `None` — an honest absence, not a dummy empty string — for a handle
+    /// that never needs one at all: a brand-new local-only file (`create`)
+    /// with no remote counterpart yet, or any handle opened on a path that
+    /// already has an active draft (Task 9's promoted fix). Both read
+    /// exclusively from the draft (see `Vfs::read`) and so never reach
+    /// `fetch_range_with_retry`, the only consumer of this field.
+    download_url: RwLock<Option<String>>,
 }
 
 /// Outcome of one ranged GET, distinguishing the two response shapes this
@@ -182,9 +189,18 @@ impl Vfs {
         // scanned. Segregate the two roots before either is ever opened.
         let cache = BlockCache::open(&cache_dir.join("blocks"), cache_max_bytes)
             .context("failed to open block cache")?;
-        let drafts = Arc::new(Mutex::new(
-            DraftStore::open(&cache_dir.join("drafts")).context("failed to open draft store")?,
-        ));
+        let drafts_store =
+            DraftStore::open(&cache_dir.join("drafts")).context("failed to open draft store")?;
+        // Task 9: every draft still `Pending` here survived an unclean
+        // shutdown — either a debounce timer that never got the chance to
+        // fire, or an upload that was in flight when the process died
+        // (already demoted back to `Pending` by `open` above, Task 6).
+        // Read the list off the plain store now, before it is wrapped in
+        // its `Arc<Mutex>` below: nothing else has a handle to it yet, so
+        // this needs no lock/await, unlike `WriteBackQueue::retry_pending`'s
+        // own (otherwise identical) read of the same list.
+        let resume_paths = drafts_store.pending();
+        let drafts = Arc::new(Mutex::new(drafts_store));
         let http = reqwest::Client::builder()
             .user_agent(USER_AGENT)
             .build()
@@ -192,6 +208,13 @@ impl Vfs {
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let write_queue =
             WriteBackQueue::new(client.clone(), tree.clone(), drafts.clone(), events_tx.clone());
+        // Re-enqueue them for an immediate upload attempt now, before this
+        // constructor returns — synchronously bumping the queue's `busy`
+        // counter here (not from a spawned task) closes the race a test
+        // calling `wait_for_writeback_idle` right after `Vfs::new` would
+        // otherwise hit: it must never see a falsely idle queue with the
+        // re-enqueue still pending.
+        write_queue.enqueue_immediate(resume_paths);
         Ok((
             Self {
                 tree,
@@ -235,7 +258,23 @@ impl Vfs {
         let key = FileKey { remote_path: attr.remote_path.clone(), etag: attr.etag.clone() };
         self.cache.lock().await.retain(&key);
 
-        let download_url = fetch_download_url(&self.client, &key).await?;
+        // Task 9 (promoted fix): a path with an active draft is always read
+        // straight from that draft (see `read`), never through
+        // `fetch_range_with_retry` — so a handle opened on one never needs
+        // a download URL at all. Fetching one unconditionally used to fail
+        // outright for a LOCAL-ONLY file (`create`, empty `etag`/
+        // `base_etag`): the server has never heard of a path that has never
+        // been uploaded, so there was nothing for the fetch to resolve.
+        // Skipping it here also removes the only fallible step that used to
+        // stand between "a draft exists" and the `Pending` -> `Editing`
+        // flip just below — see that block's doc for why the ordering
+        // concern from review finding 1 (Task 8) no longer applies.
+        let has_draft = self.drafts.lock().await.state(&attr.remote_path).is_some();
+        let download_url = if has_draft {
+            None
+        } else {
+            Some(fetch_download_url(&self.client, &key).await?)
+        };
 
         // Task 8: a reopen within the write-back debounce window cancels
         // it and puts the draft back into `Editing` — the whole point of
@@ -248,17 +287,20 @@ impl Vfs {
         // left alone — reopening it to look at its bytes (D3) must not
         // silently un-park it.
         //
-        // Placed AFTER the fallible `fetch_download_url` above on purpose
-        // (review finding 1): cancelling the timer / flipping the state
-        // earlier and then failing this `?` (e.g. attempting a reopen while
-        // offline) would strand the draft in `Editing` with no timer and no
-        // handle to ever close it again — `retry_pending_uploads` only
-        // re-arms `Pending` drafts, so an acknowledged save would never
-        // reach the server even after reconnecting. Committing to the
-        // state change only once `open` can no longer fail keeps "an
-        // acknowledged save always eventually uploads" true
-        // unconditionally: on a failed reopen the timer is simply left
-        // exactly as it was, and it still fires on schedule.
+        // Review finding 1 (Task 8) originally required this block to run
+        // only AFTER a fallible `fetch_download_url` immediately above, so
+        // a failed reopen (e.g. offline) could never strand the draft in
+        // `Editing` with no timer and no handle to ever close it again —
+        // `retry_pending_uploads` only re-arms `Pending` drafts, so an
+        // acknowledged save would otherwise never reach the server even
+        // after reconnecting. Task 9's fix above removes that hazard by
+        // construction rather than by position: this block only ever runs
+        // when `has_draft` is true (`state(..)` must be `Some` to match
+        // `Pending` below), and `has_draft` true is exactly the branch that
+        // skips the fetch entirely. There is no fallible network step left
+        // anywhere between "a draft exists" and this flip, so "an
+        // acknowledged save always eventually uploads" now holds
+        // unconditionally, not merely because of where this code sits.
         {
             let mut drafts = self.drafts.lock().await;
             if let Some(DraftState::Pending) = drafts.state(&attr.remote_path) {
@@ -446,7 +488,9 @@ impl Vfs {
 
         let key = FileKey { remote_path: attr.remote_path.clone(), etag: String::new() };
         self.cache.lock().await.retain(&key);
-        let open_file = Arc::new(OpenFile { key, size: 0, download_url: RwLock::new(String::new()) });
+        // No remote counterpart exists yet, so there is nothing to fetch a
+        // download URL for — see `download_url`'s field doc.
+        let open_file = Arc::new(OpenFile { key, size: 0, download_url: RwLock::new(None) });
         let handle_id = self.next_handle.fetch_add(1, Ordering::SeqCst);
         self.open_files.write().await.insert(handle_id, open_file);
         Ok((node, FileHandle(handle_id)))
@@ -751,7 +795,10 @@ async fn fetch_range_with_retry(
     start: u64,
     end: u64,
 ) -> Result<Bytes> {
-    let url = of.download_url.read().await.clone();
+    let url = of.download_url.read().await.clone().context(
+        "attempted a ranged fetch on a handle with no download url — drafted/local-only reads \
+         must never reach this path (see `download_url`'s field doc)",
+    )?;
     match fetch_range_with_backoff(http, &url, start, end).await? {
         FetchOutcome::Data(bytes) => return Ok(bytes),
         FetchOutcome::RangeNotSatisfiable => return Ok(Bytes::new()),
@@ -761,7 +808,7 @@ async fn fetch_range_with_retry(
     let fresh = fetch_download_url(client, &of.key)
         .await
         .context("failed to refresh an expired download URL after a 403")?;
-    *of.download_url.write().await = fresh.clone();
+    *of.download_url.write().await = Some(fresh.clone());
     match fetch_range_with_backoff(http, &fresh, start, end).await? {
         FetchOutcome::Data(bytes) => Ok(bytes),
         FetchOutcome::RangeNotSatisfiable => Ok(Bytes::new()),
