@@ -20,12 +20,16 @@ use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
+use cloudreve_uploader::{NoSessionStore, UploadParams, Uploader, UploaderConfig};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::sync::{mpsc, Mutex as TokioMutex};
 
 /// Idle time after the last write before the (Task 8) background flusher
 /// moves a draft still in `Editing` to `Pending` and queues it for upload.
@@ -284,6 +288,22 @@ impl DraftStore {
         self.entries.get(&hash16(remote_path)).map(|e| e.last_write_unix)
     }
 
+    /// Overwrites the draft's state, unconditionally — this method itself
+    /// enforces no transition rules; the write-back queue is what owns the
+    /// state machine's discipline:
+    /// - `Editing -> Pending`: only `Vfs::close`, when the closing handle
+    ///   leaves a dirty draft behind (arms the debounce timer).
+    /// - `Pending -> Editing`: only `Vfs::open`, and only after
+    ///   `WriteBackQueue::cancel` reports it actually stopped the armed
+    ///   timer — never on a draft already `Uploading` or one that already
+    ///   exhausted its retries (see `open`'s doc for why).
+    /// - `Pending -> Uploading`: only `WriteBackQueue::process`, right
+    ///   before it hands the draft's bytes to the uploader.
+    /// - `Uploading -> Pending`: `WriteBackQueue::process` on a failed
+    ///   attempt (after exhausting `UPLOAD_RETRIES`), or `DraftStore::open`
+    ///   demoting a draft found `Uploading` after a crash (Task 6).
+    /// - `Uploading -> `(removed)`: `WriteBackQueue::process` on success —
+    ///   the draft is deleted outright, not moved to a fourth state.
     pub fn set_state(&mut self, remote_path: &str, s: DraftState) -> Result<()> {
         let hash = hash16(remote_path);
         let entry = self
@@ -359,6 +379,20 @@ impl DraftStore {
     /// Remote paths of every draft waiting to be uploaded or currently
     /// being uploaded — what Task 8's flusher and startup resume loop
     /// iterate over.
+    ///
+    /// Ordering is UNSPECIFIED and MUST NOT be relied on: this iterates
+    /// `entries`, a `HashMap`, so the order is arbitrary and can change
+    /// between calls even with no mutation in between. That's safe here
+    /// because the write-back queue treats its pending drafts as an
+    /// unordered set, not a FIFO — `WriteBackQueue::retry_pending` fires
+    /// one independent upload attempt per path (each drains through the
+    /// same serializing `upload_gate`, but which one goes first has no
+    /// observable effect: every draft's own `base_etag`/conflict check/
+    /// retry outcome is computed purely from that draft's own state, never
+    /// from another draft's). If a future caller ever needs a stable or
+    /// prioritized drain order, that ordering has to be added explicitly
+    /// here (e.g. sorting by `last_write_unix`) — do not assume `pending()`
+    /// already provides one.
     pub fn pending(&self) -> Vec<String> {
         self.entries
             .values()
@@ -373,6 +407,341 @@ impl DraftStore {
 
     fn data_path_for_hash(&self, hash: &str) -> PathBuf {
         self.entry_dir(hash).join("data")
+    }
+}
+
+// ---------------------------------------------------------------------
+// The queue half (Task 8): debounced write-back, real uploads, conflict
+// copies, retry. Everything above this point is pure disk logic; from here
+// on this module does HTTP (through `cloudreve_uploader::Uploader`) and
+// owns background tokio tasks.
+// ---------------------------------------------------------------------
+
+/// Total attempts made for one draft's upload before parking it back
+/// `Pending` and giving up until the next `retry_pending_uploads` (or app
+/// restart). Pinned for the whole phase-2 write path.
+pub const UPLOAD_RETRIES: u32 = 3;
+
+/// Backoff slept between upload attempts, indexed by attempt number (after
+/// the first failure sleeps `UPLOAD_RETRY_BACKOFF[0]`, after the second
+/// `UPLOAD_RETRY_BACKOFF[1]`, then the third and final attempt runs with no
+/// further wait).
+pub const UPLOAD_RETRY_BACKOFF: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(5)];
+
+/// A no-op progress sink: the write-back queue doesn't report per-chunk
+/// progress anywhere (unlike `cloudreve-sync`'s foreground upload task,
+/// nothing in this crate is watching it yet).
+struct NoOpProgress;
+
+impl cloudreve_uploader::ProgressCallback for NoOpProgress {
+    fn on_progress(&self, _update: cloudreve_uploader::ProgressUpdate) {}
+}
+
+/// The write-back queue: debounces a closed draft, then drains it through
+/// the real chunked uploader. All fields are cheaply `Clone`-able (every one
+/// is an `Arc` or a plain sender) so a background task can own a copy that
+/// outlives the `&Vfs` call that spawned it — required since `tokio::spawn`
+/// demands `'static`.
+///
+/// Cheaply `Clone` on purpose: `arm`/`retry_pending` each hand a clone to a
+/// spawned task rather than threading `Arc<Self>` through, which would force
+/// every call site to already hold one.
+#[derive(Clone)]
+pub struct WriteBackQueue {
+    client: Arc<cloudreve_api::Client>,
+    tree: Arc<crate::tree::VfsTree>,
+    drafts: Arc<TokioMutex<DraftStore>>,
+    events: mpsc::UnboundedSender<crate::vfs::VfsEvent>,
+    /// Serializes actual upload attempts: the plan is explicit that the
+    /// queue drains sequentially, one upload at a time (YAGNI on
+    /// parallelism) — held for a whole draft's processing (conflict check
+    /// through final state), not just the upload call itself.
+    upload_gate: Arc<TokioMutex<()>>,
+    /// Debounce timers currently armed, keyed by remote path, so a reopen
+    /// within the window can cancel exactly the right one. A timer removes
+    /// its own entry the instant it fires (before doing any real work), so
+    /// a `cancel` racing in after that point correctly finds nothing and
+    /// reports it did not stop anything — see `cancel`'s doc.
+    timers: Arc<StdMutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    /// Outstanding work items: an armed-but-not-yet-fired timer, a
+    /// just-fired timer waiting for the `upload_gate`, and an upload
+    /// actually in flight all count as exactly one unit each, decremented
+    /// only when that item's whole cycle concludes (success, conflict, or
+    /// retries exhausted) or when a still-armed timer is cancelled by a
+    /// reopen. `wait_for_writeback_idle` polls this to zero.
+    busy: Arc<AtomicUsize>,
+    /// Test-overridable so the suite doesn't have to sit through the real
+    /// 2s debounce (or the 1s/5s retry backoff) on every run. Not
+    /// `#[cfg(test)]`: integration tests under `tests/` link this crate
+    /// compiled *without* `cfg(test)`, so a cfg-gated method would be
+    /// invisible to them. Kept honest instead by naming and by living only
+    /// here, never read by any non-test-only call site.
+    debounce: Arc<StdMutex<Duration>>,
+    retry_backoff: Arc<StdMutex<[Duration; 2]>>,
+}
+
+impl WriteBackQueue {
+    pub fn new(
+        client: Arc<cloudreve_api::Client>,
+        tree: Arc<crate::tree::VfsTree>,
+        drafts: Arc<TokioMutex<DraftStore>>,
+        events: mpsc::UnboundedSender<crate::vfs::VfsEvent>,
+    ) -> Self {
+        Self {
+            client,
+            tree,
+            drafts,
+            events,
+            upload_gate: Arc::new(TokioMutex::new(())),
+            timers: Arc::new(StdMutex::new(HashMap::new())),
+            busy: Arc::new(AtomicUsize::new(0)),
+            debounce: Arc::new(StdMutex::new(WRITEBACK_DEBOUNCE)),
+            retry_backoff: Arc::new(StdMutex::new(UPLOAD_RETRY_BACKOFF)),
+        }
+    }
+
+    /// Test-only override for the debounce delay. See the `debounce`
+    /// field's doc for why this isn't `#[cfg(test)]`.
+    pub fn set_debounce_for_tests(&self, d: Duration) {
+        *self.debounce.lock().unwrap() = d;
+    }
+
+    /// Test-only override for the retry backoff. See the `debounce` field's
+    /// doc — same reasoning applies here.
+    pub fn set_retry_backoff_for_tests(&self, backoff: [Duration; 2]) {
+        *self.retry_backoff.lock().unwrap() = backoff;
+    }
+
+    /// Arms the debounce timer for a draft just parked `Pending` by
+    /// `Vfs::close`. Emits `UploadQueued` immediately — the draft IS queued
+    /// from this point on, even though the actual upload attempt waits out
+    /// the debounce first.
+    pub fn arm(&self, remote_path: String) {
+        self.busy.fetch_add(1, Ordering::SeqCst);
+        let _ = self
+            .events
+            .send(crate::vfs::VfsEvent::UploadQueued { remote_path: remote_path.clone() });
+
+        let debounce = *self.debounce.lock().unwrap();
+        let timers = self.timers.clone();
+        let this = self.clone();
+        let path_for_timer = remote_path.clone();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(debounce).await;
+            // Remove ourselves before doing any real work: once this has
+            // run, a racing `cancel` for the same path must find nothing
+            // and correctly report that it stopped nothing (see `cancel`).
+            timers.lock().unwrap().remove(&path_for_timer);
+            this.run(path_for_timer).await;
+        });
+        self.timers.lock().unwrap().insert(remote_path, handle);
+    }
+
+    /// Cancels a still-armed debounce timer for `remote_path` (a reopen
+    /// within the window). Returns whether a timer was actually stopped:
+    /// `false` means it had already fired (or was never armed) — the
+    /// caller (`Vfs::open`) must only flip the draft back to `Editing` when
+    /// this returns `true`, or it would silently un-park a draft whose
+    /// upload is already underway (or already exhausted its retries and is
+    /// legitimately parked `Pending` awaiting a manual retry).
+    pub fn cancel(&self, remote_path: &str) -> bool {
+        let handle = self.timers.lock().unwrap().remove(remote_path);
+        match handle {
+            Some(handle) => {
+                handle.abort();
+                self.busy.fetch_sub(1, Ordering::SeqCst);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Re-arms every draft still `Pending` (not `Uploading` — that one is
+    /// already being processed by this same queue) for immediate upload,
+    /// bypassing the debounce entirely. Returns how many were queued.
+    pub async fn retry_pending(&self) -> usize {
+        let candidates: Vec<String> = {
+            let drafts = self.drafts.lock().await;
+            drafts
+                .pending()
+                .into_iter()
+                .filter(|path| drafts.state(path) == Some(DraftState::Pending))
+                .collect()
+        };
+        for path in &candidates {
+            self.busy.fetch_add(1, Ordering::SeqCst);
+            let _ = self
+                .events
+                .send(crate::vfs::VfsEvent::UploadQueued { remote_path: path.clone() });
+            let this = self.clone();
+            let path = path.clone();
+            tokio::spawn(async move { this.run(path).await });
+        }
+        candidates.len()
+    }
+
+    /// Resolves once nothing is armed, queued, or uploading. Polling rather
+    /// than a `Notify` on purpose: the busy count changes from several
+    /// independent places (arm, cancel, run's completion), and a short poll
+    /// is far simpler to get race-free than threading a condvar-style wake
+    /// through all of them for a method only tests and shutdown call.
+    pub async fn wait_idle(&self) {
+        while self.busy.load(Ordering::SeqCst) > 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Runs one draft's whole processing cycle behind `upload_gate`
+    /// (sequential draining) and accounts for it in `busy` regardless of
+    /// outcome.
+    async fn run(&self, remote_path: String) {
+        let _gate = self.upload_gate.lock().await;
+        self.process(&remote_path).await;
+        self.busy.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// D5 (conflict check) + upload + D6 (success promotion) / retry, for
+    /// one draft. Never propagates an error: every failure mode here ends
+    /// in a well-defined draft state and an event, not a panic or a
+    /// silently dropped future.
+    async fn process(&self, remote_path: &str) {
+        let Some(base_etag) = self.drafts.lock().await.base_etag(remote_path) else {
+            return; // draft vanished (e.g. removed concurrently) — nothing to do.
+        };
+
+        // D5: only a draft with a remote counterpart can conflict with
+        // anything. A brand-new file's `base_etag` is empty by construction
+        // (see `Vfs::create`) and must never run this check.
+        let mut conflict_copy: Option<String> = None;
+        if !base_etag.is_empty() {
+            match self.tree.refresh_etag(remote_path).await {
+                Ok(Some(current)) if current != base_etag => {
+                    conflict_copy = Some(conflict_copy_path(remote_path));
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        remote_path,
+                        %err,
+                        "writeback: conflict check failed, uploading in place anyway"
+                    );
+                }
+            }
+        }
+
+        let (upload_uri, overwrite, previous_version) = match &conflict_copy {
+            Some(conflict_path) => (conflict_path.clone(), false, String::new()),
+            None => (remote_path.to_string(), !base_etag.is_empty(), base_etag.clone()),
+        };
+
+        if let Err(err) =
+            self.drafts.lock().await.set_state(remote_path, DraftState::Uploading)
+        {
+            tracing::warn!(remote_path, %err, "writeback: failed to mark draft Uploading");
+        }
+
+        let (data_path, size, mtime) = {
+            let drafts = self.drafts.lock().await;
+            let Some(data_path) = drafts.data_path(remote_path) else {
+                return; // draft vanished mid-flight.
+            };
+            (data_path, drafts.size(remote_path).unwrap_or(0), drafts.mtime_unix(remote_path))
+        };
+
+        let params = UploadParams {
+            local_path: data_path,
+            remote_uri: upload_uri.clone(),
+            file_size: size,
+            mime_type: None,
+            last_modified: mtime.map(|secs| secs.saturating_mul(1000)),
+            overwrite,
+            previous_version,
+            task_id: format!("vfs-writeback-{remote_path}"),
+            drive_id: "vfs".to_string(),
+        };
+
+        let backoff = *self.retry_backoff.lock().unwrap();
+        let uploader =
+            Uploader::new(self.client.clone(), Arc::new(NoSessionStore), UploaderConfig::default());
+
+        let mut last_err = None;
+        for attempt in 0..UPLOAD_RETRIES {
+            match uploader.upload(params.clone(), NoOpProgress).await {
+                Ok(()) => {
+                    last_err = None;
+                    break;
+                }
+                Err(err) => {
+                    last_err = Some(err);
+                    if attempt + 1 < UPLOAD_RETRIES {
+                        tokio::time::sleep(backoff[attempt as usize]).await;
+                    }
+                }
+            }
+        }
+
+        match last_err {
+            None => match conflict_copy {
+                Some(conflict_path) => {
+                    // The original is untouched by design (D5): only
+                    // invalidate both paths so a subsequent lookup sees the
+                    // new copy and refetches the original's now-known-
+                    // divergent state, and drop the draft — its content is
+                    // safe under the copy.
+                    self.tree.invalidate_path(&conflict_path).await;
+                    self.tree.invalidate_path(remote_path).await;
+                    let _ = self.drafts.lock().await.remove(remote_path);
+                    let _ = self.events.send(crate::vfs::VfsEvent::ConflictSaved {
+                        original: remote_path.to_string(),
+                        conflict_copy: conflict_path,
+                    });
+                }
+                None => {
+                    // D6: record the new etag (best-effort — a listing that
+                    // doesn't yet reflect the upload just yields an empty
+                    // string), delete the draft, and leave the block cache
+                    // untouched/empty for this file so the next read
+                    // refetches rather than serving stale or converted
+                    // content.
+                    let new_etag =
+                        self.tree.refresh_etag(remote_path).await.ok().flatten().unwrap_or_default();
+                    let _ = self.drafts.lock().await.remove(remote_path);
+                    let _ = self.events.send(crate::vfs::VfsEvent::UploadSucceeded {
+                        remote_path: remote_path.to_string(),
+                        new_etag,
+                    });
+                }
+            },
+            Some(err) => {
+                if let Err(e) =
+                    self.drafts.lock().await.set_state(remote_path, DraftState::Pending)
+                {
+                    tracing::warn!(remote_path, %e, "writeback: failed to park draft back to Pending");
+                }
+                let _ = self.events.send(crate::vfs::VfsEvent::UploadFailed {
+                    remote_path: remote_path.to_string(),
+                    error: err.to_string(),
+                    will_retry: true,
+                });
+            }
+        }
+    }
+}
+
+/// D5/D-const conflict-copy name: `"{stem} (conflict {YYYY-MM-DD}){.ext}"`,
+/// applied to the leaf of `remote_path` only — the directory is unchanged.
+fn conflict_copy_path(remote_path: &str) -> String {
+    let (dir, filename) = remote_path.rsplit_once('/').unwrap_or(("", remote_path));
+    let date = chrono::Utc::now().format("%Y-%m-%d");
+    let (stem, ext) = match filename.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s, format!(".{e}")),
+        _ => (filename, String::new()),
+    };
+    let conflict_name = format!("{stem} (conflict {date}){ext}");
+    if dir.is_empty() {
+        conflict_name
+    } else {
+        format!("{dir}/{conflict_name}")
     }
 }
 

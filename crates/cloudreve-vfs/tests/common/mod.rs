@@ -75,8 +75,27 @@ pub struct VfsTestEnv {
     upload_session_count: Arc<AtomicUsize>,
     upload_session_failures_remaining: Arc<AtomicUsize>,
     file_url_calls: FileUrlCalls,
+    file_url_failures_remaining: Arc<AtomicUsize>,
     download_hits_by_version: DownloadHitsByVersion,
     download_delays: DownloadDelays,
+    /// Expected chunk count per session id (derived from the size the
+    /// session-creation request declared), so the chunk-upload mock can
+    /// tell "this session's last chunk just arrived" without any explicit
+    /// completion/callback call to hook (the local policy has none — see
+    /// `expect_uploads`'s doc).
+    session_expected_chunks: Arc<Mutex<HashMap<String, usize>>>,
+    /// How many upload sessions are between "created" and "received their
+    /// last expected chunk" right now — review finding 3's signal for
+    /// `uploads_drain_one_at_a_time`: the write-back queue is supposed to
+    /// drain sequentially, so this must never exceed 1.
+    concurrent_uploads: Arc<AtomicUsize>,
+    max_concurrent_uploads: Arc<AtomicUsize>,
+    /// Artificial per-chunk delay applied by the chunk-upload mock, so a
+    /// concurrency test has a wide enough window to actually observe two
+    /// sessions overlapping if the write-back queue ever failed to
+    /// serialize them (real network calls are fast enough that a broken
+    /// gate could otherwise get lucky and still look sequential).
+    chunk_upload_delay: Arc<Mutex<Duration>>,
 }
 
 impl VfsTestEnv {
@@ -107,8 +126,14 @@ impl VfsTestEnv {
         let upload_session_count = Arc::new(AtomicUsize::new(0));
         let upload_session_failures_remaining = Arc::new(AtomicUsize::new(0));
         let file_url_calls: FileUrlCalls = Arc::new(Mutex::new(HashMap::new()));
+        let file_url_failures_remaining = Arc::new(AtomicUsize::new(0));
         let download_hits_by_version: DownloadHitsByVersion = Arc::new(Mutex::new(HashMap::new()));
         let download_delays: DownloadDelays = Arc::new(Mutex::new(HashMap::new()));
+        let session_expected_chunks: Arc<Mutex<HashMap<String, usize>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let concurrent_uploads = Arc::new(AtomicUsize::new(0));
+        let max_concurrent_uploads = Arc::new(AtomicUsize::new(0));
+        let chunk_upload_delay = Arc::new(Mutex::new(Duration::ZERO));
 
         // Listing endpoint: path-aware, keyed by the `uri` query param exactly
         // as `ExplorerApiExt::list_files_all` sends it, so a directory only
@@ -159,9 +184,23 @@ impl VfsTestEnv {
         {
             let base = server.uri();
             let file_url_calls = file_url_calls.clone();
+            let file_url_failures_remaining = file_url_failures_remaining.clone();
             Mock::given(method("POST"))
                 .and(path("/api/v4/file/url"))
                 .respond_with(move |req: &Request| {
+                    // Atomically claim one scheduled failure, if any, before
+                    // touching any other state — mirrors
+                    // `expect_uploads`'s session-creation failure injection.
+                    let consumed_failure = file_url_failures_remaining
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                        .is_ok();
+                    if consumed_failure {
+                        return ResponseTemplate::new(500).set_body_json(json!({
+                            "code": 500,
+                            "msg": "mock: injected file/url failure",
+                        }));
+                    }
+
                     let request: FileURLService =
                         req.body_json().expect("decode FileURLService request body");
                     let uri = request.uris.first().cloned().unwrap_or_default();
@@ -292,8 +331,13 @@ impl VfsTestEnv {
             upload_session_count,
             upload_session_failures_remaining,
             file_url_calls,
+            file_url_failures_remaining,
             download_hits_by_version,
             download_delays,
+            session_expected_chunks,
+            concurrent_uploads,
+            max_concurrent_uploads,
+            chunk_upload_delay,
         }
     }
 
@@ -321,6 +365,9 @@ impl VfsTestEnv {
             let latest_session_for_name = self.latest_session_for_name.clone();
             let upload_session_count = self.upload_session_count.clone();
             let failures_remaining = self.upload_session_failures_remaining.clone();
+            let session_expected_chunks = self.session_expected_chunks.clone();
+            let concurrent_uploads = self.concurrent_uploads.clone();
+            let max_concurrent_uploads = self.max_concurrent_uploads.clone();
             Mock::given(method("PUT"))
                 .and(path("/api/v4/file/upload"))
                 .respond_with(move |req: &Request| {
@@ -360,6 +407,19 @@ impl VfsTestEnv {
                         .unwrap()
                         .insert(name, session_id.clone());
 
+                    // A session is "in flight" from creation until its last
+                    // expected chunk arrives (see the chunk-upload mock
+                    // below) — review finding 3's concurrency signal.
+                    let expected_chunks =
+                        ((request.size.max(1) + UPLOAD_CHUNK_SIZE - 1) / UPLOAD_CHUNK_SIZE).max(1)
+                            as usize;
+                    session_expected_chunks
+                        .lock()
+                        .unwrap()
+                        .insert(session_id.clone(), expected_chunks);
+                    let now_in_flight = concurrent_uploads.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_concurrent_uploads.fetch_max(now_in_flight, Ordering::SeqCst);
+
                     ResponseTemplate::new(200).set_body_json(json!({
                         "code": 0,
                         "msg": "",
@@ -382,6 +442,9 @@ impl VfsTestEnv {
         // if a storage policy with concurrency > 1 uploads out of order.
         {
             let upload_chunks = self.upload_chunks.clone();
+            let session_expected_chunks = self.session_expected_chunks.clone();
+            let concurrent_uploads = self.concurrent_uploads.clone();
+            let chunk_upload_delay = self.chunk_upload_delay.clone();
             Mock::given(method("POST"))
                 .and(path_regex(r"^/api/v4/file/upload/[^/]+/[0-9]+$"))
                 .respond_with(move |req: &Request| {
@@ -393,18 +456,52 @@ impl VfsTestEnv {
                         .expect("chunk index segment must be numeric");
                     let session_id = segments.next().unwrap_or_default().to_string();
 
-                    upload_chunks
+                    let received_count = {
+                        let mut chunks = upload_chunks.lock().unwrap();
+                        let entry = chunks.entry(session_id.clone()).or_default();
+                        entry.insert(chunk_index, req.body.clone());
+                        entry.len()
+                    };
+
+                    // This session's last expected chunk just landed: it's
+                    // no longer "in flight" (see the session-creation mock
+                    // above). No explicit completion call to hook for the
+                    // local policy, so chunk-count-reached is the honest
+                    // stand-in signal.
+                    let expected = session_expected_chunks
                         .lock()
                         .unwrap()
-                        .entry(session_id)
-                        .or_default()
-                        .insert(chunk_index, req.body.clone());
+                        .get(&session_id)
+                        .copied();
+                    if expected == Some(received_count) {
+                        concurrent_uploads.fetch_sub(1, Ordering::SeqCst);
+                    }
 
-                    ResponseTemplate::new(200).set_body_json(json!({ "code": 0, "msg": "" }))
+                    let delay = *chunk_upload_delay.lock().unwrap();
+                    let resp = ResponseTemplate::new(200).set_body_json(json!({ "code": 0, "msg": "" }));
+                    if delay > Duration::ZERO { resp.set_delay(delay) } else { resp }
                 })
                 .mount(&self.server)
                 .await;
         }
+    }
+
+    /// The highest number of upload sessions ever simultaneously "in
+    /// flight" (created but not yet having received their last expected
+    /// chunk) since `expect_uploads` was mounted. Review finding 3's
+    /// pinning signal: the write-back queue drains sequentially, so this
+    /// must never exceed 1 across a whole test.
+    pub fn max_concurrent_uploads(&self) -> usize {
+        self.max_concurrent_uploads.load(Ordering::SeqCst)
+    }
+
+    /// Adds an artificial delay to every future chunk-upload response,
+    /// widening the window in which two sessions running concurrently
+    /// (a broken write-back queue) would actually overlap and be caught by
+    /// `max_concurrent_uploads` — real loopback HTTP calls are otherwise
+    /// fast enough that even a broken gate could get lucky.
+    pub fn slow_down_chunk_uploads(&self, delay: Duration) {
+        *self.chunk_upload_delay.lock().unwrap() = delay;
     }
 
     /// Bytes the mock actually received for `remote_name`, reassembled in
@@ -442,6 +539,15 @@ impl VfsTestEnv {
     pub fn fail_next_upload_sessions(&self, n: usize) {
         self.upload_session_failures_remaining
             .fetch_add(n, Ordering::SeqCst);
+    }
+
+    /// Makes the next `n` `POST /api/v4/file/url` (signed download-URL)
+    /// requests answer with a server error instead of a URL — simulates
+    /// being offline for exactly the fetch `Vfs::open` performs, so tests
+    /// can exercise `open`'s failure path (e.g. a reopen attempted while
+    /// offline).
+    pub fn fail_next_file_url_requests(&self, n: usize) {
+        self.file_url_failures_remaining.fetch_add(n, Ordering::SeqCst);
     }
 
     /// Mutates the etag the mocked listing endpoint reports for `name`,

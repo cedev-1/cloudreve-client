@@ -23,7 +23,7 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 
 use crate::cache::{BlockCache, FileKey, BLOCK_SIZE};
 use crate::tree::{NodeAttr, NodeId, VfsTree};
-use crate::writeback::{DraftInit, DraftState, DraftStore};
+use crate::writeback::{DraftInit, DraftState, DraftStore, WriteBackQueue};
 
 /// How many blocks past the end of a satisfied read are proactively
 /// fetched in the background. Sized for smooth sequential access (video
@@ -99,9 +99,10 @@ enum FetchOutcome {
 
 /// Events the write-back path (Task 8) reports to whatever owns the
 /// receiver half of `Vfs::new`'s channel — a dashboard row, a toast, or (in
-/// tests) nothing at all. Nothing in this crate emits one yet; the channel
-/// exists from Task 7 on so the constructor's shape never has to change
-/// again once Task 8 starts sending.
+/// tests) nothing at all. Emitted exclusively by `writeback::WriteBackQueue`
+/// (see `Vfs::close`/`open`'s hooks into it) — the channel has existed since
+/// Task 7 so the constructor's shape never had to change again once Task 8
+/// started sending.
 #[derive(Debug, Clone, PartialEq)]
 pub enum VfsEvent {
     UploadQueued { remote_path: String },
@@ -111,14 +112,23 @@ pub enum VfsEvent {
 }
 
 pub struct Vfs {
-    tree: VfsTree,
+    /// `Arc`-wrapped (not owned outright) because the write-back queue's
+    /// background tasks (Task 8) need a `'static` handle that outlives any
+    /// particular `&Vfs` call — `tokio::spawn` requires it.
+    tree: Arc<VfsTree>,
     cache: Arc<Mutex<BlockCache>>,
     /// Whole-file local drafts absorbing every write (D1/D2/D3). A plain
     /// `Mutex`, not the cache's own lock: `DraftStore`'s methods are all
     /// synchronous `&mut self`, so this is held only for the duration of one
     /// disk op at a time, same discipline as `cache` — never across a
-    /// network await.
-    drafts: Mutex<DraftStore>,
+    /// network await. `Arc`-wrapped for the same reason as `tree` above:
+    /// the write-back queue's background tasks need to lock it too, well
+    /// after the `&Vfs` call (`close`) that armed them has returned.
+    drafts: Arc<Mutex<DraftStore>>,
+    /// Debounces a closed dirty draft, then drains it through the real
+    /// uploader (Task 8) — conflict check, retry, and the events below are
+    /// all its responsibility. See `writeback::WriteBackQueue`.
+    write_queue: WriteBackQueue,
     client: Arc<cloudreve_api::Client>,
     http: reqwest::Client,
     /// Root every temp file created while materializing a draft (D2) is
@@ -149,10 +159,10 @@ pub struct Vfs {
     /// removed, bounded by the number of distinct files ever drafted in
     /// this process — far too small to matter for a desktop sync client.
     draft_begin_locks: std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>,
-    /// Sender half of the `VfsEvent` channel returned by `new`. Nothing
-    /// sends through it yet (Task 8 does) — held here so the field exists
-    /// once emission lands rather than requiring the constructor to change
-    /// shape again.
+    /// Sender half of the `VfsEvent` channel returned by `new`. A clone of
+    /// this lives inside `write_queue`, which is the only thing that
+    /// actually sends through it today; kept here too for any future
+    /// direct emission (e.g. Task 10's namespace ops).
     #[allow(dead_code)]
     events: mpsc::UnboundedSender<VfsEvent>,
 }
@@ -164,7 +174,7 @@ impl Vfs {
         cache_dir: &Path,
         cache_max_bytes: u64,
     ) -> Result<(Self, mpsc::UnboundedReceiver<VfsEvent>)> {
-        let tree = VfsTree::new(client.clone(), remote_base);
+        let tree = Arc::new(VfsTree::new(client.clone(), remote_base));
         // D1 TRAP: `BlockCache::open` deletes any directory under its root
         // that lacks a `meta.json` — pointing it at a root that also holds
         // `drafts/` would destroy every draft at startup the first time a
@@ -172,18 +182,22 @@ impl Vfs {
         // scanned. Segregate the two roots before either is ever opened.
         let cache = BlockCache::open(&cache_dir.join("blocks"), cache_max_bytes)
             .context("failed to open block cache")?;
-        let drafts = DraftStore::open(&cache_dir.join("drafts"))
-            .context("failed to open draft store")?;
+        let drafts = Arc::new(Mutex::new(
+            DraftStore::open(&cache_dir.join("drafts")).context("failed to open draft store")?,
+        ));
         let http = reqwest::Client::builder()
             .user_agent(USER_AGENT)
             .build()
             .context("failed to build the vfs http client")?;
         let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let write_queue =
+            WriteBackQueue::new(client.clone(), tree.clone(), drafts.clone(), events_tx.clone());
         Ok((
             Self {
                 tree,
                 cache: Arc::new(Mutex::new(cache)),
-                drafts: Mutex::new(drafts),
+                drafts,
+                write_queue,
                 client,
                 http,
                 cache_dir: cache_dir.to_path_buf(),
@@ -217,10 +231,43 @@ impl Vfs {
         if attr.is_dir {
             bail!("cannot open a directory as a file");
         }
+
         let key = FileKey { remote_path: attr.remote_path.clone(), etag: attr.etag.clone() };
         self.cache.lock().await.retain(&key);
 
         let download_url = fetch_download_url(&self.client, &key).await?;
+
+        // Task 8: a reopen within the write-back debounce window cancels
+        // it and puts the draft back into `Editing` — the whole point of
+        // debouncing at all is to coalesce exactly this "save, then
+        // immediately keep editing" pattern into one eventual upload.
+        // `cancel` only reports success (and only then do we flip the
+        // state) if the timer had not already fired: a draft whose upload
+        // is already underway, or one that already exhausted its retries
+        // and is legitimately parked `Pending` for a manual retry, must be
+        // left alone — reopening it to look at its bytes (D3) must not
+        // silently un-park it.
+        //
+        // Placed AFTER the fallible `fetch_download_url` above on purpose
+        // (review finding 1): cancelling the timer / flipping the state
+        // earlier and then failing this `?` (e.g. attempting a reopen while
+        // offline) would strand the draft in `Editing` with no timer and no
+        // handle to ever close it again — `retry_pending_uploads` only
+        // re-arms `Pending` drafts, so an acknowledged save would never
+        // reach the server even after reconnecting. Committing to the
+        // state change only once `open` can no longer fail keeps "an
+        // acknowledged save always eventually uploads" true
+        // unconditionally: on a failed reopen the timer is simply left
+        // exactly as it was, and it still fires on schedule.
+        {
+            let mut drafts = self.drafts.lock().await;
+            if let Some(DraftState::Pending) = drafts.state(&attr.remote_path) {
+                if self.write_queue.cancel(&attr.remote_path) {
+                    drafts.set_state(&attr.remote_path, DraftState::Editing)?;
+                }
+            }
+        }
+
         let open_file =
             Arc::new(OpenFile { key, size: attr.size, download_url: RwLock::new(download_url) });
 
@@ -321,9 +368,9 @@ impl Vfs {
     /// same file) keeps it pinned regardless of this one closing.
     ///
     /// If the handle leaves behind a dirty draft (`Editing`: written to but
-    /// not yet queued), it is parked `Pending` here. That's all Task 7
-    /// does — Task 8's write-back queue is what actually notices `Pending`
-    /// drafts and drains them.
+    /// not yet queued), it is parked `Pending` and the write-back queue's
+    /// debounce timer is armed for it (Task 8) — a reopen of the same path
+    /// within the window cancels it again (see `open`).
     pub async fn close(&self, h: FileHandle) -> Result<()> {
         let of = self
             .open_files
@@ -335,10 +382,39 @@ impl Vfs {
             let mut drafts = self.drafts.lock().await;
             if let Some(DraftState::Editing) = drafts.state(&of.key.remote_path) {
                 drafts.set_state(&of.key.remote_path, DraftState::Pending)?;
+                drop(drafts);
+                self.write_queue.arm(of.key.remote_path.clone());
             }
         }
         self.cache.lock().await.release(&of.key);
         Ok(())
+    }
+
+    /// Re-arms every draft still `Pending` for immediate upload, bypassing
+    /// the debounce entirely — offline recovery: phase 4 calls this on
+    /// reconnect. Returns how many were queued.
+    pub async fn retry_pending_uploads(&self) -> usize {
+        self.write_queue.retry_pending().await
+    }
+
+    /// Resolves once the write-back queue has nothing armed, queued, or
+    /// uploading. Test and shutdown hook.
+    pub async fn wait_for_writeback_idle(&self) {
+        self.write_queue.wait_idle().await;
+    }
+
+    /// Test-only: overrides the write-back debounce delay so the suite
+    /// doesn't have to sit through the real `WRITEBACK_DEBOUNCE`. See
+    /// `WriteBackQueue`'s `debounce` field doc for why this isn't gated by
+    /// `#[cfg(test)]`.
+    pub fn set_debounce_for_tests(&self, d: Duration) {
+        self.write_queue.set_debounce_for_tests(d);
+    }
+
+    /// Test-only: overrides the upload retry backoff. Same reasoning as
+    /// `set_debounce_for_tests`.
+    pub fn set_retry_backoff_for_tests(&self, backoff: [Duration; 2]) {
+        self.write_queue.set_retry_backoff_for_tests(backoff);
     }
 
     /// Begins a brand new file: a local-only tree entry (visible to

@@ -8,13 +8,61 @@ mod common;
 
 use std::io::Write;
 use std::sync::Arc;
+use std::time::Duration;
 
 use cloudreve_uploader::{
     NoSessionStore, ProgressCallback, ProgressUpdate, UploadParams, Uploader, UploaderConfig,
 };
-use cloudreve_vfs::vfs::{Vfs, DEFAULT_CACHE_MAX_BYTES};
+use cloudreve_vfs::vfs::{Vfs, VfsEvent, DEFAULT_CACHE_MAX_BYTES};
+use cloudreve_vfs::writeback::UPLOAD_RETRIES;
 use common::{remote_file, uri_of, VfsTestEnv};
 use tempfile::NamedTempFile;
+use tokio::sync::mpsc::UnboundedReceiver;
+
+/// Waits (bounded) for the next event matching `pred`, panicking if none
+/// arrives in time — every Task 8 test needs this to observe the
+/// write-back queue's outcome events without racing the background worker.
+async fn expect_event(
+    rx: &mut UnboundedReceiver<VfsEvent>,
+    pred: impl Fn(&VfsEvent) -> bool,
+) -> VfsEvent {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(remaining > Duration::ZERO, "timed out waiting for a matching VfsEvent");
+        let event = tokio::time::timeout(remaining, rx.recv())
+            .await
+            .expect("timed out waiting for a VfsEvent")
+            .expect("event channel closed unexpectedly");
+        if pred(&event) {
+            return event;
+        }
+    }
+}
+
+/// Collects exactly `n` events in arrival order, bounded by an overall
+/// deadline. Unlike `expect_event`, which skips anything that doesn't
+/// match a predicate, this pins the exact SEQUENCE — a dropped or
+/// reordered event shows up as a timeout or a mismatched `Vec`, not as a
+/// silent pass.
+async fn collect_events(rx: &mut UnboundedReceiver<VfsEvent>, n: usize) -> Vec<VfsEvent> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut events = Vec::with_capacity(n);
+    while events.len() < n {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            remaining > Duration::ZERO,
+            "timed out waiting for {n} events, only got {}: {events:?}",
+            events.len()
+        );
+        let event = tokio::time::timeout(remaining, rx.recv())
+            .await
+            .expect("timed out waiting for a VfsEvent")
+            .expect("event channel closed unexpectedly");
+        events.push(event);
+    }
+    events
+}
 
 /// A progress callback that does nothing — this smoke test only cares about
 /// the bytes the mock received, not progress reporting.
@@ -305,4 +353,370 @@ async fn creating_over_an_existing_file_is_refused() {
     let h = vfs.open(node).await.unwrap();
     let content = vfs.read(h, 0, original.len() as u32).await.unwrap();
     assert_eq!(content.as_ref(), &original[..], "the original's content must be untouched");
+}
+
+// ---------------------------------------------------------------------
+// Task 8: write-back queue (debounce, upload, conflicts, retry).
+// ---------------------------------------------------------------------
+
+/// A closed, dirty draft uploads by itself, and the exact saved bytes reach
+/// the (mocked) server. Once it's done, the draft is gone and the block
+/// cache was left empty for the file (D6) — a fresh open+read must
+/// genuinely refetch from the server rather than replay anything local.
+#[tokio::test]
+async fn a_closed_draft_uploads_and_the_server_receives_the_exact_bytes() {
+    let env = VfsTestEnv::new().await;
+    env.expect_uploads().await;
+    let original = b"original server content".to_vec();
+    env.set_remote_files(vec![remote_file("doc.txt", original.len() as i64, "e1")]).await;
+    env.serve_file_content("doc.txt", &original).await;
+
+    let (vfs, mut rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+    vfs.set_debounce_for_tests(Duration::from_millis(20));
+
+    let node = vfs.tree().lookup(vfs.tree().root(), "doc.txt").await.unwrap().unwrap().0;
+    let h = vfs.open(node).await.unwrap();
+    vfs.truncate(h, 0).await.unwrap();
+    let saved = b"freshly saved bytes".to_vec();
+    vfs.write(h, 0, &saved).await.unwrap();
+    vfs.close(h).await.unwrap();
+
+    vfs.wait_for_writeback_idle().await;
+
+    assert_eq!(
+        env.uploaded_content("doc.txt"),
+        Some(saved.clone()),
+        "the server must receive the exact saved bytes"
+    );
+
+    let event =
+        expect_event(&mut rx, |e| matches!(e, VfsEvent::UploadSucceeded { .. })).await;
+    assert!(
+        matches!(&event, VfsEvent::UploadSucceeded { remote_path, .. } if remote_path.ends_with("doc.txt")),
+        "unexpected event: {event:?}"
+    );
+
+    // D6: draft removed, cache left empty for the file.
+    assert!(
+        env.download_requests("doc.txt").is_empty(),
+        "no ranged download should have happened before this point"
+    );
+    let h2 = vfs.open(node).await.unwrap();
+    let back = vfs.read(h2, 0, original.len() as u32).await.unwrap();
+    assert_eq!(
+        back.as_ref(),
+        &original[..],
+        "the draft is gone: a fresh read must come from the server, not the removed draft"
+    );
+    assert!(
+        !env.download_requests("doc.txt").is_empty(),
+        "the fresh read must have actually hit the network"
+    );
+}
+
+/// Save, close (arms the debounce), reopen well within the window (which
+/// must cancel it), save again, close again: only ONE upload session is
+/// ever created, and it carries the SECOND save's bytes.
+#[tokio::test]
+async fn save_close_reopen_save_uploads_once() {
+    let env = VfsTestEnv::new().await;
+    env.expect_uploads().await;
+    env.set_remote_files(vec![remote_file("notes.txt", 5, "e1")]).await;
+    env.serve_file_content("notes.txt", b"abcde").await;
+
+    let (vfs, _rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+    vfs.set_debounce_for_tests(Duration::from_millis(300));
+
+    let node = vfs.tree().lookup(vfs.tree().root(), "notes.txt").await.unwrap().unwrap().0;
+
+    let h1 = vfs.open(node).await.unwrap();
+    vfs.truncate(h1, 0).await.unwrap();
+    vfs.write(h1, 0, b"first save").await.unwrap();
+    vfs.close(h1).await.unwrap(); // Pending, debounce armed.
+
+    // Reopen immediately, well inside the 300ms debounce window: this must
+    // cancel the timer and put the draft back into Editing.
+    let h2 = vfs.open(node).await.unwrap();
+    let second_save = b"second save, overwrites".to_vec();
+    vfs.write(h2, 0, &second_save).await.unwrap();
+    vfs.close(h2).await.unwrap(); // Pending again, a fresh debounce armed.
+
+    vfs.wait_for_writeback_idle().await;
+
+    assert_eq!(env.upload_session_count(), 1, "only one upload session should ever be created");
+    assert_eq!(env.uploaded_content("notes.txt"), Some(second_save));
+}
+
+/// The file's remote etag changed since the draft began (someone else's
+/// concurrent edit): the write-back queue must never overwrite it. It
+/// uploads to a conflict-copy name instead, leaves the original untouched,
+/// and reports `ConflictSaved`.
+#[tokio::test]
+async fn a_remote_change_since_the_draft_began_becomes_a_conflict_copy() {
+    let env = VfsTestEnv::new().await;
+    env.expect_uploads().await;
+    env.set_remote_files(vec![remote_file("shared.txt", 5, "e1")]).await;
+    env.serve_file_content("shared.txt", b"abcde").await;
+
+    let (vfs, mut rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+    vfs.set_debounce_for_tests(Duration::from_millis(20));
+
+    let node = vfs.tree().lookup(vfs.tree().root(), "shared.txt").await.unwrap().unwrap().0;
+    let h = vfs.open(node).await.unwrap(); // observes etag "e1" at draft-begin time.
+    vfs.write(h, 0, b"local edit").await.unwrap(); // materializes with base_etag "e1".
+
+    // Someone else's edit lands on the server before this draft uploads.
+    env.set_remote_etag("shared.txt", "e2").await;
+
+    vfs.close(h).await.unwrap();
+    vfs.wait_for_writeback_idle().await;
+
+    assert_eq!(env.upload_session_count(), 1, "exactly one upload — the conflict copy");
+    assert_eq!(
+        env.uploaded_content("shared.txt"),
+        None,
+        "the original must never be overwritten by a conflicting draft"
+    );
+
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let conflict_name = format!("shared (conflict {today}).txt");
+    assert!(conflict_name.contains("(conflict "));
+    assert_eq!(
+        env.uploaded_content(&conflict_name),
+        Some(b"local edit".to_vec()),
+        "the draft's content must land under the conflict-copy name instead"
+    );
+
+    let event = expect_event(&mut rx, |e| matches!(e, VfsEvent::ConflictSaved { .. })).await;
+    match event {
+        VfsEvent::ConflictSaved { original, conflict_copy } => {
+            assert!(original.ends_with("shared.txt"));
+            assert!(conflict_copy.contains("(conflict "));
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+}
+
+/// Every upload attempt fails (session creation itself errors): after
+/// exhausting `UPLOAD_RETRIES`, the draft is parked back `Pending` — never
+/// dropped — and `UploadFailed{will_retry: true}` is reported. Once the
+/// server heals, `retry_pending_uploads` re-arms it on demand and the save
+/// finally reaches the server.
+#[tokio::test]
+async fn a_failed_upload_keeps_the_draft_and_retries_on_demand() {
+    let env = VfsTestEnv::new().await;
+    env.expect_uploads().await;
+    env.set_remote_files(vec![remote_file("flaky.txt", 5, "e1")]).await;
+    env.serve_file_content("flaky.txt", b"abcde").await;
+    env.fail_next_upload_sessions(UPLOAD_RETRIES as usize);
+
+    let (vfs, mut rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+    vfs.set_debounce_for_tests(Duration::from_millis(20));
+    vfs.set_retry_backoff_for_tests([Duration::from_millis(20), Duration::from_millis(20)]);
+
+    let node = vfs.tree().lookup(vfs.tree().root(), "flaky.txt").await.unwrap().unwrap().0;
+    let h = vfs.open(node).await.unwrap();
+    let saved = b"new content".to_vec();
+    vfs.write(h, 0, &saved).await.unwrap();
+    vfs.close(h).await.unwrap();
+
+    vfs.wait_for_writeback_idle().await;
+
+    let event = expect_event(&mut rx, |e| matches!(e, VfsEvent::UploadFailed { .. })).await;
+    assert!(
+        matches!(&event, VfsEvent::UploadFailed { will_retry: true, .. }),
+        "unexpected event: {event:?}"
+    );
+    assert_eq!(env.upload_session_count(), UPLOAD_RETRIES as usize);
+    assert_eq!(env.uploaded_content("flaky.txt"), None, "nothing must have actually uploaded");
+
+    // The draft's bytes must survive the failure — reopening still serves
+    // them (D3), proving nothing was dropped when the upload gave up.
+    let h2 = vfs.open(node).await.unwrap();
+    let back = vfs.read(h2, 0, saved.len() as u32).await.unwrap();
+    assert_eq!(back.as_ref(), &saved[..], "the draft's bytes must survive a failed upload");
+    vfs.close(h2).await.unwrap();
+
+    // The mock's injected-failure budget is exhausted: every session
+    // creation from here on succeeds normally.
+    let requeued = vfs.retry_pending_uploads().await;
+    assert_eq!(requeued, 1);
+
+    vfs.wait_for_writeback_idle().await;
+    assert_eq!(env.uploaded_content("flaky.txt"), Some(saved));
+}
+
+/// A file that is only ever read, never written, must never trigger an
+/// upload — there is no dirty draft to write back.
+#[tokio::test]
+async fn nothing_is_uploaded_for_a_file_only_read() {
+    let env = VfsTestEnv::new().await;
+    env.expect_uploads().await;
+    env.set_remote_files(vec![remote_file("readonly.txt", 5, "e1")]).await;
+    env.serve_file_content("readonly.txt", b"abcde").await;
+
+    let (vfs, _rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+
+    let node = vfs.tree().lookup(vfs.tree().root(), "readonly.txt").await.unwrap().unwrap().0;
+    let h = vfs.open(node).await.unwrap();
+    let back = vfs.read(h, 0, 5).await.unwrap();
+    assert_eq!(back.as_ref(), b"abcde");
+    vfs.close(h).await.unwrap();
+
+    vfs.wait_for_writeback_idle().await;
+
+    assert_eq!(env.upload_session_count(), 0);
+}
+
+/// Review finding 2 (pinning): a normal save must report its outcome
+/// events in the right ORDER — `UploadQueued` when the draft is armed,
+/// then `UploadSucceeded` once it lands — not just "both showed up
+/// somewhere in the channel eventually". `expect_event` (used by the other
+/// tests) skips anything that doesn't match its predicate and so cannot
+/// tell a dropped or reordered event from a correct sequence; this test
+/// uses `collect_events` specifically to close that gap.
+#[tokio::test]
+async fn a_successful_save_emits_queued_then_succeeded_in_order() {
+    let env = VfsTestEnv::new().await;
+    env.expect_uploads().await;
+    env.set_remote_files(vec![remote_file("ordered.txt", 5, "e1")]).await;
+    env.serve_file_content("ordered.txt", b"abcde").await;
+
+    let (vfs, mut rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+    vfs.set_debounce_for_tests(Duration::from_millis(20));
+
+    let node = vfs.tree().lookup(vfs.tree().root(), "ordered.txt").await.unwrap().unwrap().0;
+    let h = vfs.open(node).await.unwrap();
+    vfs.truncate(h, 0).await.unwrap();
+    vfs.write(h, 0, b"ordered save").await.unwrap();
+    vfs.close(h).await.unwrap();
+
+    vfs.wait_for_writeback_idle().await;
+
+    let events = collect_events(&mut rx, 2).await;
+    match &events[..] {
+        [VfsEvent::UploadQueued { remote_path: queued }, VfsEvent::UploadSucceeded { remote_path: succeeded, .. }] =>
+        {
+            assert!(queued.ends_with("ordered.txt"));
+            assert!(succeeded.ends_with("ordered.txt"));
+        }
+        other => panic!("expected [UploadQueued, UploadSucceeded] in order, got {other:?}"),
+    }
+}
+
+/// Review finding 3 (pinning): the write-back queue drains sequentially,
+/// one upload at a time (YAGNI on parallelism per the plan) — never two
+/// sessions "in flight" together. Two files are saved in the same debounce
+/// window so both their timers fire close together; an artificial per-chunk
+/// delay widens the window in which a broken `upload_gate` would actually
+/// let both sessions overlap (real loopback HTTP is otherwise fast enough
+/// that even a broken gate could get lucky and still look sequential).
+/// `max_concurrent_uploads` is the cheapest honest signal available here:
+/// the local storage policy has no completion/callback call to hook (see
+/// `expect_uploads`'s doc), so the mock infers "session no longer in
+/// flight" from its last EXPECTED chunk (by declared size) having arrived —
+/// exactly the same event that ends `Uploader::upload`'s chunk phase.
+#[tokio::test]
+async fn uploads_drain_one_at_a_time() {
+    let env = VfsTestEnv::new().await;
+    env.expect_uploads().await;
+    env.set_remote_files(vec![
+        remote_file("alpha.bin", 20, "e1"),
+        remote_file("beta.bin", 20, "e1"),
+    ])
+    .await;
+    env.serve_file_content("alpha.bin", &[1u8; 20]).await;
+    env.serve_file_content("beta.bin", &[2u8; 20]).await;
+    env.slow_down_chunk_uploads(Duration::from_millis(50));
+
+    let (vfs, _rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+    vfs.set_debounce_for_tests(Duration::from_millis(20));
+
+    let root = vfs.tree().root();
+    let alpha = vfs.tree().lookup(root, "alpha.bin").await.unwrap().unwrap().0;
+    let beta = vfs.tree().lookup(root, "beta.bin").await.unwrap().unwrap().0;
+
+    let alpha_bytes = vec![9u8; 20];
+    let beta_bytes = vec![8u8; 20];
+
+    let ha = vfs.open(alpha).await.unwrap();
+    vfs.truncate(ha, 0).await.unwrap();
+    vfs.write(ha, 0, &alpha_bytes).await.unwrap();
+    vfs.close(ha).await.unwrap(); // arms alpha's debounce timer.
+
+    let hb = vfs.open(beta).await.unwrap();
+    vfs.truncate(hb, 0).await.unwrap();
+    vfs.write(hb, 0, &beta_bytes).await.unwrap();
+    vfs.close(hb).await.unwrap(); // arms beta's debounce timer, moments later.
+
+    vfs.wait_for_writeback_idle().await;
+
+    assert_eq!(env.upload_session_count(), 2, "both files must have uploaded");
+    assert_eq!(env.uploaded_content("alpha.bin"), Some(alpha_bytes));
+    assert_eq!(env.uploaded_content("beta.bin"), Some(beta_bytes));
+    assert_eq!(
+        env.max_concurrent_uploads(),
+        1,
+        "the write-back queue must drain sequentially — two sessions were in flight at once"
+    );
+}
+
+/// Review finding 1 (durability): a reopen attempted while offline must
+/// never strand an acknowledged save. `open()` must not cancel the
+/// write-back debounce timer / flip the draft back to `Editing` until every
+/// fallible step it performs (the download-URL fetch) has actually
+/// succeeded — otherwise a failed reopen leaves the draft `Editing` with no
+/// timer and no handle, and `retry_pending_uploads` (which only re-arms
+/// `Pending` drafts) can never recover it.
+#[tokio::test]
+async fn a_failed_reopen_does_not_strand_a_pending_save() {
+    let env = VfsTestEnv::new().await;
+    env.expect_uploads().await;
+    env.set_remote_files(vec![remote_file("offline.txt", 5, "e1")]).await;
+    env.serve_file_content("offline.txt", b"abcde").await;
+
+    let (vfs, _rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+    // Wide enough that the debounce timer armed by `close` below is still
+    // very much alive (and thus still cancellable) at the moment the
+    // reopen is attempted — the whole point is to hit the failure path
+    // while there's something to strand.
+    vfs.set_debounce_for_tests(Duration::from_millis(300));
+
+    let node = vfs.tree().lookup(vfs.tree().root(), "offline.txt").await.unwrap().unwrap().0;
+    let h = vfs.open(node).await.unwrap();
+    let saved = b"saved offline".to_vec();
+    vfs.write(h, 0, &saved).await.unwrap();
+    vfs.close(h).await.unwrap(); // Pending, debounce armed.
+
+    // Simulate being offline for exactly the reopen's download-URL fetch.
+    env.fail_next_file_url_requests(1);
+    let reopen = vfs.open(node).await;
+    assert!(reopen.is_err(), "the reopen must fail while offline");
+
+    // Back online: nothing further fails. The ORIGINAL debounce timer must
+    // still be armed (the fix never got far enough to cancel it) and must
+    // still deliver the acknowledged save.
+    vfs.wait_for_writeback_idle().await;
+
+    assert_eq!(
+        env.uploaded_content("offline.txt"),
+        Some(saved),
+        "an acknowledged save must always eventually upload, even after a failed reopen"
+    );
 }

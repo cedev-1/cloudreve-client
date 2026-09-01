@@ -372,6 +372,30 @@ impl VfsTree {
             .collect()
     }
 
+    /// D5 (write-back conflict check): forces a fresh listing of
+    /// `remote_path`'s parent directory and returns the server's current
+    /// etag for it — `None` if the parent directory isn't known to the tree
+    /// yet, or if the file no longer exists there (deleted remotely since
+    /// the draft began). Deliberately works from a bare remote path alone,
+    /// no `NodeId`: the write-back queue (Task 8) only ever holds paths —
+    /// `DraftStore` never allocates or tracks node ids.
+    pub async fn refresh_etag(&self, remote_path: &str) -> Result<Option<String>> {
+        let Some((parent_path, name)) = remote_path.rsplit_once('/') else {
+            return Ok(None);
+        };
+        self.invalidate_path(remote_path).await;
+        let parent_id = {
+            let inner = self.inner.read().await;
+            inner
+                .attrs
+                .iter()
+                .find(|(_, attr)| attr.is_dir && attr.remote_path == parent_path)
+                .map(|(id, _)| *id)
+        };
+        let Some(parent_id) = parent_id else { return Ok(None) };
+        Ok(self.lookup(parent_id, name).await?.map(|(_, attr)| attr.etag))
+    }
+
     /// Force a directory's cached listing to be treated as expired,
     /// regardless of when it was actually populated. Test-only: production
     /// code relies on wall-clock TTL expiry, not this shortcut. Currently
