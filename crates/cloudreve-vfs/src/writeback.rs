@@ -16,7 +16,7 @@
 //! block cache's LRU (spec §5, "pending drafts exempt from LRU" holds by
 //! construction — see D1 in the phase-2 write-path plan).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -393,6 +393,14 @@ impl DraftStore {
     /// prioritized drain order, that ordering has to be added explicitly
     /// here (e.g. sorting by `last_write_unix`) — do not assume `pending()`
     /// already provides one.
+    ///
+    /// Includes `Uploading` entries deliberately: at startup they've always
+    /// already been demoted to `Pending` by `DraftStore::open` before this
+    /// is ever called, but `WriteBackQueue::retry_pending` also calls this
+    /// mid-process, where a `Uploading` entry can be a cycle stranded by a
+    /// rename (see `migrate_armed_timer`'s doc) rather than one truly still
+    /// in flight — `retry_pending` is what tells the two apart and recovers
+    /// the former.
     pub fn pending(&self) -> Vec<String> {
         self.entries
             .values()
@@ -478,6 +486,18 @@ pub struct WriteBackQueue {
     /// here, never read by any non-test-only call site.
     debounce: Arc<StdMutex<Duration>>,
     retry_backoff: Arc<StdMutex<[Duration; 2]>>,
+    /// Remote paths for which `run`/`process` is CURRENTLY executing — the
+    /// queue's own ground truth for "is anything genuinely in flight for
+    /// this path right now". Since draining is sequential (`upload_gate`)
+    /// this holds at most one path in practice today, but is a set (not a
+    /// single slot) so it stays correct if that ever changes.
+    ///
+    /// Exists to tell a draft that merely LOOKS `Uploading` in `DraftStore`
+    /// (state left behind by a cycle that got cut short — see
+    /// `migrate_armed_timer`'s doc for how a rename can cause exactly that)
+    /// apart from one an active `run` call still genuinely owns — see
+    /// `retry_pending`.
+    in_flight: Arc<StdMutex<HashSet<String>>>,
 }
 
 impl WriteBackQueue {
@@ -497,6 +517,7 @@ impl WriteBackQueue {
             busy: Arc::new(AtomicUsize::new(0)),
             debounce: Arc::new(StdMutex::new(WRITEBACK_DEBOUNCE)),
             retry_backoff: Arc::new(StdMutex::new(UPLOAD_RETRY_BACKOFF)),
+            in_flight: Arc::new(StdMutex::new(HashSet::new())),
         }
     }
 
@@ -556,17 +577,94 @@ impl WriteBackQueue {
         }
     }
 
-    /// Re-arms every draft still `Pending` (not `Uploading` — that one is
-    /// already being processed by this same queue) for immediate upload,
-    /// bypassing the debounce entirely. Returns how many were queued.
+    /// Task 10: moves a still-armed debounce timer from `old_path` to
+    /// `new_path` (the draft itself was already relocated in `DraftStore` by
+    /// the caller — see `Vfs::rename`). Without this, a rename of a `Pending`
+    /// draft would leave its timer armed under the OLD path; once it fired,
+    /// `process` would find nothing at that path any more (the draft
+    /// genuinely lives elsewhere now) and silently give up — the queued
+    /// upload would vanish under EITHER name, not just move to the new one.
+    ///
+    /// A fresh debounce window starting over is an acceptable, harmless
+    /// side effect (the same "just keep editing" coalescing `arm`/`cancel`
+    /// already provide for a reopen) — restarting the clock never loses
+    /// data, it only delays the eventual upload a little. A no-op if
+    /// nothing was actually armed (draft still `Editing`, or already
+    /// `Uploading`): there is nothing to migrate in either case.
+    ///
+    /// This only ever handles a timer caught BEFORE it fires — `cancel`
+    /// (which this is built on) is exactly as honest about a timer that
+    /// already fired as it always has been, and that honesty is exactly
+    /// what leaves two known gaps here, both a genuine TOCTOU between
+    /// `Vfs::rename` and a timer firing at the same moment, not merely a
+    /// theoretical concern:
+    ///
+    /// (a) The timer fires and `run`/`process` reads `base_etag(old_path)`
+    ///     BEFORE `DraftStore::rename` lands: `cancel` above already found
+    ///     nothing (the timer removed itself from `timers` the instant it
+    ///     fired, before doing any work — see `cancel`'s doc), so this is a
+    ///     no-op and no new timer is armed for `new_path`. `process` itself
+    ///     then finds the draft gone from `old_path` and gives up
+    ///     ("draft vanished — nothing to do"). The entry re-appears at
+    ///     `new_path` still `Pending` (rename never touches the state
+    ///     field) with no timer watching it — recoverable through
+    ///     `retry_pending` exactly like any other `Pending` draft, since
+    ///     that path never depends on a timer at all.
+    /// (b) The timer fires and `process` gets far enough to flip the draft
+    ///     to `Uploading` (still under `old_path`) before `DraftStore::rename`
+    ///     runs: the rename then relocates the (now `Uploading`) entry to
+    ///     `new_path` out from under `process`, whose own `data_path`
+    ///     lookup at `old_path` fails ("draft vanished mid-flight") and
+    ///     returns WITHOUT ever resetting the state — the entry is left
+    ///     sitting at `new_path` marked `Uploading` forever, in this
+    ///     process, with nothing left running for it. `retry_pending`'s
+    ///     stranded-`Uploading` recovery (see its own doc) is exactly the
+    ///     fix for this case: it is what makes (b) recoverable without a
+    ///     full app restart.
+    pub fn migrate_armed_timer(&self, old_path: &str, new_path: String) {
+        if self.cancel(old_path) {
+            self.arm(new_path);
+        }
+    }
+
+    /// Re-arms every draft still `Pending` for immediate upload, bypassing
+    /// the debounce entirely. Returns how many were queued.
+    ///
+    /// Also recovers a draft found `Uploading` that `in_flight` proves
+    /// nothing is genuinely processing any more — a STRANDED cycle, not one
+    /// actually in progress (see `migrate_armed_timer`'s doc, case (b), for
+    /// how a rename racing a firing debounce timer produces exactly this).
+    /// Before this recovery existed, a stranded `Uploading` draft was
+    /// invisible to this method (it only ever looked at `Pending`) and sat
+    /// stuck until the next full app restart, since only `DraftStore::open`
+    /// demotes `Uploading` back to `Pending`. Demoting it here first makes
+    /// the SAME hook phase 4 wires to reconnect (this method) able to
+    /// recover it too, without waiting for a restart. A draft genuinely
+    /// still being processed by THIS queue (present in `in_flight`) is left
+    /// alone — re-enqueueing it would race the upload already in flight for
+    /// it.
     pub async fn retry_pending(&self) -> usize {
+        let in_flight = self.in_flight.lock().unwrap().clone();
         let candidates: Vec<String> = {
-            let drafts = self.drafts.lock().await;
-            drafts
-                .pending()
-                .into_iter()
-                .filter(|path| drafts.state(path) == Some(DraftState::Pending))
-                .collect()
+            let mut drafts = self.drafts.lock().await;
+            let mut candidates = Vec::new();
+            for path in drafts.pending() {
+                match drafts.state(&path) {
+                    Some(DraftState::Pending) => candidates.push(path),
+                    Some(DraftState::Uploading) if !in_flight.contains(&path) => {
+                        match drafts.set_state(&path, DraftState::Pending) {
+                            Ok(()) => candidates.push(path),
+                            Err(err) => tracing::warn!(
+                                remote_path = %path,
+                                %err,
+                                "writeback: failed to demote a stranded Uploading draft"
+                            ),
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            candidates
         };
         self.enqueue_immediate(candidates)
     }
@@ -608,7 +706,9 @@ impl WriteBackQueue {
     /// outcome.
     async fn run(&self, remote_path: String) {
         let _gate = self.upload_gate.lock().await;
+        self.in_flight.lock().unwrap().insert(remote_path.clone());
         self.process(&remote_path).await;
+        self.in_flight.lock().unwrap().remove(&remote_path);
         self.busy.fetch_sub(1, Ordering::SeqCst);
     }
 
@@ -905,6 +1005,53 @@ mod tests {
         assert_eq!(s.size("gone.bin"), None);
         assert_eq!(s.state("gone.bin"), None);
         assert_eq!(s.data_path("gone.bin"), None);
+    }
+
+    /// Task 10 carried obligation: `rename` is a destructive directory move
+    /// (the shard directory name is `sha256(remote_path)`, so a path change
+    /// always means a different shard) — data, metadata, and every accessor
+    /// must all agree on the NEW path afterwards, and the OLD directory must
+    /// be entirely gone, not just unreferenced.
+    #[test]
+    fn rename_moves_data_and_meta_to_the_new_shard_dir() {
+        let dir = TempDir::new().unwrap();
+        let mut s = DraftStore::open(dir.path()).unwrap();
+        s.begin("old/report.txt", "etag-1", DraftInit::Empty).unwrap();
+        s.write("old/report.txt", 0, b"payload bytes").unwrap();
+
+        let old_dir = s.data_path("old/report.txt").unwrap().parent().unwrap().to_path_buf();
+        assert!(old_dir.exists());
+
+        s.rename("old/report.txt", "new/renamed.txt").unwrap();
+
+        // This is a MOVE, not a copy: the old shard directory must not
+        // survive it at all.
+        assert!(!old_dir.exists(), "the old draft directory must not survive a rename");
+
+        // The store's own accessors must agree the old path resolves to
+        // nothing and the new one has everything.
+        assert_eq!(s.state("old/report.txt"), None, "the old path must no longer resolve");
+        assert_eq!(s.size("new/renamed.txt"), Some(b"payload bytes".len() as u64));
+        assert_eq!(s.base_etag("new/renamed.txt"), Some("etag-1".to_string()));
+        let back = s.read("new/renamed.txt", 0, 100).unwrap();
+        assert_eq!(back.as_ref(), b"payload bytes", "content must survive the rename intact");
+
+        // Different remote_path must land in a genuinely different shard —
+        // the whole reason this is a directory move rather than an in-place
+        // metadata edit.
+        let new_dir = s.data_path("new/renamed.txt").unwrap().parent().unwrap().to_path_buf();
+        assert_ne!(old_dir, new_dir, "renaming to a different path must move to a different shard");
+
+        // The persisted draft.json itself (not just the in-memory
+        // accessors) must carry the NEW remote_path — this is exactly what
+        // a mutation skipping the meta rewrite gets wrong: the directory
+        // moves, but the JSON payload inside it still says the OLD path.
+        let raw = std::fs::read(new_dir.join("draft.json")).unwrap();
+        let meta: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(
+            meta["remote_path"], "new/renamed.txt",
+            "draft.json on disk must be rewritten with the new remote_path, not just moved verbatim"
+        );
     }
 
     #[test]

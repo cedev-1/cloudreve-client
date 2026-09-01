@@ -14,7 +14,7 @@ use cloudreve_uploader::{
     NoSessionStore, ProgressCallback, ProgressUpdate, UploadParams, Uploader, UploaderConfig,
 };
 use cloudreve_vfs::vfs::{Vfs, VfsEvent, DEFAULT_CACHE_MAX_BYTES};
-use cloudreve_vfs::writeback::UPLOAD_RETRIES;
+use cloudreve_vfs::writeback::{DraftState, UPLOAD_RETRIES};
 use common::{remote_file, uri_of, VfsTestEnv};
 use tempfile::NamedTempFile;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -870,5 +870,59 @@ async fn a_new_file_can_be_reopened_before_its_upload_lands() {
         env.uploaded_content("brand-new.txt"),
         Some(second_version),
         "the eventual upload must carry the SECOND version's bytes"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Coordinator review (Task 10 fix round): a draft that ends up stuck
+// `Uploading` in memory with nothing actually processing it any more (e.g.
+// a rename racing a firing debounce timer — see
+// `WriteBackQueue::migrate_armed_timer`'s doc, case (b)) must still be
+// recoverable through the SAME hook phase 4 already wires to reconnect
+// (`retry_pending_uploads`), not only at the next full app restart.
+// ---------------------------------------------------------------------
+
+/// Reproducing the actual microsecond scheduling race that strands a draft
+/// in `Uploading` is not attempted here — it depends on OS thread timing
+/// inside a production `process()` call this test has no hook into. Instead
+/// this forces the exact END STATE such a stranded cycle leaves behind
+/// (`DraftState::Uploading`, with no `run`/`process` call anywhere actually
+/// owning the path) directly via `set_draft_state_for_tests`, and pins the
+/// guarantee that actually matters: `retry_pending_uploads` recovers it.
+#[tokio::test]
+async fn a_stuck_uploading_draft_is_recovered_by_retry() {
+    let env = VfsTestEnv::new().await;
+    env.expect_uploads().await;
+    env.set_remote_files(vec![remote_file("stuck.txt", 5, "e1")]).await;
+    env.serve_file_content("stuck.txt", b"abcde").await;
+
+    let (vfs, _rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+
+    let node = vfs.tree().lookup(vfs.tree().root(), "stuck.txt").await.unwrap().unwrap().0;
+    let h = vfs.open(node).await.unwrap();
+    let saved = b"stuck upload bytes".to_vec();
+    vfs.write(h, 0, &saved).await.unwrap(); // materializes a draft, state `Editing`.
+
+    // Force the draft straight to `Uploading` WITHOUT ever going through
+    // `close`/a debounce timer/`process` — simulating exactly the state a
+    // stranded cycle leaves behind: `Uploading` on disk, but nothing
+    // genuinely running for this path.
+    vfs.set_draft_state_for_tests(&uri_of("stuck.txt"), DraftState::Uploading)
+        .await
+        .unwrap();
+
+    let requeued = vfs.retry_pending_uploads().await;
+    assert_eq!(
+        requeued, 1,
+        "a stuck Uploading draft with nothing actually in flight must be recovered"
+    );
+
+    vfs.wait_for_writeback_idle().await;
+    assert_eq!(
+        env.uploaded_content("stuck.txt"),
+        Some(saved),
+        "the stranded draft must eventually reach the server once recovered"
     );
 }

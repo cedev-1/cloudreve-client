@@ -18,7 +18,9 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use bytes::{Bytes, BytesMut};
 use cloudreve_api::api::ExplorerApi;
-use cloudreve_api::models::explorer::FileURLService;
+use cloudreve_api::models::explorer::{
+    CreateFileService, DeleteFileService, FileURLService, MoveFileService, RenameFileService,
+};
 use tokio::sync::{mpsc, Mutex, RwLock};
 
 use crate::cache::{BlockCache, FileKey, BLOCK_SIZE};
@@ -459,6 +461,19 @@ impl Vfs {
         self.write_queue.set_retry_backoff_for_tests(backoff);
     }
 
+    /// Test-only: forces a draft's state directly, bypassing every normal
+    /// transition path (`close`'s arm, `open`'s cancel, `process`'s own
+    /// transitions). Same non-`#[cfg(test)]` reasoning as the two methods
+    /// above. Exists specifically to reproduce, without depending on the
+    /// actual microsecond scheduling race, the END STATE a cycle stranded
+    /// by a rename racing a firing debounce timer leaves behind — see
+    /// `WriteBackQueue::migrate_armed_timer`'s doc, case (b) — so the
+    /// recovery path (`retry_pending_uploads`) can be pinned by a
+    /// deterministic test.
+    pub async fn set_draft_state_for_tests(&self, remote_path: &str, state: DraftState) -> Result<()> {
+        self.drafts.lock().await.set_state(remote_path, state)
+    }
+
     /// Begins a brand new file: a local-only tree entry (visible to
     /// `readdir`/`lookup` immediately, before any upload) plus an `Empty`
     /// draft, and a handle already open on it ready for `write`.
@@ -470,7 +485,26 @@ impl Vfs {
     /// placeholder and shadowing its real content with an empty draft whose
     /// blank `base_etag` would later bypass the conflict check (D5)
     /// entirely — a silent overwrite of a file this call never touched.
+    ///
+    /// The EEXIST check and the eventual `DraftStore::begin` are guarded by
+    /// the SAME per-path lock `ensure_drafted` uses (`draft_begin_locks`):
+    /// without it, two concurrent `create`s of the same name can both pass
+    /// the check before either has inserted anything, and the second
+    /// `begin` — an unconditional overwrite — silently discards the first
+    /// caller's already-returned, already-acknowledged draft. The lock is
+    /// keyed by the prospective remote path, computed up front from the
+    /// parent's own attrs (cheap and synchronous — no listing involved) so
+    /// it can be taken before any of the check-then-act section runs.
     pub async fn create(&self, parent: NodeId, name: &str) -> Result<(NodeId, FileHandle)> {
+        let parent_attr = self
+            .tree
+            .getattr(parent)
+            .await?
+            .context("create: unknown parent (readdir/lookup it first)")?;
+        let remote_path = format!("{}/{name}", parent_attr.remote_path);
+        let path_lock = self.draft_begin_lock_for(&remote_path);
+        let _guard = path_lock.lock().await;
+
         if self.lookup(parent, name).await?.is_some() {
             anyhow::bail!("EEXIST: an entry named {name:?} already exists in this directory");
         }
@@ -494,6 +528,235 @@ impl Vfs {
         let handle_id = self.next_handle.fetch_add(1, Ordering::SeqCst);
         self.open_files.write().await.insert(handle_id, open_file);
         Ok((node, FileHandle(handle_id)))
+    }
+
+    /// Creates a folder, synchronously — unlike `create`'s files, a folder
+    /// has no draft/upload phase at all: `create_file` either succeeds (the
+    /// folder now genuinely exists on the server) or fails outright.
+    ///
+    /// Because the server round-trip already happened, this deliberately
+    /// does NOT use `insert_local_entry`'s client-side-only overlay the way
+    /// `create` does for files: `invalidate_path` forces the very next
+    /// listing to hit the network and pick up the real, now-authoritative
+    /// state (including the folder's real id/attrs, not a size-0
+    /// placeholder this facade would have to keep in sync by hand). The
+    /// `lookup` right after intentionally reuses that same fresh listing
+    /// (the tree's `LISTING_TTL` keeps it cached) to hand back a `NodeId`
+    /// without a second network round-trip.
+    pub async fn mkdir(&self, parent: NodeId, name: &str) -> Result<NodeId> {
+        let parent_attr = self
+            .tree
+            .getattr(parent)
+            .await?
+            .context("mkdir: unknown parent (readdir/lookup it first)")?;
+        anyhow::ensure!(parent_attr.is_dir, "mkdir: parent is not a directory");
+        let uri = format!("{}/{name}", parent_attr.remote_path);
+
+        self.client
+            .create_file(&CreateFileService {
+                uri: uri.clone(),
+                file_type: "folder".to_string(),
+                // Deliberate deviation from `cloudreve-sync`'s
+                // `create_empty_file_or_folder`, which sends `Some(false)`
+                // for folders (a sync pass re-creating an already-existing
+                // remote folder is expected and must be a harmless no-op).
+                // `mkdir` is a direct, single-shot user action instead: an
+                // existing entry of the same name is a real EEXIST the
+                // caller should see as an error, not something to silently
+                // succeed over — hence `Some(true)` here, not a mirror of
+                // the sync engine's shape.
+                err_on_conflict: Some(true),
+                metadata: None,
+            })
+            .await
+            .context("failed to create folder")?;
+
+        self.tree.invalidate_path(&uri).await;
+        let (id, _attr) = self
+            .tree
+            .lookup(parent, name)
+            .await?
+            .context("mkdir: created folder not found in the fresh listing")?;
+        Ok(id)
+    }
+
+    /// Removes a file or folder. A drafted file's local edits (and any
+    /// armed/queued upload) are discarded outright — deleting the file
+    /// makes any pending write moot. If the draft's `base_etag` is empty
+    /// (`create`'s brand-new-file case), the file never existed remotely and
+    /// `delete_files` is skipped entirely: there is nothing on the server to
+    /// remove.
+    pub async fn unlink(&self, parent: NodeId, name: &str) -> Result<()> {
+        let (_id, attr) = self
+            .lookup(parent, name)
+            .await?
+            .with_context(|| format!("unlink: no such entry {name:?}"))?;
+        let remote_path = attr.remote_path;
+
+        // `cancel` is a harmless no-op if nothing is currently armed for
+        // this path (draft still `Editing`, or an upload already
+        // `Uploading` — the latter simply finds its draft gone mid-flight,
+        // a case `WriteBackQueue::process` already handles gracefully).
+        let dropped_base_etag = {
+            let mut drafts = self.drafts.lock().await;
+            match drafts.base_etag(&remote_path) {
+                Some(base_etag) => {
+                    self.write_queue.cancel(&remote_path);
+                    drafts.remove(&remote_path)?;
+                    Some(base_etag)
+                }
+                None => None,
+            }
+        };
+
+        if dropped_base_etag.as_deref() == Some("") {
+            self.tree.invalidate_path(&remote_path).await;
+            return Ok(());
+        }
+
+        self.client
+            .delete_files(&DeleteFileService {
+                uris: vec![remote_path.clone()],
+                unlink: None,
+                skip_soft_delete: None,
+            })
+            .await
+            .context("failed to delete")?;
+
+        self.tree.invalidate_path(&remote_path).await;
+        Ok(())
+    }
+
+    /// Renames/moves an entry. Same-directory name changes call
+    /// `rename_file`; a directory change calls `move_files`; a directory
+    /// change THAT ALSO changes the leaf name calls both, in that order —
+    /// `move_files` first (relocating the entry while it still has its old
+    /// name), then `rename_file` targeting the entry's now-current uri
+    /// (parent changed, name hasn't yet). Operating on the entry's actual
+    /// current uri at each step, rather than computing both target paths up
+    /// front, is what makes the two-call sequence correct regardless of
+    /// which the server processes first.
+    ///
+    /// A draft with an empty `base_etag` (`create`'s brand-new-file case)
+    /// has no remote counterpart at all: both API calls are skipped
+    /// entirely (there's nothing on the server to move/rename), and instead
+    /// a fresh local-only entry is inserted at the destination — the same
+    /// client-side overlay `create` itself uses — so the renamed draft
+    /// stays visible before its eventual upload lands under the new path.
+    ///
+    /// Any active draft on the entry is retargeted via `DraftStore::rename`
+    /// so its eventual upload (successful or not) always lands under the
+    /// NEW path, never the old one.
+    ///
+    /// KNOWN PHASE-3 BLOCKER — renaming a file with an OPEN handle is
+    /// unsupported: an `OpenFile`'s `key.remote_path` is fixed at
+    /// `open`/`create` time and this method never touches it, so the
+    /// handle keeps pointing at the OLD path even after this call returns
+    /// successfully. Two failure modes follow, and they're inconsistent
+    /// with each other depending on pure cache-state luck:
+    /// - If the file's blocks are still cached under the old key, a
+    ///   subsequent `write` on that handle silently `ensure_drafted`s (or
+    ///   writes into an already-open draft) under the OLD path — the
+    ///   write appears to succeed, but it re-diverges a file this call
+    ///   already renamed, and whatever eventually uploads does so to the
+    ///   OLD name, not the one the caller renamed it to.
+    /// - If the blocks are gone (evicted, or the remote entry no longer
+    ///   resolves under the old path at all), the same `write` instead
+    ///   fails loudly — a materialization attempt with nothing left at the
+    ///   old path to read.
+    ///
+    /// Either way the handle's view of "which file this is" has silently
+    /// diverged from reality the instant `rename` returns. Phase 3's NFS/
+    /// FUSE frontends MUST serialize (block the rename until every handle
+    /// on the source closes) or deny (`EBUSY`/equivalent) a rename while a
+    /// handle is open on the entry — this facade does not do either for
+    /// them.
+    pub async fn rename(
+        &self,
+        parent: NodeId,
+        name: &str,
+        new_parent: NodeId,
+        new_name: &str,
+    ) -> Result<()> {
+        let (_id, attr) = self
+            .lookup(parent, name)
+            .await?
+            .with_context(|| format!("rename: no such entry {name:?}"))?;
+        let old_path = attr.remote_path;
+        let new_parent_attr = self
+            .tree
+            .getattr(new_parent)
+            .await?
+            .context("rename: unknown new_parent (readdir/lookup it first)")?;
+        let new_path = format!("{}/{new_name}", new_parent_attr.remote_path);
+
+        if old_path == new_path {
+            return Ok(()); // renaming onto itself: nothing to do.
+        }
+
+        let existed_remotely = match self.drafts.lock().await.base_etag(&old_path) {
+            Some(base_etag) => !base_etag.is_empty(),
+            None => true, // no draft at all: an ordinary remote file/dir.
+        };
+
+        if existed_remotely {
+            let same_dir = parent == new_parent;
+            if same_dir {
+                self.client
+                    .rename_file(&RenameFileService {
+                        uri: old_path.clone(),
+                        new_name: new_name.to_string(),
+                    })
+                    .await
+                    .context("failed to rename")?;
+            } else {
+                self.client
+                    .move_files(&MoveFileService {
+                        uris: vec![old_path.clone()],
+                        dst: new_parent_attr.remote_path.clone(),
+                        copy: None,
+                    })
+                    .await
+                    .context("failed to move")?;
+                if name != new_name {
+                    // The entry now lives under the new parent, still under
+                    // its OLD name — operate on its current uri, not the
+                    // pre-move one.
+                    let moved_path = format!("{}/{name}", new_parent_attr.remote_path);
+                    self.client
+                        .rename_file(&RenameFileService {
+                            uri: moved_path,
+                            new_name: new_name.to_string(),
+                        })
+                        .await
+                        .context("failed to rename after move")?;
+                }
+            }
+        }
+
+        let had_draft = {
+            let mut drafts = self.drafts.lock().await;
+            if drafts.state(&old_path).is_some() {
+                drafts.rename(&old_path, &new_path)?;
+                true
+            } else {
+                false
+            }
+        };
+        if had_draft {
+            // A no-op unless a debounce timer was actually armed for the
+            // old path (see `migrate_armed_timer`'s doc) — a draft still
+            // `Editing` or already `Uploading` has nothing to migrate here.
+            self.write_queue.migrate_armed_timer(&old_path, new_path.clone());
+        }
+
+        self.tree.invalidate_path(&old_path).await;
+        if existed_remotely {
+            self.tree.invalidate_path(&new_path).await;
+        } else if had_draft {
+            self.tree.insert_local_entry(new_parent, new_name).await?;
+        }
+        Ok(())
     }
 
     /// Writes `data` at `offset`. The first write on a handle with no draft

@@ -13,7 +13,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cloudreve_api::api::ExplorerApi;
-use cloudreve_api::models::explorer::{FileURLService, UploadSessionRequest};
+use cloudreve_api::models::explorer::{
+    CreateFileService, DeleteFileService, FileURLService, MoveFileService, RenameFileService,
+    UploadSessionRequest,
+};
 use cloudreve_api::models::user::Token;
 use cloudreve_api::{Client, ClientConfig};
 use serde_json::{json, Value};
@@ -39,6 +42,8 @@ pub fn uri_of(name: &str) -> String {
 type FilesState = Arc<Mutex<HashMap<String, Vec<Value>>>>;
 type ContentStore = Arc<Mutex<HashMap<String, Vec<u8>>>>;
 type RequestLog = Arc<Mutex<HashMap<String, Vec<Option<String>>>>>;
+/// `(uris, dst)` recorded from the most recent mocked `move_files` call.
+type LastMove = Arc<Mutex<Option<(Vec<String>, String)>>>;
 type BytesServedLog = Arc<Mutex<HashMap<String, u64>>>;
 /// Bytes received per chunk index, keyed by upload session id. A `BTreeMap`
 /// keeps chunks in index order regardless of the (possibly concurrent)
@@ -96,6 +101,15 @@ pub struct VfsTestEnv {
     /// serialize them (real network calls are fast enough that a broken
     /// gate could otherwise get lucky and still look sequential).
     chunk_upload_delay: Arc<Mutex<Duration>>,
+    /// Task 10 namespace-op call counters and last-call recordings — see
+    /// `expect_namespace_ops`.
+    create_file_calls: Arc<AtomicUsize>,
+    delete_calls: Arc<AtomicUsize>,
+    last_deleted_uris: Arc<Mutex<Vec<String>>>,
+    rename_calls: Arc<AtomicUsize>,
+    last_rename: Arc<Mutex<Option<(String, String)>>>,
+    move_calls: Arc<AtomicUsize>,
+    last_move: LastMove,
 }
 
 impl VfsTestEnv {
@@ -134,6 +148,13 @@ impl VfsTestEnv {
         let concurrent_uploads = Arc::new(AtomicUsize::new(0));
         let max_concurrent_uploads = Arc::new(AtomicUsize::new(0));
         let chunk_upload_delay = Arc::new(Mutex::new(Duration::ZERO));
+        let create_file_calls = Arc::new(AtomicUsize::new(0));
+        let delete_calls = Arc::new(AtomicUsize::new(0));
+        let last_deleted_uris = Arc::new(Mutex::new(Vec::new()));
+        let rename_calls = Arc::new(AtomicUsize::new(0));
+        let last_rename = Arc::new(Mutex::new(None));
+        let move_calls = Arc::new(AtomicUsize::new(0));
+        let last_move = Arc::new(Mutex::new(None));
 
         // Listing endpoint: path-aware, keyed by the `uri` query param exactly
         // as `ExplorerApiExt::list_files_all` sends it, so a directory only
@@ -338,7 +359,191 @@ impl VfsTestEnv {
             concurrent_uploads,
             max_concurrent_uploads,
             chunk_upload_delay,
+            create_file_calls,
+            delete_calls,
+            last_deleted_uris,
+            rename_calls,
+            last_rename,
+            move_calls,
+            last_move,
         }
+    }
+
+    /// Mounts mocks for the namespace-mutating endpoints Task 10's `Vfs`
+    /// facade drives: `POST /file/create`, `DELETE /file`, `POST
+    /// /file/rename`, `POST /file/move`. Opt-in (like `expect_uploads`)
+    /// rather than always mounted in `new()`, since most tests in this crate
+    /// never touch these ops.
+    ///
+    /// Each mock emulates the real server's actual effect on the directory
+    /// listing it stands in for (`files`), not just a canned response body —
+    /// mirroring how `set_remote_files`'s siblings behave for the download/
+    /// listing endpoints — so a test can prove a namespace op "really
+    /// happened" via a plain `readdir`/`lookup` afterwards, exactly as it
+    /// would against the real server, instead of only trusting a call
+    /// counter.
+    pub async fn expect_namespace_ops(&self) {
+        // POST /file/create: adds the created file/folder to its parent's
+        // listing and echoes it back as the `FileResponse` the real
+        // endpoint returns.
+        {
+            let files = self.files.clone();
+            let create_file_calls = self.create_file_calls.clone();
+            Mock::given(method("POST"))
+                .and(path("/api/v4/file/create"))
+                .respond_with(move |req: &Request| {
+                    create_file_calls.fetch_add(1, Ordering::SeqCst);
+                    let request: CreateFileService =
+                        req.body_json().expect("decode CreateFileService body");
+                    let (parent_uri, name) =
+                        request.uri.rsplit_once('/').unwrap_or(("", request.uri.as_str()));
+                    let mut entry = if request.file_type == "folder" {
+                        remote_dir(name)
+                    } else {
+                        remote_file(name, 0, "")
+                    };
+                    // The helpers above assume a root-level path; overwrite
+                    // with the real requested uri so a nested parent is
+                    // reflected correctly too.
+                    entry["path"] = json!(request.uri.clone());
+                    files
+                        .lock()
+                        .unwrap()
+                        .entry(parent_uri.to_string())
+                        .or_default()
+                        .push(entry.clone());
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({ "code": 0, "msg": "", "data": entry }))
+                })
+                .mount(&self.server)
+                .await;
+        }
+
+        // DELETE /file: removes every matching entry (by exact `path`) from
+        // whichever directory listing currently holds it.
+        {
+            let files = self.files.clone();
+            let delete_calls = self.delete_calls.clone();
+            let last_deleted_uris = self.last_deleted_uris.clone();
+            Mock::given(method("DELETE"))
+                .and(path("/api/v4/file"))
+                .respond_with(move |req: &Request| {
+                    delete_calls.fetch_add(1, Ordering::SeqCst);
+                    let request: DeleteFileService =
+                        req.body_json().expect("decode DeleteFileService body");
+                    *last_deleted_uris.lock().unwrap() = request.uris.clone();
+                    let mut files = files.lock().unwrap();
+                    for uri in &request.uris {
+                        remove_entry_by_path(&mut files, uri);
+                    }
+                    ResponseTemplate::new(200).set_body_json(json!({ "code": 0, "msg": "" }))
+                })
+                .mount(&self.server)
+                .await;
+        }
+
+        // POST /file/rename: renames the matching entry in place (same
+        // parent directory), updating both its `name` and `path`.
+        {
+            let files = self.files.clone();
+            let rename_calls = self.rename_calls.clone();
+            let last_rename = self.last_rename.clone();
+            Mock::given(method("POST"))
+                .and(path("/api/v4/file/rename"))
+                .respond_with(move |req: &Request| {
+                    rename_calls.fetch_add(1, Ordering::SeqCst);
+                    let request: RenameFileService =
+                        req.body_json().expect("decode RenameFileService body");
+                    *last_rename.lock().unwrap() =
+                        Some((request.uri.clone(), request.new_name.clone()));
+                    let mut files = files.lock().unwrap();
+                    let (parent_uri, _old_name) =
+                        request.uri.rsplit_once('/').unwrap_or(("", request.uri.as_str()));
+                    let new_path = format!("{parent_uri}/{}", request.new_name);
+                    let mut entry = remove_entry_by_path(&mut files, &request.uri)
+                        .expect("mock: rename_file on an unknown uri");
+                    entry["name"] = json!(request.new_name.clone());
+                    entry["path"] = json!(new_path.clone());
+                    // A renamed directory takes its own nested listing (if
+                    // any) along with it, keyed by its full path.
+                    if let Some(children) = files.remove(&request.uri) {
+                        files.insert(new_path.clone(), children);
+                    }
+                    files.entry(parent_uri.to_string()).or_default().push(entry.clone());
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({ "code": 0, "msg": "", "data": entry }))
+                })
+                .mount(&self.server)
+                .await;
+        }
+
+        // POST /file/move: relocates each matching entry into `dst`'s
+        // listing, keeping its name.
+        {
+            let files = self.files.clone();
+            let move_calls = self.move_calls.clone();
+            let last_move = self.last_move.clone();
+            Mock::given(method("POST"))
+                .and(path("/api/v4/file/move"))
+                .respond_with(move |req: &Request| {
+                    move_calls.fetch_add(1, Ordering::SeqCst);
+                    let request: MoveFileService =
+                        req.body_json().expect("decode MoveFileService body");
+                    *last_move.lock().unwrap() = Some((request.uris.clone(), request.dst.clone()));
+                    let mut files = files.lock().unwrap();
+                    for uri in &request.uris {
+                        let Some(mut entry) = remove_entry_by_path(&mut files, uri) else {
+                            continue;
+                        };
+                        let name =
+                            entry.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
+                        let new_path = format!("{}/{name}", request.dst);
+                        entry["path"] = json!(new_path.clone());
+                        if let Some(children) = files.remove(uri) {
+                            files.insert(new_path.clone(), children);
+                        }
+                        files.entry(request.dst.clone()).or_default().push(entry);
+                    }
+                    ResponseTemplate::new(200).set_body_json(json!({ "code": 0, "msg": "" }))
+                })
+                .mount(&self.server)
+                .await;
+        }
+    }
+
+    /// Total `POST /file/create` requests received so far.
+    pub fn create_file_call_count(&self) -> usize {
+        self.create_file_calls.load(Ordering::SeqCst)
+    }
+
+    /// Total `DELETE /file` requests received so far.
+    pub fn delete_call_count(&self) -> usize {
+        self.delete_calls.load(Ordering::SeqCst)
+    }
+
+    /// The `uris` carried by the most recent `DELETE /file` call.
+    pub fn last_deleted_uris(&self) -> Vec<String> {
+        self.last_deleted_uris.lock().unwrap().clone()
+    }
+
+    /// Total `POST /file/rename` requests received so far.
+    pub fn rename_call_count(&self) -> usize {
+        self.rename_calls.load(Ordering::SeqCst)
+    }
+
+    /// `(uri, new_name)` carried by the most recent `POST /file/rename` call.
+    pub fn last_rename(&self) -> Option<(String, String)> {
+        self.last_rename.lock().unwrap().clone()
+    }
+
+    /// Total `POST /file/move` requests received so far.
+    pub fn move_call_count(&self) -> usize {
+        self.move_calls.load(Ordering::SeqCst)
+    }
+
+    /// `(uris, dst)` carried by the most recent `POST /file/move` call.
+    pub fn last_move(&self) -> Option<(Vec<String>, String)> {
+        self.last_move.lock().unwrap().clone()
     }
 
     /// Mounts the upload endpoints the real `cloudreve-uploader` protocol
@@ -801,6 +1006,21 @@ impl VfsTestEnv {
             assert!(now < deadline, "downloads never settled (still arriving after 5s)");
         }
     }
+}
+
+/// Removes and returns the first entry whose `path` field equals
+/// `target_path`, scanning every directory listing registered so far —
+/// namespace-op mocks use this to find an entry regardless of which
+/// directory's listing currently holds it.
+fn remove_entry_by_path(files: &mut HashMap<String, Vec<Value>>, target_path: &str) -> Option<Value> {
+    for list in files.values_mut() {
+        if let Some(idx) =
+            list.iter().position(|f| f.get("path").and_then(Value::as_str) == Some(target_path))
+        {
+            return Some(list.remove(idx));
+        }
+    }
+    None
 }
 
 /// Build the JSON for a remote file as the Cloudreve list API would return it.
