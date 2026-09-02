@@ -335,6 +335,29 @@ impl DraftStore {
         self.entries.get(&hash16(remote_path)).map(|e| e.base_etag.clone())
     }
 
+    /// Whether any draft's path is STRICTLY nested under `prefix`
+    /// (`prefix` + "/" + anything) — deliberately excludes an exact match
+    /// on `prefix` itself. A plain file with its own draft (not open) may
+    /// still be renamed: `Vfs::rename` migrates that draft in place via
+    /// `rename` above, and this method must stay a no-op for that case
+    /// (a file has no descendants, so the exact-match exclusion never even
+    /// applies to it in practice — it only matters for a DIRECTORY's own
+    /// path, which never has a draft of its own).
+    ///
+    /// Used by `Vfs::rename`'s subtree EBUSY guard: renaming a directory
+    /// must be refused while any descendant file has unsaved/unsettled
+    /// content, because `rename` above only ever migrates the ONE exact
+    /// path handed to it — a descendant's draft left un-migrated would
+    /// keep targeting the OLD (renamed-away) path, and its eventual upload
+    /// would resurrect the just-renamed directory there with the user's
+    /// edit inside, while the new location keeps stale content. Denying
+    /// the whole rename is deliberately simpler than teaching `rename`
+    /// (the method) to migrate a whole subtree of drafts at once.
+    pub fn has_draft_strictly_under(&self, prefix: &str) -> bool {
+        let nested = format!("{prefix}/");
+        self.entries.values().any(|e| e.remote_path.starts_with(&nested))
+    }
+
     /// The draft's content-mutation counter — see `Entry::write_seq`'s doc.
     pub fn write_seq(&self, remote_path: &str) -> Option<u64> {
         self.entries.get(&hash16(remote_path)).map(|e| e.write_seq)

@@ -27,7 +27,7 @@
 //! incoming RPC (`rpcwire.rs`), so two RPCs on the same file genuinely CAN
 //! run concurrently — e.g. a slow WRITE (its facade handle open for the
 //! duration of that one call) overlapping a RENAME on the same path is
-//! enough to legitimately trip `Vfs::rename`'s `is_path_open` guard and
+//! enough to legitimately trip `Vfs::rename`'s `is_subtree_open` guard and
 //! return [`RenameBusyError`](crate::vfs::RenameBusyError)/`JUKEBOX`; the
 //! narrower [`StaleHandleError`](crate::vfs::StaleHandleError) race (a
 //! read overlapping the exact instant its draft's upload removes it) is
@@ -379,7 +379,7 @@ fn to_nfsstat3(errno: FrontendErrno) -> nfsstat3 {
         // the module doc): `nfs3_server` dispatches each incoming RPC on
         // its own tokio task, so a slow WRITE's facade handle can still be
         // open when a concurrent RENAME on the same path arrives and trips
-        // `Vfs::rename`'s `is_path_open` guard. No deterministic test drives
+        // `Vfs::rename`'s `is_subtree_open` guard. No deterministic test drives
         // that overlap through the trait object (it depends on the tokio
         // scheduler), so this mapping is pinned by a direct unit test
         // instead — real AND end-to-end-testable once the FUSE adapter

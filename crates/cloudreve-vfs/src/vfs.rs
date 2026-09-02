@@ -432,9 +432,26 @@ impl Vfs {
         // `rename`'s EBUSY guard (see `open_locks`'s field doc) — an open
         // already in progress for this path always finishes (and becomes
         // visible in `open_files`) before a racing `rename`'s busy-check can
-        // run, and an open arriving after `rename` took the lock waits for
-        // the rename to fully commit instead of registering against a path
-        // that's about to change out from under it.
+        // run.
+        //
+        // The reverse ordering is NOT fully closed, and an earlier version
+        // of this comment overclaimed that it was. `attr` above is resolved
+        // (via `tree.getattr`) BEFORE this lock is taken, so an open racing
+        // a `rename` that commits first still waits here on the SAME lock
+        // key (both resolve to the entry's pre-rename path) but then
+        // resumes holding a now-STALE `attr.remote_path` — waiting does NOT
+        // re-resolve it. In practice this fails LOUDLY rather than leaving a
+        // surviving stale handle: by the time the rename has committed, its
+        // draft (if any) has already migrated to the new path, so
+        // `has_draft` below is false, and the `fetch_download_url` call
+        // further down 404s against the server for a path that no longer
+        // exists there — this whole function returns that error before ever
+        // reaching the final `open_files.write().await.insert(..)`, so
+        // nothing stale is ever registered. Reachable only via NFS's
+        // per-RPC concurrency (FUSE's single dispatch thread can't race its
+        // own calls this way); `create` has the same shape, narrower
+        // (its parent attr is likewise resolved before its own
+        // `open_lock_for` call).
         let open_lock = self.open_lock_for(&attr.remote_path);
         let _open_guard = open_lock.lock().await;
 
@@ -702,7 +719,7 @@ impl Vfs {
     /// visible in the tree several `.await`s before this call finishes
     /// registering its own handle in `open_files`; a `rename` of that SAME
     /// not-yet-fully-created name landing in that window would see
-    /// `is_path_open == false` and complete, reproducing cycle A's exact
+    /// `is_subtree_open == false` and complete, reproducing cycle A's exact
     /// stale-handle bug for a name that didn't exist a moment ago instead
     /// of one that already did. Taken FIRST, before `draft_begin_lock` — see
     /// `draft_begin_locks`'s doc for the ordering rule the two lock maps
@@ -896,6 +913,29 @@ impl Vfs {
     /// on the entry and retrying succeeds (see the guard's own doc, and
     /// `open_locks`'s field doc, for why this is race-free rather than a
     /// mere check-then-act).
+    ///
+    /// For a DIRECTORY rename the same guard extends to descendants (any
+    /// open handle or live draft strictly under the old path also answers
+    /// EBUSY), but with one honestly-narrower guarantee: `open_locks` is
+    /// keyed per exact path, so a brand-new open/create of a *descendant*
+    /// racing this call is not serialized against it — a check-then-act
+    /// window of about one HTTP round-trip remains, versus the
+    /// deterministic bypass of already-open handles this guard closes.
+    /// Closing it fully needs hierarchical locking; tracked as a phase-4
+    /// obligation.
+    ///
+    /// Callers should also expect this call to sometimes BLOCK rather than
+    /// answer immediately, even outside the EBUSY path: `open_locks` (the
+    /// per-path lock this call and `open`/`create` all share) can be held
+    /// across a network hop, not just an in-memory check. `open` holds its
+    /// lock across one `fetch_download_url` HTTP round-trip; `create`'s
+    /// EEXIST `lookup` can itself trigger a fresh directory listing if the
+    /// parent's cached one has expired. A `rename` arriving while either is
+    /// in flight for the same path simply waits for it to finish before its
+    /// own busy-check even runs — by design (see `open_locks`'s field doc),
+    /// but a frontend mapping this call directly onto a synchronous syscall
+    /// must not assume EBUSY is the only way this call takes noticeable
+    /// time.
     pub async fn rename(
         &self,
         parent: NodeId,
@@ -925,9 +965,25 @@ impl Vfs {
         // check-then-act TOCTOU — dropped automatically at the end of this
         // function (early return on the busy path, or falling off the end
         // on success).
+        //
+        // Covers the whole SUBTREE, not just `old_path` itself: renaming a
+        // DIRECTORY must be refused if any descendant currently has an open
+        // handle OR a live draft — otherwise `DraftStore::rename` below
+        // (which only ever migrates the one exact path handed to it) would
+        // leave that descendant's draft targeting the OLD, just-renamed-away
+        // path, and its eventual upload would resurrect the renamed
+        // directory there with the user's edit inside (the master-index
+        // BLOCKER this guard exists to close). The draft check deliberately
+        // uses `has_draft_strictly_under`, NOT a plain exact-or-prefix
+        // match: a draft sitting AT `old_path` itself (the ordinary
+        // drafted-FILE-rename case, no descendants possible) must stay
+        // allowed through unmigrated-until-below, exactly as before this
+        // fix — see that method's doc.
         let open_lock = self.open_lock_for(&old_path);
         let _open_guard = open_lock.lock().await;
-        if self.is_path_open(&old_path).await {
+        if self.is_subtree_open(&old_path).await
+            || self.drafts.lock().await.has_draft_strictly_under(&old_path)
+        {
             return Err(anyhow::Error::new(RenameBusyError { remote_path: old_path }));
         }
 
@@ -1145,11 +1201,32 @@ impl Vfs {
             .clone()
     }
 
-    /// Whether any live handle currently points at `remote_path`. Callers
-    /// needing a race-free answer must hold `open_lock_for(remote_path)`
-    /// across both this check and whatever it gates — see `rename`'s guard.
-    async fn is_path_open(&self, remote_path: &str) -> bool {
-        self.open_files.read().await.values().any(|of| of.key.remote_path == remote_path)
+    /// Whether any live handle currently points at `remote_path` itself, OR
+    /// at anything nested under it (`remote_path` + "/" + anything).
+    /// The `+ "/"` boundary is deliberate: a sibling whose name merely
+    /// shares `remote_path` as a string prefix (`/docs` vs `/docs2`) must
+    /// NOT be treated as a descendant — only a real path separator makes
+    /// one an ancestor of the other.
+    ///
+    /// The exact-match branch is what a plain FILE rename has always
+    /// relied on (a file can't have descendants, so only that branch ever
+    /// fires for one); the prefix branch is what a DIRECTORY rename needs
+    /// — a directory itself is never opened as a file (`open` bails on
+    /// one), so without it this check could never see a descendant's open
+    /// handle at all. Callers needing a race-free answer must hold
+    /// `open_lock_for(remote_path)` across both this check and whatever it
+    /// gates — see `rename`'s guard. Note that lock is keyed to
+    /// `remote_path` alone, not to every descendant's own path, so it does
+    /// NOT close the (pre-existing, narrower) race of a *new* open/create
+    /// arriving on a descendant while this check is already running — see
+    /// `rename`'s doc.
+    async fn is_subtree_open(&self, remote_path: &str) -> bool {
+        let nested_prefix = format!("{remote_path}/");
+        self.open_files
+            .read()
+            .await
+            .values()
+            .any(|of| of.key.remote_path == remote_path || of.key.remote_path.starts_with(&nested_prefix))
     }
 
     /// D2's materialization: pulls the whole file's current content through

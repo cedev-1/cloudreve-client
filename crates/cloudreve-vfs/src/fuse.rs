@@ -50,7 +50,7 @@
 //! a real file descriptor. So `open` a file, keep holding it (its `fh`
 //! lives in the KERNEL now, not on this thread's stack), and a `rename` of
 //! that same path arriving as its own later, separate FUSE call reliably
-//! finds `Vfs::rename`'s `is_path_open` guard tripped — no race, no
+//! finds `Vfs::rename`'s `is_subtree_open` guard tripped — no race, no
 //! scheduler dependency. See `tests/mounted_linux.rs`'s EBUSY test.
 //!
 //! ## Handle model (D6)

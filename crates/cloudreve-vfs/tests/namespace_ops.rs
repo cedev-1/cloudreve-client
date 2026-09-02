@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use cloudreve_vfs::vfs::{CreatePauseHook, RenameBusyError, Vfs, DEFAULT_CACHE_MAX_BYTES};
 use common::{remote_dir, remote_file, VfsTestEnv};
+use serde_json::json;
 
 /// A created folder is visible in a listing immediately — no separate
 /// round-trip beyond the `create_file` call itself and the relist it forces.
@@ -397,5 +398,214 @@ async fn concurrent_creates_of_the_same_name_yield_one_file() {
             ok_count, 1,
             "iteration {iteration}: expected exactly one create() to win, got a={ra:?} b={rb:?}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------
+// Final fix wave (F1): renaming a DIRECTORY used to bypass the EBUSY
+// guard entirely, because both the open-handle check and the draft
+// migration matched the exact path only — a directory itself is never
+// opened as a file and never has its own draft, so neither check ever
+// tripped for one. A file with an open handle or a dirty/pending draft
+// underneath a renamed directory kept pointing at the OLD path: the
+// server-side rename went through, and the descendant's eventual upload
+// then resurrected the just-renamed directory at its old uri with the
+// user's edit inside, while the new location kept stale content.
+// ---------------------------------------------------------------------
+
+/// Builds the JSON for a remote file nested under `dir`, the way
+/// `remote_file` cannot: that helper always stamps a root-level `path`.
+fn nested_remote_file(dir: &str, name: &str, size: i64, etag: &str) -> serde_json::Value {
+    let mut entry = remote_file(name, size, etag);
+    entry["path"] = json!(format!("{}/{dir}/{name}", common::REMOTE_BASE));
+    entry
+}
+
+/// Renaming a directory with an open handle on a file inside it must be
+/// refused with `RenameBusyError`, exactly like renaming the file itself
+/// would be — and the refusal must happen before the server is ever
+/// contacted. Closing the handle lifts the guard, and the rename then
+/// succeeds, moving the child along with it.
+#[tokio::test]
+async fn renaming_a_directory_with_an_open_child_handle_is_refused() {
+    let env = VfsTestEnv::new().await;
+    env.expect_namespace_ops().await;
+    env.set_remote_files(vec![remote_dir("docs")]).await;
+    env.set_remote_files_at("docs", vec![nested_remote_file("docs", "inside.txt", 5, "e1")]).await;
+    env.serve_file_content("inside.txt", b"hello").await;
+
+    let (vfs, _rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+    let root = vfs.tree().root();
+    let docs = vfs.lookup(root, "docs").await.unwrap().unwrap().0;
+    let inside = vfs.lookup(docs, "inside.txt").await.unwrap().unwrap().0;
+    let h = vfs.open(inside).await.unwrap();
+
+    let result = vfs.rename(root, "docs", root, "docs-renamed").await;
+    let err = result.expect_err(
+        "renaming a directory with an open handle on a descendant must be refused",
+    );
+    assert!(
+        err.downcast_ref::<RenameBusyError>().is_some(),
+        "expected a RenameBusyError, got: {err:#}"
+    );
+    assert_eq!(
+        env.rename_call_count(),
+        0,
+        "a refused directory rename must never have reached the server"
+    );
+    assert!(
+        vfs.lookup(root, "docs").await.unwrap().is_some(),
+        "the directory must still resolve under its old name"
+    );
+
+    vfs.close(h).await.unwrap();
+
+    vfs.rename(root, "docs", root, "docs-renamed")
+        .await
+        .expect("renaming should succeed once the descendant's handle is closed");
+    assert!(vfs.lookup(root, "docs").await.unwrap().is_none(), "the old name must no longer resolve");
+    let renamed = vfs
+        .lookup(root, "docs-renamed")
+        .await
+        .unwrap()
+        .expect("the new name must resolve after the rename");
+    assert!(renamed.1.is_dir);
+    let (_, attr) = vfs
+        .lookup(renamed.0, "inside.txt")
+        .await
+        .unwrap()
+        .expect("the child must have moved along with its renamed parent");
+    assert_eq!(attr.name, "inside.txt");
+}
+
+/// Same failure mode, without any handle ever staying open: a descendant
+/// file that was edited and closed (its draft is `Pending`, debounced for
+/// upload, no open handle left) must ALSO refuse a rename of its parent
+/// directory — otherwise `DraftStore::rename`'s exact-path-only migration
+/// would never touch it, and its debounced upload would land under the
+/// OLD, just-renamed-away directory path once it eventually fires
+/// (reviewer's proven resurrection scenario). Once the draft has fully
+/// settled (uploaded and removed), the same rename succeeds.
+#[tokio::test]
+async fn renaming_a_directory_with_a_pending_child_draft_is_refused() {
+    let env = VfsTestEnv::new().await;
+    env.expect_namespace_ops().await;
+    env.expect_uploads().await;
+    env.set_remote_files(vec![remote_dir("docs")]).await;
+    env.set_remote_files_at("docs", vec![nested_remote_file("docs", "inside.txt", 5, "e1")]).await;
+    env.serve_file_content("inside.txt", b"hello").await;
+
+    let (vfs, _rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+    vfs.set_debounce_for_tests(Duration::from_millis(50));
+    let root = vfs.tree().root();
+    let docs = vfs.lookup(root, "docs").await.unwrap().unwrap().0;
+    let inside = vfs.lookup(docs, "inside.txt").await.unwrap().unwrap().0;
+    let h = vfs.open(inside).await.unwrap();
+    vfs.write(h, 0, b"edited").await.unwrap();
+    vfs.close(h).await.unwrap(); // Pending, debounce armed — no handle left open.
+
+    let result = vfs.rename(root, "docs", root, "docs-renamed").await;
+    let err = result.expect_err(
+        "renaming a directory with a pending (unopened) draft on a descendant must be refused",
+    );
+    assert!(
+        err.downcast_ref::<RenameBusyError>().is_some(),
+        "expected a RenameBusyError, got: {err:#}"
+    );
+    assert_eq!(
+        env.rename_call_count(),
+        0,
+        "a refused directory rename must never have reached the server"
+    );
+
+    // Let the debounce fire and the upload land under the STILL-original
+    // path (nothing was renamed remotely yet) — the draft fully settles
+    // and is removed.
+    vfs.wait_for_writeback_idle().await;
+    assert_eq!(
+        env.uploaded_content("inside.txt"),
+        Some(b"edited".to_vec()),
+        "the settled draft must have uploaded under its original (never-renamed) path"
+    );
+
+    vfs.rename(root, "docs", root, "docs-renamed")
+        .await
+        .expect("renaming should succeed once the descendant's draft has settled");
+    assert!(vfs.lookup(root, "docs").await.unwrap().is_none(), "the old name must no longer resolve");
+    assert!(
+        vfs.lookup(root, "docs-renamed").await.unwrap().is_some(),
+        "the new name must resolve after the rename"
+    );
+}
+
+/// The subtree guard's prefix match must key on a real path separator
+/// (`old_path` + "/"), not a bare string prefix: `docs` and `docs2` share
+/// "docs" as characters, but neither is an ancestor of the other. Only
+/// one of the two directions below is actually diagnostic of a missing
+/// separator (a naive `starts_with(old_path)` without it would wrongly
+/// treat the longer sibling's descendant as nested under the shorter
+/// name) — both are pinned so neither direction can silently regress.
+#[tokio::test]
+async fn renaming_a_directory_ignores_an_open_handle_in_a_same_prefixed_sibling() {
+    // Direction A — the actually diagnostic one: the SHORTER name
+    // ("docs") is renamed while the LONGER sibling ("docs2") has an open
+    // descendant. `"docs2/other.txt".starts_with("docs")` is true as a
+    // bare string, but false once the boundary is `"docs/"`.
+    {
+        let env = VfsTestEnv::new().await;
+        env.expect_namespace_ops().await;
+        env.set_remote_files(vec![remote_dir("docs"), remote_dir("docs2")]).await;
+        env.set_remote_files_at("docs2", vec![nested_remote_file("docs2", "other.txt", 5, "e1")])
+            .await;
+        env.serve_file_content("other.txt", b"hello").await;
+
+        let (vfs, _rx) = Vfs::new(
+            env.client(),
+            common::REMOTE_BASE.into(),
+            env.cache_dir(),
+            DEFAULT_CACHE_MAX_BYTES,
+        )
+        .unwrap();
+        let root = vfs.tree().root();
+        let docs2 = vfs.lookup(root, "docs2").await.unwrap().unwrap().0;
+        let other = vfs.lookup(docs2, "other.txt").await.unwrap().unwrap().0;
+        let _h = vfs.open(other).await.unwrap(); // stays open
+
+        vfs.rename(root, "docs", root, "docs-renamed").await.expect(
+            "an open handle in an unrelated, similarly-prefixed sibling must not refuse this rename",
+        );
+        assert!(vfs.lookup(root, "docs-renamed").await.unwrap().is_some());
+    }
+
+    // Direction B — the reviewer's literal wording: the LONGER name
+    // ("docs2") is renamed while the SHORTER sibling ("docs") has an open
+    // descendant.
+    {
+        let env = VfsTestEnv::new().await;
+        env.expect_namespace_ops().await;
+        env.set_remote_files(vec![remote_dir("docs"), remote_dir("docs2")]).await;
+        env.set_remote_files_at("docs", vec![nested_remote_file("docs", "file.txt", 5, "e1")]).await;
+        env.serve_file_content("file.txt", b"hello").await;
+
+        let (vfs, _rx) = Vfs::new(
+            env.client(),
+            common::REMOTE_BASE.into(),
+            env.cache_dir(),
+            DEFAULT_CACHE_MAX_BYTES,
+        )
+        .unwrap();
+        let root = vfs.tree().root();
+        let docs = vfs.lookup(root, "docs").await.unwrap().unwrap().0;
+        let file = vfs.lookup(docs, "file.txt").await.unwrap().unwrap().0;
+        let _h = vfs.open(file).await.unwrap(); // stays open
+
+        vfs.rename(root, "docs2", root, "docs2-renamed")
+            .await
+            .expect("renaming docs2 while docs/file.txt is open must succeed");
+        assert!(vfs.lookup(root, "docs2-renamed").await.unwrap().is_some());
     }
 }
