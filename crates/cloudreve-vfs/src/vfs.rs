@@ -111,15 +111,69 @@ enum FetchOutcome {
 
 /// Events the write-back path (Task 8) reports to whatever owns the
 /// receiver half of `Vfs::new`'s channel — a dashboard row, a toast, or (in
-/// tests) nothing at all. Emitted exclusively by `writeback::WriteBackQueue`
-/// (see `Vfs::close`/`open`'s hooks into it) — the channel has existed since
-/// Task 7 so the constructor's shape never had to change again once Task 8
-/// started sending.
+/// tests) nothing at all. Emitted by `writeback::WriteBackQueue` (see
+/// `Vfs::close`/`open`'s hooks into it) and, for `UploadCancelled`/
+/// `UploadRenamed`, directly by `Vfs::open`/`Vfs::unlink` and
+/// `WriteBackQueue::migrate_armed_timer` — see each variant's doc for its
+/// exact emission site(s).
+///
+/// RECONSTRUCTION-COMPLETE STATE MACHINE (phase-4 obligation carried from
+/// phase 2): every [`VfsEvent::UploadQueued`] for one draft's upload cycle
+/// is eventually followed by EXACTLY ONE of the following, closing that
+/// cycle out:
+/// - [`VfsEvent::UploadSucceeded`] — the upload landed in place.
+/// - [`VfsEvent::UploadFailed`] — every attempt in this cycle was
+///   exhausted; the draft is parked `Pending` again, picked back up only by
+///   an explicit `retry_pending_uploads` (or app restart) — which starts a
+///   brand new `UploadQueued`/terminal cycle of its own, not a continuation
+///   of this one. (No separate "this one will never retry" variant exists:
+///   this event itself is always this cycle's terminal outcome, regardless
+///   of its `will_retry` field — that field describes whether the DRAFT
+///   overall will be retried later, not whether THIS event has a
+///   successor.)
+/// - [`VfsEvent::UploadCancelled`] — the debounce timer armed for this
+///   cycle was stopped before it ever fired: a reopen-for-write within the
+///   window (`Vfs::open`), or `Vfs::unlink` dropping the queued draft
+///   outright. Nothing was ever uploaded for this cycle.
+/// - [`VfsEvent::UploadRenamed`] — `Vfs::rename` migrated this cycle's
+///   still-armed timer to a new path
+///   (`WriteBackQueue::migrate_armed_timer`) before it fired. The lifecycle
+///   continues uninterrupted under the NEW path: a fresh
+///   `UploadQueued { remote_path: to }` follows immediately, itself
+///   guaranteed one of these same terminal outcomes.
+/// - [`VfsEvent::ConflictSaved`] — the upload detected a remote change
+///   since the draft began and landed as a conflict copy instead; the
+///   original draft is settled the same way `UploadSucceeded` settles one
+///   (removed, or kept and re-armed — a fresh `UploadQueued` — if written
+///   again mid-flight; see `WriteBackQueue::settle_uploaded_draft`).
+///
+/// KNOWN GAP (pre-existing, narrower than the three sites above): a draft
+/// queued via `retry_pending_uploads`/the startup resume
+/// (`WriteBackQueue::enqueue_immediate`, which spawns its upload
+/// immediately with no debounce timer for `cancel`/`migrate_armed_timer` to
+/// find) that gets unlinked or renamed in the brief scheduling window
+/// between being spawned and `process` actually running gets NO terminal
+/// event for that cycle: `cancel` finds nothing armed to stop, and
+/// `process` finds its draft already gone and returns silently (no event).
+/// Never observed to matter in practice (the window is a few microseconds
+/// of tokio scheduling, not a debounce-length one), and closing it fully
+/// would need synchronizing `enqueue_immediate`'s spawn against
+/// `unlink`/`rename`'s own per-path locks — out of scope for this task.
 #[derive(Debug, Clone, PartialEq)]
 pub enum VfsEvent {
     UploadQueued { remote_path: String },
     UploadSucceeded { remote_path: String, new_etag: String },
     UploadFailed { remote_path: String, error: String, will_retry: bool },
+    /// A queued upload's debounce timer was stopped before it fired:
+    /// `Vfs::open` cancelling it on a reopen-for-write within the window,
+    /// or `Vfs::unlink` dropping the queued draft outright. See the enum's
+    /// own doc for the full terminal-state contract.
+    UploadCancelled { remote_path: String },
+    /// A queued upload's still-armed debounce timer was migrated to a new
+    /// path by `Vfs::rename` (via `WriteBackQueue::migrate_armed_timer`)
+    /// before it fired. The lifecycle continues under `to`: expect a fresh
+    /// `UploadQueued { remote_path: to }` immediately after this event.
+    UploadRenamed { from: String, to: String },
     ConflictSaved { original: String, conflict_copy: String },
 }
 
@@ -293,10 +347,10 @@ pub struct Vfs {
     /// means `create` never pauses, which is every non-test call.
     create_pause_hook: std::sync::Mutex<Option<Arc<CreatePauseHook>>>,
     /// Sender half of the `VfsEvent` channel returned by `new`. A clone of
-    /// this lives inside `write_queue`, which is the only thing that
-    /// actually sends through it today; kept here too for any future
-    /// direct emission (e.g. Task 10's namespace ops).
-    #[allow(dead_code)]
+    /// this lives inside `write_queue`, which emits most events; this
+    /// facade-level copy is what `open`/`unlink` use for the two terminal
+    /// events they emit directly (`UploadCancelled` on a reopen/unlink
+    /// racing a still-armed debounce timer — see `VfsEvent`'s doc).
     events: mpsc::UnboundedSender<VfsEvent>,
 }
 
@@ -505,6 +559,28 @@ impl Vfs {
             let mut drafts = self.drafts.lock().await;
             if let Some(DraftState::Pending) = drafts.state(&attr.remote_path) {
                 if self.write_queue.cancel(&attr.remote_path) {
+                    // ORDERING CONTRACT (reviewer-caught, fix round 1): send
+                    // the terminal event BEFORE the fallible `set_state`
+                    // call below, never after. `cancel()` returning `true`
+                    // just above already `abort()`ed the debounce timer —
+                    // that is the commitment point, and it is irreversible:
+                    // nothing will ever fire for this cycle through the
+                    // normal timer path again. If the event send instead
+                    // sat downstream of `set_state`'s disk write and that
+                    // write failed, `open()` would return early via `?` and
+                    // this cycle's `UploadCancelled` would be silently
+                    // swallowed forever — a permanent hole in the
+                    // reconstruction-complete invariant documented on
+                    // `VfsEvent`, for no benefit (the in-memory draft state
+                    // flips to `Editing` regardless of whether the persist
+                    // below succeeds — see `DraftStore::set_state`'s doc).
+                    // Mirrors `Vfs::unlink`'s already-correct ordering.
+                    // Pinned by
+                    // `a_reopen_cancel_still_emits_cancelled_even_if_persisting_editing_fails`
+                    // via `fail_next_draft_persist_for_tests`.
+                    let _ = self
+                        .events
+                        .send(VfsEvent::UploadCancelled { remote_path: attr.remote_path.clone() });
                     drafts.set_state(&attr.remote_path, DraftState::Editing)?;
                 }
             }
@@ -690,6 +766,18 @@ impl Vfs {
         self.drafts.lock().await.set_state(remote_path, state)
     }
 
+    /// Test-only: makes the very next `DraftStore::set_state` call anywhere
+    /// (e.g. inside `open`'s reopen-cancel, or `close`'s arm) fail as if its
+    /// disk persist step failed, without touching disk. Pins the ordering
+    /// contract a reviewer caught: a caller must send any terminal
+    /// `VfsEvent` it already owes — because it made some OTHER commitment
+    /// irreversible first, like `WriteBackQueue::cancel` aborting a debounce
+    /// timer — BEFORE this kind of fallible call, never downstream of it.
+    /// See `DraftStore::fail_next_set_state_for_tests`'s doc.
+    pub async fn fail_next_draft_persist_for_tests(&self) {
+        self.drafts.lock().await.fail_next_set_state_for_tests();
+    }
+
     /// Begins a brand new file: a local-only tree entry (visible to
     /// `readdir`/`lookup` immediately, before any upload) plus an `Empty`
     /// draft, and a handle already open on it ready for `write`.
@@ -851,7 +939,20 @@ impl Vfs {
             let mut drafts = self.drafts.lock().await;
             match drafts.base_etag(&remote_path) {
                 Some(base_etag) => {
-                    self.write_queue.cancel(&remote_path);
+                    // Closes out this cycle's `UploadQueued` (see
+                    // `VfsEvent`'s state-machine doc) whenever there really
+                    // was a still-armed debounce timer to stop — a draft
+                    // still `Editing` (never closed, never queued) or one
+                    // already `Uploading` correctly emits nothing here: the
+                    // former was never queued at all, the latter's own
+                    // in-flight cycle settles on its own terms (see
+                    // `WriteBackQueue::process`'s "draft vanished mid-flight"
+                    // handling).
+                    if self.write_queue.cancel(&remote_path) {
+                        let _ = self
+                            .events
+                            .send(VfsEvent::UploadCancelled { remote_path: remote_path.clone() });
+                    }
                     drafts.remove(&remote_path)?;
                     Some(base_etag)
                 }

@@ -123,6 +123,75 @@ async fn a_deleted_directory_takes_its_whole_subtree_with_it() {
     );
 }
 
+/// Phase-4 obligation carried from phase 2: `invalidate_path` called with a
+/// DIRECTORY's own path (not just a child's path, or the parent's path)
+/// must clear THAT directory's cached listing too. Before this fix, only
+/// the parent's `listed_at` entry for the directory was touched — the
+/// directory's own `children`/`listed_at` survived, so a readdir of the
+/// directory itself within `LISTING_TTL` kept serving the stale list.
+#[tokio::test]
+async fn invalidating_a_directory_path_clears_its_own_cached_listing() {
+    let env = VfsTestEnv::new().await;
+    env.set_remote_files(vec![remote_dir("photos")]).await;
+    let tree = VfsTree::new(env.client(), common::REMOTE_BASE.into());
+    let (photos_id, _) = tree.lookup(tree.root(), "photos").await.unwrap().unwrap();
+
+    env.set_remote_files_at("photos", vec![remote_file("cat.jpg", 4096, "e1")]).await;
+    let listing = tree.readdir(photos_id).await.unwrap();
+    assert_eq!(listing.len(), 1, "one child listed initially");
+
+    // The server now has two children, but the cached listing is still
+    // within LISTING_TTL — pinned baseline: this half must pass TODAY.
+    env.set_remote_files_at(
+        "photos",
+        vec![remote_file("cat.jpg", 4096, "e1"), remote_file("dog.jpg", 2048, "e2")],
+    )
+    .await;
+    let still_stale = tree.readdir(photos_id).await.unwrap();
+    assert_eq!(
+        still_stale.len(),
+        1,
+        "pinned baseline: a listing still fresh within LISTING_TTL must not be refetched"
+    );
+
+    tree.invalidate_path(&common::uri_of("photos")).await;
+
+    // No TTL wait: `invalidate_path` on the directory's OWN path must force
+    // the very next readdir to refetch immediately.
+    let refreshed = tree.readdir(photos_id).await.unwrap();
+    assert_eq!(
+        refreshed.len(),
+        2,
+        "invalidate_path on a directory's own path must clear its own cached \
+         listing, not just the parent's entry for it"
+    );
+}
+
+/// Same obligation, at the tree's root: the root has no parent for
+/// `invalidate_path`'s existing parent-entry logic to find, so its own
+/// listing must still be forgotten by the directory-self-path handling
+/// alone.
+#[tokio::test]
+async fn invalidating_the_root_path_clears_its_own_cached_listing() {
+    let env = VfsTestEnv::new().await;
+    env.set_remote_files(vec![remote_file("a.txt", 1, "e1")]).await;
+    let tree = VfsTree::new(env.client(), common::REMOTE_BASE.into());
+    tree.readdir(tree.root()).await.unwrap();
+
+    env.set_remote_files(vec![remote_file("a.txt", 1, "e1"), remote_file("b.txt", 2, "e2")]).await;
+    let still_stale = tree.readdir(tree.root()).await.unwrap();
+    assert_eq!(still_stale.len(), 1, "pinned baseline: fresh-within-TTL, not refetched");
+
+    tree.invalidate_path(common::REMOTE_BASE).await;
+
+    let refreshed = tree.readdir(tree.root()).await.unwrap();
+    assert_eq!(
+        refreshed.len(),
+        2,
+        "invalidating the root's own path must also force its listing to refetch"
+    );
+}
+
 /// `invalidate_path` on a deleted entry's own path must remove it
 /// immediately, without waiting for the parent's next re-list.
 #[tokio::test]

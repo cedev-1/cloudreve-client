@@ -268,12 +268,48 @@ impl VfsTree {
     /// Forget the cached listing containing this remote path (and the
     /// entry's attributes), so the next readdir/lookup refetches. Called by
     /// the SSE hookup in phase 4 and after writes in phase 2.
+    ///
+    /// Phase-4 obligation (carried from phase 2): when `remote_path` itself
+    /// names an already-known DIRECTORY — not just one of its children, or
+    /// its parent — that directory's OWN cached listing is cleared too (see
+    /// the first block below). Before this existed, only the PARENT's
+    /// `listed_at` entry for the directory was ever touched here; the
+    /// directory's own `children`/`listed_at` survived untouched, so a
+    /// direct readdir of that same directory within [`LISTING_TTL`] kept
+    /// serving the stale list — `ensure_listed`'s freshness check saw
+    /// `children` present and `listed_at` still fresh and returned
+    /// immediately, never even reaching the point where the (harmlessly
+    /// dropped) attrs entry would have mattered.
     pub async fn invalidate_path(&self, remote_path: &str) {
+        let mut inner = self.inner.write().await;
+
+        // The directory named by `remote_path` itself, if any is known:
+        // forget its own listing outright, exactly like `LISTING_TTL`
+        // expiring early. Deliberately does NOT remove the directory's own
+        // `NodeAttr` (unlike the file case at the bottom of this function):
+        // `ensure_listed` needs `attrs.get(&dir).remote_path` to know what
+        // to re-list, so the node must stay resolvable by its `NodeId`.
+        // A directory that was actually deleted/renamed away, rather than
+        // merely having its OWN contents change, is still cleaned up in
+        // full (attrs included) the ordinary way: this call also forces the
+        // PARENT to re-list (see the next block), and that re-list's
+        // ghost-pruning (`ensure_listed`'s `old_children` diff) removes the
+        // whole subtree once it actually runs. This also covers invalidating
+        // the tree's own root path: the root has no parent for the next
+        // block to find, but its own listing must still be forgotten.
+        let self_dir_id = inner
+            .attrs
+            .iter()
+            .find(|(_, attr)| attr.is_dir && attr.remote_path == remote_path)
+            .map(|(id, _)| *id);
+        if let Some(dir_id) = self_dir_id {
+            inner.children.remove(&dir_id);
+            inner.listed_at.remove(&dir_id);
+        }
+
         let Some((parent_path, _name)) = remote_path.rsplit_once('/') else {
             return;
         };
-
-        let mut inner = self.inner.write().await;
 
         // The directory that listed this entry: only its `listed_at` stamp
         // is dropped, not `children` itself. Clearing `listed_at` alone
@@ -294,14 +330,21 @@ impl VfsTree {
 
         // The entry's own attributes, if already known: drop them too, so a
         // direct getattr can't serve a stale copy before the parent is
-        // relisted (getattr never triggers a listing on its own).
-        if let Some(entry_id) = inner
-            .attrs
-            .iter()
-            .find(|(_, attr)| attr.remote_path == remote_path)
-            .map(|(id, _)| *id)
-        {
-            inner.attrs.remove(&entry_id);
+        // relisted (getattr never triggers a listing on its own). Skipped
+        // when `remote_path` was itself the directory handled above: that
+        // node's own `NodeAttr` must survive (see that block's doc) — this
+        // branch exists for files (and any other case the block above did
+        // not already handle), whose immediate removal here is exactly what
+        // `invalidating_a_deleted_files_own_path_removes_it` pins.
+        if self_dir_id.is_none() {
+            if let Some(entry_id) = inner
+                .attrs
+                .iter()
+                .find(|(_, attr)| attr.remote_path == remote_path)
+                .map(|(id, _)| *id)
+            {
+                inner.attrs.remove(&entry_id);
+            }
         }
     }
 

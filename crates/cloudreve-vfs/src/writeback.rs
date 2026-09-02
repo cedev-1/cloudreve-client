@@ -99,6 +99,16 @@ pub struct DraftStore {
     /// from a path is cheap and keeps this in lockstep with `BlockCache`'s
     /// equivalent map in `cache.rs`.
     entries: HashMap<String, Entry>,
+    /// Test-only fault injection: when `true`, the NEXT `set_state` call
+    /// fails (consuming this flag) instead of persisting, without touching
+    /// disk. Not `#[cfg(test)]` — see `WriteBackQueue::debounce`'s field doc
+    /// for why (integration tests under `tests/` link this crate without
+    /// `cfg(test)`). Exists to pin a real reviewer-caught ordering bug: a
+    /// caller sending a terminal `VfsEvent` only after a fallible
+    /// `set_state` call must not let that event get silently swallowed by
+    /// this kind of disk fault — see `set_state`'s own doc and
+    /// `fail_next_set_state_for_tests`.
+    fail_next_set_state: bool,
 }
 
 impl DraftStore {
@@ -167,7 +177,7 @@ impl DraftStore {
             entries.insert(hash, entry);
         }
 
-        Ok(Self { root: root.to_path_buf(), entries })
+        Ok(Self { root: root.to_path_buf(), entries, fail_next_set_state: false })
     }
 
     /// Starts (or restarts) a draft for `remote_path`. Overwrites any
@@ -326,9 +336,33 @@ impl DraftStore {
             .entries
             .get_mut(&hash)
             .ok_or_else(|| anyhow::anyhow!("no draft open for {remote_path}"))?;
+        // Mutated in memory BEFORE the fallible persist below, deliberately:
+        // a caller relying on this method to reflect a state change it has
+        // already otherwise committed to (e.g. `Vfs::open`'s reopen-cancel,
+        // which only calls this after `WriteBackQueue::cancel` has
+        // irreversibly `abort()`ed the debounce timer) sees that commitment
+        // survive in memory even if the disk write below fails — only the
+        // persisted copy is at risk, never the running process's own view.
         entry.state = s;
+        if self.fail_next_set_state {
+            self.fail_next_set_state = false;
+            anyhow::bail!(
+                "test hook: injected set_state persistence failure for {remote_path} \
+                 (see fail_next_set_state_for_tests)"
+            );
+        }
         write_meta(&self.root, &hash, entry)?;
         Ok(())
+    }
+
+    /// Test-only: makes the very next `set_state` call fail as if its disk
+    /// persist step failed, without touching disk at all. See
+    /// `fail_next_set_state`'s field doc for why this exists and what it
+    /// pins — a caller must never let a terminal event it owes (because it
+    /// already made some OTHER commitment irreversible, like aborting a
+    /// timer) sit downstream of this fallible call.
+    pub fn fail_next_set_state_for_tests(&mut self) {
+        self.fail_next_set_state = true;
     }
 
     pub fn base_etag(&self, remote_path: &str) -> Option<String> {
@@ -694,6 +728,14 @@ impl WriteBackQueue {
     ///     full app restart.
     pub fn migrate_armed_timer(&self, old_path: &str, new_path: String) {
         if self.cancel(old_path) {
+            // Closes out the OLD path's cycle (see `VfsEvent`'s
+            // state-machine doc): the timer really was still armed, so it
+            // migrates rather than vanishing — `arm` below immediately opens
+            // a fresh cycle under `new_path` with its own `UploadQueued`.
+            let _ = self.events.send(crate::vfs::VfsEvent::UploadRenamed {
+                from: old_path.to_string(),
+                to: new_path.clone(),
+            });
             self.arm(new_path);
         }
     }

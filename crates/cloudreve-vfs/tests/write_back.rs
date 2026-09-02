@@ -1223,3 +1223,203 @@ async fn a_fresh_open_after_upload_serves_the_uploaded_content_not_stale_blocks(
          serve the pre-upload blocks still cached under the unchanged etag"
     );
 }
+
+// ---------------------------------------------------------------------
+// Phase-4 obligation (carried from phase 2): the VfsEvent channel must be
+// reconstruction-complete — every UploadQueued eventually gets exactly one
+// terminal counterpart. These three tests pin the three sites that
+// previously had none: a reopen cancelling the still-armed timer, an
+// unlink dropping a queued draft, and a rename migrating one.
+// ---------------------------------------------------------------------
+
+/// Reopening a file for write before its debounce timer fires cancels that
+/// upload cycle outright: `UploadCancelled` closes it out. The second
+/// close/save starts a genuinely NEW cycle — a fresh `UploadQueued`,
+/// eventually `UploadSucceeded` — and only one upload session is ever
+/// created (the cancelled cycle never uploaded anything).
+#[tokio::test]
+async fn reopening_before_the_debounce_fires_emits_cancelled_then_a_new_cycle() {
+    let env = VfsTestEnv::new().await;
+    env.expect_uploads().await;
+    env.set_remote_files(vec![remote_file("cancel-me.txt", 5, "e1")]).await;
+    env.serve_file_content("cancel-me.txt", b"abcde").await;
+
+    let (vfs, mut rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+    vfs.set_debounce_for_tests(Duration::from_millis(300));
+
+    let node = vfs.tree().lookup(vfs.tree().root(), "cancel-me.txt").await.unwrap().unwrap().0;
+
+    let h1 = vfs.open(node).await.unwrap();
+    vfs.truncate(h1, 0).await.unwrap();
+    vfs.write(h1, 0, b"first save").await.unwrap();
+    vfs.close(h1).await.unwrap(); // Pending, debounce armed.
+
+    // Reopen well within the debounce window: this must cancel the armed
+    // timer outright, not merely let it fire and upload stale bytes.
+    let h2 = vfs.open(node).await.unwrap();
+    let second_save = b"second save".to_vec();
+    vfs.write(h2, 0, &second_save).await.unwrap();
+    vfs.close(h2).await.unwrap(); // Pending again, a fresh debounce armed.
+
+    vfs.wait_for_writeback_idle().await;
+
+    let events = collect_events(&mut rx, 4).await;
+    match &events[..] {
+        [VfsEvent::UploadQueued { remote_path: q1 }, VfsEvent::UploadCancelled { remote_path: c1 }, VfsEvent::UploadQueued { remote_path: q2 }, VfsEvent::UploadSucceeded { remote_path: s1, .. }] =>
+        {
+            assert!(q1.ends_with("cancel-me.txt"));
+            assert!(c1.ends_with("cancel-me.txt"));
+            assert!(q2.ends_with("cancel-me.txt"));
+            assert!(s1.ends_with("cancel-me.txt"));
+        }
+        other => panic!("expected [Queued, Cancelled, Queued, Succeeded] in order, got {other:?}"),
+    }
+    assert_eq!(env.upload_session_count(), 1, "only one upload session should ever be created");
+    assert_eq!(env.uploaded_content("cancel-me.txt"), Some(second_save));
+}
+
+/// Unlinking a file whose save is still debounced (queued but not yet
+/// uploaded) cancels that cycle instead of letting it upload into the void:
+/// `UploadCancelled` closes it out, and nothing is ever uploaded.
+#[tokio::test]
+async fn unlinking_a_queued_draft_before_upload_emits_cancelled_and_uploads_nothing() {
+    let env = VfsTestEnv::new().await;
+    env.expect_uploads().await;
+    env.expect_namespace_ops().await;
+    env.set_remote_files(vec![remote_file("doomed.txt", 5, "e1")]).await;
+    env.serve_file_content("doomed.txt", b"abcde").await;
+
+    let (vfs, mut rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+    vfs.set_debounce_for_tests(Duration::from_millis(300));
+
+    let root = vfs.tree().root();
+    let node = vfs.tree().lookup(root, "doomed.txt").await.unwrap().unwrap().0;
+
+    let h = vfs.open(node).await.unwrap();
+    vfs.write(h, 0, b"about to be deleted").await.unwrap();
+    vfs.close(h).await.unwrap(); // Pending, debounce armed.
+
+    vfs.unlink(root, "doomed.txt").await.expect("unlink should succeed before the debounce fires");
+
+    let events = collect_events(&mut rx, 2).await;
+    match &events[..] {
+        [VfsEvent::UploadQueued { remote_path: q }, VfsEvent::UploadCancelled { remote_path: c }] => {
+            assert!(q.ends_with("doomed.txt"));
+            assert!(c.ends_with("doomed.txt"));
+        }
+        other => panic!("expected [Queued, Cancelled], got {other:?}"),
+    }
+
+    vfs.wait_for_writeback_idle().await;
+    assert_eq!(env.upload_session_count(), 0, "an unlinked queued draft must never be uploaded");
+}
+
+/// Renaming a file whose save is still debounced migrates that cycle to the
+/// new path instead of silently vanishing (see
+/// `WriteBackQueue::migrate_armed_timer`'s doc): `UploadRenamed{from, to}`
+/// closes out the OLD cycle, a fresh `UploadQueued` opens a new one under
+/// `to`, and the eventual success carries the NEW path.
+#[tokio::test]
+async fn renaming_a_queued_draft_before_upload_emits_renamed_and_uploads_under_the_new_path() {
+    let env = VfsTestEnv::new().await;
+    env.expect_uploads().await;
+    env.expect_namespace_ops().await;
+    env.set_remote_files(vec![remote_file("old-name.txt", 5, "e1")]).await;
+    env.serve_file_content("old-name.txt", b"abcde").await;
+
+    let (vfs, mut rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+    vfs.set_debounce_for_tests(Duration::from_millis(300));
+
+    let root = vfs.tree().root();
+    let node = vfs.tree().lookup(root, "old-name.txt").await.unwrap().unwrap().0;
+
+    let h = vfs.open(node).await.unwrap();
+    let saved = b"renamed before upload".to_vec();
+    vfs.write(h, 0, &saved).await.unwrap();
+    vfs.close(h).await.unwrap(); // Pending, debounce armed under the OLD path.
+
+    vfs.rename(root, "old-name.txt", root, "new-name.txt")
+        .await
+        .expect("rename should succeed before the debounce fires");
+
+    let events = collect_events(&mut rx, 3).await;
+    match &events[..] {
+        [VfsEvent::UploadQueued { remote_path: q }, VfsEvent::UploadRenamed { from, to }, VfsEvent::UploadQueued { remote_path: q2 }] =>
+        {
+            assert!(q.ends_with("old-name.txt"));
+            assert!(from.ends_with("old-name.txt"));
+            assert!(to.ends_with("new-name.txt"));
+            assert!(q2.ends_with("new-name.txt"));
+        }
+        other => panic!("expected [Queued, Renamed, Queued] in order, got {other:?}"),
+    }
+
+    vfs.wait_for_writeback_idle().await;
+
+    let succeeded = expect_event(&mut rx, |e| matches!(e, VfsEvent::UploadSucceeded { .. })).await;
+    assert!(
+        matches!(&succeeded, VfsEvent::UploadSucceeded { remote_path, .. } if remote_path.ends_with("new-name.txt")),
+        "the eventual success must carry the NEW path, got: {succeeded:?}"
+    );
+    assert_eq!(env.uploaded_content("new-name.txt"), Some(saved));
+    assert_eq!(env.uploaded_content("old-name.txt"), None);
+}
+
+// ---------------------------------------------------------------------
+// Fix round 1 (reviewer finding): `Vfs::open`'s reopen-cancel path used to
+// send `UploadCancelled` only AFTER a fallible `DraftStore::set_state`
+// persist call, guarded by `?` — an IO fault at that exact instant would
+// make `open()` return early with the terminal event silently swallowed,
+// even though `WriteBackQueue::cancel`'s `abort()` just above it had
+// already irreversibly committed to the cancellation (nothing will ever
+// fire for that cycle through the normal timer path again). The fix sends
+// the event immediately once `cancel()` reports `true`, before the fallible
+// persist call — mirroring `Vfs::unlink`'s already-correct ordering.
+// ---------------------------------------------------------------------
+
+/// The terminal event must fire even when the disk persist that follows the
+/// (already-irreversible) timer cancellation fails. Pins the fix via
+/// `Vfs::fail_next_draft_persist_for_tests`, a fault-injection hook on
+/// `DraftStore::set_state` — not a scheduling race, so this is fully
+/// deterministic.
+#[tokio::test]
+async fn a_reopen_cancel_still_emits_cancelled_even_if_persisting_editing_fails() {
+    let env = VfsTestEnv::new().await;
+    env.expect_uploads().await;
+    env.set_remote_files(vec![remote_file("flaky-persist.txt", 5, "e1")]).await;
+    env.serve_file_content("flaky-persist.txt", b"abcde").await;
+
+    let (vfs, mut rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+    vfs.set_debounce_for_tests(Duration::from_millis(300));
+
+    let node = vfs.tree().lookup(vfs.tree().root(), "flaky-persist.txt").await.unwrap().unwrap().0;
+    let h1 = vfs.open(node).await.unwrap();
+    vfs.write(h1, 0, b"queued").await.unwrap();
+    vfs.close(h1).await.unwrap(); // Pending, debounce armed.
+
+    // Simulate a disk fault on exactly the persistence step that follows
+    // the timer cancel inside `open`'s reopen-cancel block.
+    vfs.fail_next_draft_persist_for_tests().await;
+
+    let reopen = vfs.open(node).await;
+    assert!(
+        reopen.is_err(),
+        "the injected persistence failure must still surface as an error to the caller"
+    );
+
+    // The terminal event must have fired regardless — the timer's abort()
+    // is the commitment point, not the disk write that follows it.
+    let event = expect_event(&mut rx, |e| matches!(e, VfsEvent::UploadCancelled { .. })).await;
+    assert!(
+        matches!(&event, VfsEvent::UploadCancelled { remote_path } if remote_path.ends_with("flaky-persist.txt")),
+        "unexpected event: {event:?}"
+    );
+}
