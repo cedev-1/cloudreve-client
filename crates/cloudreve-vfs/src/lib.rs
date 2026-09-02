@@ -6,11 +6,15 @@
 
 pub mod cache;
 pub mod frontend_util;
-// macOS-only for now (Task 3): `mount.rs` shells out to `mount_nfs`/`umount`/
-// `diskutil`, all macOS-specific. Task 4 adds the Linux/FUSE branch into the
-// SAME file and will need to relax this gate (declare unconditionally, or
-// per-OS) — see `mount.rs`'s module doc.
-#[cfg(target_os = "macos")]
+// Linux-only (Task 4): implements `fuser::Filesystem` over the facade,
+// mounted by `mount.rs`'s `linux_impl` branch. Never compiled on this
+// (macOS) development machine — see `fuse.rs`'s module doc.
+#[cfg(target_os = "linux")]
+pub mod fuse;
+// Declared unconditionally as of Task 4: `mount.rs` now cfg-gates its two
+// platform branches PER ITEM internally (macOS's `mount_nfs`/`umount`/
+// `diskutil` shell-outs vs. Linux's `fuser` mount) rather than gating the
+// whole module — see its own doc.
 pub mod mount;
 pub mod nfs;
 pub mod tree;
