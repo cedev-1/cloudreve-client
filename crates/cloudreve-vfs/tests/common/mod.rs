@@ -64,6 +64,14 @@ type FileUrlCalls = Arc<Mutex<HashMap<String, u32>>>;
 /// "the refreshed url" apart even though both are served by the same mock.
 type DownloadHitsByVersion = Arc<Mutex<HashMap<(String, u32), u32>>>;
 type DownloadDelays = Arc<Mutex<HashMap<String, Duration>>>;
+/// Full remote uris a successful `overwrite=false` (or otherwise confirmed
+/// to exist) upload session has ever been created for — lets the session-
+/// creation mock simulate the real server's `ObjectExisted` (40004) refusal
+/// when a SECOND `overwrite=false` session targets the same uri (see
+/// `expect_uploads`'s doc). Deliberately separate from `files`/`FilesState`:
+/// this only needs to answer "has an upload session for this exact uri ever
+/// succeeded", not model a whole directory listing.
+type ExistingUploadUris = Arc<Mutex<std::collections::HashSet<String>>>;
 
 pub struct VfsTestEnv {
     pub server: MockServer,
@@ -77,6 +85,7 @@ pub struct VfsTestEnv {
     list_requests: Arc<AtomicUsize>,
     upload_chunks: UploadChunksStore,
     latest_session_for_name: LatestSessionForName,
+    existing_upload_uris: ExistingUploadUris,
     upload_session_count: Arc<AtomicUsize>,
     upload_session_failures_remaining: Arc<AtomicUsize>,
     file_url_calls: FileUrlCalls,
@@ -137,6 +146,8 @@ impl VfsTestEnv {
         let list_requests = Arc::new(AtomicUsize::new(0));
         let upload_chunks: UploadChunksStore = Arc::new(Mutex::new(HashMap::new()));
         let latest_session_for_name: LatestSessionForName = Arc::new(Mutex::new(HashMap::new()));
+        let existing_upload_uris: ExistingUploadUris =
+            Arc::new(Mutex::new(std::collections::HashSet::new()));
         let upload_session_count = Arc::new(AtomicUsize::new(0));
         let upload_session_failures_remaining = Arc::new(AtomicUsize::new(0));
         let file_url_calls: FileUrlCalls = Arc::new(Mutex::new(HashMap::new()));
@@ -349,6 +360,7 @@ impl VfsTestEnv {
             list_requests,
             upload_chunks,
             latest_session_for_name,
+            existing_upload_uris,
             upload_session_count,
             upload_session_failures_remaining,
             file_url_calls,
@@ -568,6 +580,8 @@ impl VfsTestEnv {
         {
             let upload_chunks = self.upload_chunks.clone();
             let latest_session_for_name = self.latest_session_for_name.clone();
+            let existing_upload_uris = self.existing_upload_uris.clone();
+            let files = self.files.clone();
             let upload_session_count = self.upload_session_count.clone();
             let failures_remaining = self.upload_session_failures_remaining.clone();
             let session_expected_chunks = self.session_expected_chunks.clone();
@@ -595,6 +609,25 @@ impl VfsTestEnv {
 
                     let request: UploadSessionRequest =
                         req.body_json().expect("decode UploadSessionRequest body");
+
+                    // Real Cloudreve behavior this mock must mirror for
+                    // cycle B (phase-2 debt burn-down) to be testable at
+                    // all: `overwrite=false` (no `entity_type`) against a
+                    // uri that already exists — either a file registered up
+                    // front (`set_remote_files`/`add_remote_file`) or one an
+                    // earlier session already created here — is refused
+                    // with Cloudreve's own `ObjectExisted` code (40004), not
+                    // silently accepted. No session is registered for a
+                    // refused request.
+                    let already_exists = path_exists_in_files(&files.lock().unwrap(), &request.uri)
+                        || existing_upload_uris.lock().unwrap().contains(&request.uri);
+                    if request.entity_type.is_none() && already_exists {
+                        return ResponseTemplate::new(200).set_body_json(json!({
+                            "code": 40004,
+                            "msg": "mock: object already exists (overwrite=false)",
+                        }));
+                    }
+
                     let name = request
                         .uri
                         .rsplit('/')
@@ -611,6 +644,7 @@ impl VfsTestEnv {
                         .lock()
                         .unwrap()
                         .insert(name, session_id.clone());
+                    existing_upload_uris.lock().unwrap().insert(request.uri.clone());
 
                     // A session is "in flight" from creation until its last
                     // expected chunk arrives (see the chunk-upload mock
@@ -1006,6 +1040,16 @@ impl VfsTestEnv {
             assert!(now < deadline, "downloads never settled (still arriving after 5s)");
         }
     }
+}
+
+/// Whether any directory listing registered so far already holds an entry
+/// at exactly `target_path` — the read-only counterpart of
+/// `remove_entry_by_path`, used by the upload-session mock's `ObjectExisted`
+/// simulation (see `expect_uploads`'s doc).
+fn path_exists_in_files(files: &HashMap<String, Vec<Value>>, target_path: &str) -> bool {
+    files
+        .values()
+        .any(|list| list.iter().any(|f| f.get("path").and_then(Value::as_str) == Some(target_path)))
 }
 
 /// Removes and returns the first entry whose `path` field equals

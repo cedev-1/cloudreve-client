@@ -836,21 +836,42 @@ impl WriteBackQueue {
         let uploader =
             Uploader::new(self.client.clone(), Arc::new(NoSessionStore), UploaderConfig::default());
 
-        let mut last_err = None;
-        for attempt in 0..UPLOAD_RETRIES {
-            match uploader.upload(params.clone(), NoOpProgress).await {
-                Ok(()) => {
-                    last_err = None;
-                    break;
-                }
-                Err(err) => {
-                    last_err = Some(err);
-                    if attempt + 1 < UPLOAD_RETRIES {
-                        tokio::time::sleep(backoff[attempt as usize]).await;
+        // Cycle B (phase-2 debt burn-down): a conflict copy always uploads
+        // with `overwrite=false` (it's assumed to be brand new), so if a
+        // SECOND conflicting edit lands on the SAME file on the SAME day,
+        // its deterministic name collides with the first copy's — the
+        // server refuses with `ObjectExisted`. Only a conflict-copy upload
+        // gets the uniqueness search below; a plain (non-conflict) upload's
+        // `ObjectExisted` (which would mean something else is racing this
+        // exact path) is left to the ordinary transient-failure retry loop
+        // beneath it, unchanged.
+        let (last_err, final_uri) = if conflict_copy.is_some() {
+            let (uri, err) =
+                upload_conflict_copy(&uploader, params, upload_uri.clone(), backoff).await;
+            (err, uri)
+        } else {
+            let mut last_err = None;
+            for attempt in 0..UPLOAD_RETRIES {
+                match uploader.upload(params.clone(), NoOpProgress).await {
+                    Ok(()) => {
+                        last_err = None;
+                        break;
+                    }
+                    Err(err) => {
+                        last_err = Some(err);
+                        if attempt + 1 < UPLOAD_RETRIES {
+                            tokio::time::sleep(backoff[attempt as usize]).await;
+                        }
                     }
                 }
             }
-        }
+            (last_err, upload_uri.clone())
+        };
+        // The conflict copy may have been retargeted to a uniqueness-
+        // suffixed name above — the rest of this function (events, tree
+        // invalidation) must refer to wherever it actually landed, not the
+        // deterministic name first guessed.
+        let conflict_copy = conflict_copy.map(|_| final_uri);
 
         match last_err {
             None => match conflict_copy {
@@ -987,21 +1008,128 @@ impl WriteBackQueue {
     }
 }
 
+/// Splits a leaf filename into `(stem, ".ext")` — `ext` includes the leading
+/// dot and is empty for an extension-less name (or one that's ALL
+/// extension, e.g. `.gitignore`, treated as having no stem-visible
+/// extension). Shared by `conflict_copy_path` and `append_uniqueness_suffix`
+/// so both insert their text in front of the extension the same way.
+fn split_stem_ext(filename: &str) -> (&str, String) {
+    match filename.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s, format!(".{e}")),
+        _ => (filename, String::new()),
+    }
+}
+
 /// D5/D-const conflict-copy name: `"{stem} (conflict {YYYY-MM-DD}){.ext}"`,
 /// applied to the leaf of `remote_path` only — the directory is unchanged.
 fn conflict_copy_path(remote_path: &str) -> String {
     let (dir, filename) = remote_path.rsplit_once('/').unwrap_or(("", remote_path));
     let date = chrono::Utc::now().format("%Y-%m-%d");
-    let (stem, ext) = match filename.rsplit_once('.') {
-        Some((s, e)) if !s.is_empty() => (s, format!(".{e}")),
-        _ => (filename, String::new()),
-    };
+    let (stem, ext) = split_stem_ext(filename);
     let conflict_name = format!("{stem} (conflict {date}){ext}");
     if dir.is_empty() {
         conflict_name
     } else {
         format!("{dir}/{conflict_name}")
     }
+}
+
+/// Appends a uniqueness suffix (` 2`, ` 3`, …) before `path`'s extension —
+/// cycle B's answer to a SECOND same-day conflict colliding with the first
+/// one's deterministic `conflict_copy_path` name. `n` is the 1-based
+/// occurrence number (`n == 2` produces the first disambiguated name, since
+/// the bare `conflict_copy_path` result is implicitly occurrence 1).
+fn append_uniqueness_suffix(path: &str, n: u32) -> String {
+    let (dir, filename) = path.rsplit_once('/').unwrap_or(("", path));
+    let (stem, ext) = split_stem_ext(filename);
+    let named = format!("{stem} {n}{ext}");
+    if dir.is_empty() {
+        named
+    } else {
+        format!("{dir}/{named}")
+    }
+}
+
+/// Total candidate names tried (the deterministic one plus this many
+/// suffixed alternates) before `upload_conflict_copy` gives up. Past this,
+/// something is very wrong — a bug causing the search to never converge, or
+/// genuinely 100+ conflicting edits landing on the same file in one day —
+/// and refusing outright beats looping forever or (worse) falling back to
+/// silently overwriting a name this draft never actually touched.
+const MAX_CONFLICT_NAME_ATTEMPTS: u32 = 100;
+
+/// Whether `err`'s cause chain is Cloudreve's `ObjectExisted` (40004) API
+/// error — the server's answer to an `overwrite=false` upload targeting a
+/// uri that already exists. Same detection idiom as
+/// `cloudreve-sync`'s upload task for the identical code.
+fn is_object_existed_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<cloudreve_api::error::ApiError>(),
+            Some(cloudreve_api::error::ApiError::ApiError { code, .. })
+                if *code == cloudreve_api::error::ErrorCode::ObjectExisted as i32
+        )
+    })
+}
+
+/// Uploads a conflict copy, searching for a free name if the deterministic
+/// same-day name (`base_uri`, already reflected in `params.remote_uri`) is
+/// already taken by an EARLIER conflict copy uploaded today. Returns the uri
+/// the upload actually landed under (== `base_uri` unless a retarget
+/// happened) and, on failure, the last error encountered.
+///
+/// REACTIVE (retry-on-`ObjectExisted`) rather than a proactive listing probe
+/// on purpose: a probe-then-upload has its own TOCTOU window — another
+/// writer (or another device syncing the same drive) could still land the
+/// same name in the gap between the probe and this upload — while reacting
+/// to the server's own authoritative "no, that name is taken" is atomic by
+/// construction. It also reuses the exact error classification
+/// `cloudreve-sync`'s upload task already relies on for the same code,
+/// rather than inventing a second, listing-based signal for what is really
+/// the same condition. A collision is NOT treated as a transient failure:
+/// retrying the same name would only reproduce it, so the transient-retry
+/// budget (`UPLOAD_RETRIES`/`backoff`) is spent per CANDIDATE NAME, not
+/// shared across the whole search.
+async fn upload_conflict_copy(
+    uploader: &Uploader,
+    mut params: UploadParams,
+    base_uri: String,
+    backoff: [Duration; 2],
+) -> (String, Option<anyhow::Error>) {
+    for n in 1..=MAX_CONFLICT_NAME_ATTEMPTS {
+        let candidate = if n == 1 { base_uri.clone() } else { append_uniqueness_suffix(&base_uri, n) };
+        params.remote_uri = candidate.clone();
+
+        let mut last_err = None;
+        for attempt in 0..UPLOAD_RETRIES {
+            match uploader.upload(params.clone(), NoOpProgress).await {
+                Ok(()) => return (candidate, None),
+                Err(err) => {
+                    let collided = is_object_existed_error(&err);
+                    last_err = Some(err);
+                    if collided {
+                        break; // not transient — try the next candidate name instead
+                    }
+                    if attempt + 1 < UPLOAD_RETRIES {
+                        tokio::time::sleep(backoff[attempt as usize]).await;
+                    }
+                }
+            }
+        }
+        let err = last_err.expect("the inner loop always records an error before falling through");
+        if !is_object_existed_error(&err) {
+            return (candidate, Some(err));
+        }
+        // else: this name is taken — loop around to the next suffix.
+    }
+    (
+        base_uri.clone(),
+        Some(anyhow::anyhow!(
+            "writeback: exhausted {MAX_CONFLICT_NAME_ATTEMPTS} conflict-name candidates for \
+             {base_uri} — refusing to keep searching indefinitely or silently overwrite an \
+             unrelated file"
+        )),
+    )
 }
 
 /// Directory name for a remote path: first 16 hex chars (8 bytes) of

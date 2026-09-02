@@ -166,6 +166,59 @@ async fn a_partial_write_keeps_the_untouched_bytes() {
     assert_eq!(&whole[suffix_start..], &original[suffix_start..], "suffix must survive");
 }
 
+/// Phase-2 debt burn-down (cycle C): `materialize`'s temp files live under
+/// `cache_dir/tmp/` and are only ever referenced within the single
+/// `materialize` call that created them (moved into the drafts store, or
+/// abandoned in place if that call never got that far — e.g. the process
+/// died mid-download). Nothing else in the crate ever opens a temp by name
+/// after its own call returns, so any file already sitting under `tmp/` when
+/// `Vfs::new` runs is unreachable leftover from an earlier, unclean
+/// shutdown — it must be swept before it can accumulate across restarts.
+/// The directory itself (not just its contents) must survive: `materialize`
+/// still needs it to exist for the very next temp file it creates.
+#[tokio::test]
+async fn leftover_materialization_temps_are_swept_at_startup() {
+    let env = VfsTestEnv::new().await;
+    let original: Vec<u8> = (0..=255u8).cycle().take(4096).collect();
+    env.set_remote_files(vec![remote_file("big.bin", original.len() as i64, "e1")]).await;
+    env.serve_file_content("big.bin", &original).await;
+
+    // Simulate a leftover from a materialize call a PREVIOUS, uncleanly
+    // terminated process never finished (or finished but never got to move
+    // into the drafts store).
+    let tmp_dir = env.cache_dir().join("tmp");
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let stray = tmp_dir.join("materialize-1");
+    std::fs::write(&stray, b"leftover from a crashed materialize call").unwrap();
+
+    let (vfs, _rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+
+    assert!(!stray.exists(), "a stray leftover temp must be swept at Vfs::new startup");
+    assert!(
+        tmp_dir.exists(),
+        "the tmp directory itself must survive the sweep — only its contents are removed"
+    );
+
+    // A fresh materialization (a partial in-place write, same as
+    // `a_partial_write_keeps_the_untouched_bytes`) must still work after the
+    // sweep — the swept directory is not just gone, but still usable.
+    let node = vfs.tree().lookup(vfs.tree().root(), "big.bin").await.unwrap().unwrap().0;
+    let h = vfs.open(node).await.unwrap();
+    let patch = b"PATCHED!!!".to_vec();
+    vfs.write(h, 100, &patch).await.unwrap();
+
+    let mut expected = original.clone();
+    expected[100..100 + patch.len()].copy_from_slice(&patch);
+    let back = vfs.read(h, 0, original.len() as u32).await.unwrap();
+    assert_eq!(
+        back.as_ref(),
+        &expected[..],
+        "materialization must still work correctly after the startup sweep"
+    );
+}
+
 /// A created file exists for the frontends before any upload happens.
 #[tokio::test]
 async fn a_created_file_is_visible_before_any_upload() {
@@ -501,6 +554,78 @@ async fn a_remote_change_since_the_draft_began_becomes_a_conflict_copy() {
         }
         other => panic!("unexpected event: {other:?}"),
     }
+}
+
+/// Phase-2 debt burn-down (cycle B): a SECOND conflicting edit landing on
+/// the SAME file on the SAME day must not collide with the first same-day
+/// conflict copy's deterministic name — without a uniqueness guard, both
+/// target `"shared (conflict {today}).txt"` with `overwrite=false`, and the
+/// second one is refused by the server (`ObjectExisted`) forever, since
+/// retrying just re-sends the exact same request. Both copies must land
+/// under DISTINCT names, and neither must clobber the other's content.
+#[tokio::test]
+async fn two_conflicts_on_the_same_day_get_distinct_names() {
+    let env = VfsTestEnv::new().await;
+    env.expect_uploads().await;
+    env.set_remote_files(vec![remote_file("shared.txt", 5, "e1")]).await;
+    env.serve_file_content("shared.txt", b"abcde").await;
+
+    let (vfs, _rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+    vfs.set_debounce_for_tests(Duration::from_millis(20));
+    // A name collision is not transient (retrying the SAME name would just
+    // collide again forever) and cycle B's fix must retarget immediately
+    // rather than sleeping through the transient-failure backoff — this
+    // keeps the test fast and, if a future regression made a collision
+    // consume the backoff instead, would make that regression visible as a
+    // slow test rather than silently passing slowly.
+    vfs.set_retry_backoff_for_tests([Duration::from_millis(5), Duration::from_millis(5)]);
+
+    let root = vfs.tree().root();
+    let node = vfs.tree().lookup(root, "shared.txt").await.unwrap().unwrap().0;
+
+    // First conflict: draft begins against etag "e1"; the remote moves to
+    // "e2" before it uploads.
+    let h1 = vfs.open(node).await.unwrap();
+    vfs.write(h1, 0, b"first conflicting edit").await.unwrap();
+    env.set_remote_etag("shared.txt", "e2").await;
+    vfs.close(h1).await.unwrap();
+    vfs.wait_for_writeback_idle().await;
+
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let first_conflict_name = format!("shared (conflict {today}).txt");
+    assert_eq!(
+        env.uploaded_content(&first_conflict_name),
+        Some(b"first conflicting edit".to_vec()),
+        "the first same-day conflict must land under the deterministic name"
+    );
+
+    // Second conflict, same original file, same day: draft begins against
+    // the now-current etag "e2"; the remote moves again to "e3" before it
+    // uploads. Without cycle B's fix, this targets the SAME deterministic
+    // name as the first conflict above. A fresh lookup is needed first: the
+    // first conflict's resolution invalidated "shared.txt"'s cached attrs
+    // (see `VfsTree::invalidate_path`), and `getattr` never re-lists on its
+    // own — exactly what a real frontend would do before a second open too.
+    let node = vfs.lookup(root, "shared.txt").await.unwrap().unwrap().0;
+    let h2 = vfs.open(node).await.unwrap();
+    vfs.write(h2, 0, b"second conflicting edit").await.unwrap();
+    env.set_remote_etag("shared.txt", "e3").await;
+    vfs.close(h2).await.unwrap();
+    vfs.wait_for_writeback_idle().await;
+
+    let second_conflict_name = format!("shared (conflict {today}) 2.txt");
+    assert_eq!(
+        env.uploaded_content(&second_conflict_name),
+        Some(b"second conflicting edit".to_vec()),
+        "the second same-day conflict must land under a DIFFERENT name"
+    );
+    assert_eq!(
+        env.uploaded_content(&first_conflict_name),
+        Some(b"first conflicting edit".to_vec()),
+        "the first conflict's copy must survive untouched by the second"
+    );
 }
 
 /// Every upload attempt fails (session creation itself errors): after

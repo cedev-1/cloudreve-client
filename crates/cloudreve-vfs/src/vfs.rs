@@ -151,6 +151,62 @@ impl std::fmt::Display for StaleHandleError {
 
 impl std::error::Error for StaleHandleError {}
 
+/// Returned by [`Vfs::rename`] when a handle is currently open on the entry
+/// being renamed (its source path, before the change). Phase 2 shipped this
+/// as documented UB instead of a guard — an `OpenFile`'s `key.remote_path`
+/// is fixed at `open`/`create` time and `rename` never touches it, so a
+/// handle that outlived a rename kept reading/writing under the OLD path
+/// while the tree believed the entry lived at the new one. This error
+/// replaces that hazard with an explicit EBUSY-class refusal: frontends
+/// (NFS/FUSE) map it to `EBUSY`, exactly like renaming a file still open
+/// under POSIX on a filesystem that enforces the same restriction. Closing
+/// every handle on the entry (or letting the frontend serialize instead of
+/// deny, if it prefers) and retrying succeeds. Detectable via
+/// `anyhow::Error::downcast_ref::<RenameBusyError>()`.
+#[derive(Debug, Clone)]
+pub struct RenameBusyError {
+    pub remote_path: String,
+}
+
+impl std::fmt::Display for RenameBusyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cannot rename {}: a handle is still open on it — close it first",
+            self.remote_path
+        )
+    }
+}
+
+impl std::error::Error for RenameBusyError {}
+
+/// Test-only rendezvous for pausing `create()` mid-body — see
+/// `Vfs::pause_create_before_registration_for_tests`. Exists because the
+/// window this is meant to test (`create` making a name visible before it
+/// finishes registering its own handle) has no `.await` inside it in
+/// production, so it is sub-microsecond and cannot be reliably raced by a
+/// plain concurrent-tasks test; this widens it to something deterministic.
+pub struct CreatePauseHook {
+    /// Notified once by `create` the instant it reaches the pause point —
+    /// lets a test know it is now safe to run whatever it wants to race
+    /// against the still-parked `create` call.
+    pub parked: tokio::sync::Notify,
+    /// Notified once by the test to let the parked `create` call continue.
+    pub resume: tokio::sync::Notify,
+}
+
+impl CreatePauseHook {
+    pub fn new() -> Self {
+        Self { parked: tokio::sync::Notify::new(), resume: tokio::sync::Notify::new() }
+    }
+}
+
+impl Default for CreatePauseHook {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct Vfs {
     /// `Arc`-wrapped (not owned outright) because the write-back queue's
     /// background tasks (Task 8) need a `'static` handle that outlives any
@@ -198,7 +254,44 @@ pub struct Vfs {
     /// instant it takes to get-or-insert one entry); entries are never
     /// removed, bounded by the number of distinct files ever drafted in
     /// this process — far too small to matter for a desktop sync client.
+    ///
+    /// LOCK ORDERING RULE (with `open_locks` below): `open_lock` before
+    /// `draft_begin_lock`, ALWAYS. `create` is the only call site that ever
+    /// holds both for the same path at once (see its body), and it
+    /// acquires `open_lock` first, `draft_begin_lock` nested inside it.
+    /// `open`/`rename` only ever touch `open_locks`; `write`/`truncate`
+    /// (via `ensure_drafted`) only ever touch `draft_begin_locks` — neither
+    /// pair nests the two locks in the opposite order, so this rule has
+    /// nothing to conflict with today. Keep it that way: introducing a
+    /// second call site that acquires `draft_begin_lock` first and
+    /// `open_lock` second would deadlock against `create`.
     draft_begin_locks: std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Per-path async locks making `open`'s handle registration,
+    /// `rename`'s open-handle guard, and `create`'s own handle registration
+    /// race-free with respect to each other (cycle A of the phase-2 debt
+    /// burn-down, plus its coordinator-review follow-up for `create`).
+    /// `open` takes the lock for its target path before doing anything else
+    /// and holds it through registering the new handle in `open_files`;
+    /// `rename` takes the SAME lock for its source path before checking
+    /// `open_files` and holds it through the whole rename; `create` takes
+    /// it for its prospective path before even checking EEXIST and holds it
+    /// through registering ITS new handle. That makes all three operations
+    /// strictly ordered for a given path: an `open`/`create` already in
+    /// flight always finishes (and is correctly seen as busy) before a
+    /// racing `rename`'s check runs, and an `open`/`create` arriving after
+    /// `rename` has taken the lock blocks until the rename fully commits —
+    /// there is no window in which a handle can slip into existence unseen
+    /// between the check and the actual rename, whether that handle belongs
+    /// to a pre-existing file (`open`) or a brand-new one still being
+    /// created (`create`). See `draft_begin_locks`'s doc above for the
+    /// ordering rule the two lock maps must keep with respect to each
+    /// other. Same non-removal/std-Mutex-only-for-the-instant-of-lookup
+    /// discipline as `draft_begin_locks`.
+    open_locks: std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Test-only pause point for `create` — see `CreatePauseHook`'s doc and
+    /// `pause_create_before_registration_for_tests`. `None` (the default)
+    /// means `create` never pauses, which is every non-test call.
+    create_pause_hook: std::sync::Mutex<Option<Arc<CreatePauseHook>>>,
     /// Sender half of the `VfsEvent` channel returned by `new`. A clone of
     /// this lives inside `write_queue`, which is the only thing that
     /// actually sends through it today; kept here too for any future
@@ -224,6 +317,43 @@ impl Vfs {
             BlockCache::open(&cache_dir.join("blocks"), cache_max_bytes)
                 .context("failed to open block cache")?,
         ));
+        // Cycle C (phase-2 debt burn-down): sweep any leftover contents of
+        // `materialize`'s temp directory. A temp file there is referenced
+        // ONLY within the single `materialize` call that created it — it's
+        // either moved into the drafts store before that call returns
+        // (`DraftStore::begin`'s `Materialized` case) or never referenced
+        // again at all. A file still sitting here at startup can therefore
+        // only be an orphan from an earlier, unclean shutdown (the process
+        // died mid-download, before the move), and — unlike a draft — it
+        // has no metadata identifying which write it belonged to, so
+        // there's nothing to resume; it's pure leftover. Swept unconditionally,
+        // before anything else opens a fallible root, so a leftover from a
+        // previous crash can never accumulate across restarts. Sweeps
+        // CONTENTS only, not the directory itself: `materialize` always
+        // `create_dir_all`s it again anyway, but a missing directory would
+        // make `tmp_dir.exists()` a surprising false right after `Vfs::new`
+        // for any caller inspecting the cache layout. Best-effort: a failure
+        // to remove one stray entry only leaves that entry behind — it must
+        // never fail the whole constructor over a leftover file this crate
+        // was already free to ignore.
+        if let Ok(entries) = std::fs::read_dir(cache_dir.join("tmp")) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let result = if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    std::fs::remove_dir_all(&path)
+                } else {
+                    std::fs::remove_file(&path)
+                };
+                if let Err(err) = result {
+                    tracing::warn!(
+                        path = %path.display(),
+                        %err,
+                        "vfs: failed to sweep a leftover materialization temp"
+                    );
+                }
+            }
+        }
+
         let drafts_store =
             DraftStore::open(&cache_dir.join("drafts")).context("failed to open draft store")?;
         // Task 9: every draft still `Pending` here survived an unclean
@@ -269,6 +399,8 @@ impl Vfs {
                 next_tmp: AtomicU64::new(1),
                 readahead_inflight: Arc::new(std::sync::Mutex::new(HashSet::new())),
                 draft_begin_locks: std::sync::Mutex::new(HashMap::new()),
+                open_locks: std::sync::Mutex::new(HashMap::new()),
+                create_pause_hook: std::sync::Mutex::new(None),
                 events: events_tx,
             },
             events_rx,
@@ -294,6 +426,17 @@ impl Vfs {
         if attr.is_dir {
             bail!("cannot open a directory as a file");
         }
+
+        // Held through the whole rest of this call, including registering
+        // the new handle at the very end: this is the other half of
+        // `rename`'s EBUSY guard (see `open_locks`'s field doc) — an open
+        // already in progress for this path always finishes (and becomes
+        // visible in `open_files`) before a racing `rename`'s busy-check can
+        // run, and an open arriving after `rename` took the lock waits for
+        // the rename to fully commit instead of registering against a path
+        // that's about to change out from under it.
+        let open_lock = self.open_lock_for(&attr.remote_path);
+        let _open_guard = open_lock.lock().await;
 
         let key = FileKey { remote_path: attr.remote_path.clone(), etag: attr.etag.clone() };
         self.cache.lock().await.retain(&key);
@@ -551,6 +694,19 @@ impl Vfs {
     /// keyed by the prospective remote path, computed up front from the
     /// parent's own attrs (cheap and synchronous — no listing involved) so
     /// it can be taken before any of the check-then-act section runs.
+    ///
+    /// Coordinator review (cycle A follow-up): the whole call is ALSO
+    /// wrapped in `open_lock_for(remote_path)` — the same lock `open` and
+    /// `rename` use for their own EBUSY guard (see `open_locks`'s field
+    /// doc). Without it, `insert_local_entry` below makes the new name
+    /// visible in the tree several `.await`s before this call finishes
+    /// registering its own handle in `open_files`; a `rename` of that SAME
+    /// not-yet-fully-created name landing in that window would see
+    /// `is_path_open == false` and complete, reproducing cycle A's exact
+    /// stale-handle bug for a name that didn't exist a moment ago instead
+    /// of one that already did. Taken FIRST, before `draft_begin_lock` — see
+    /// `draft_begin_locks`'s doc for the ordering rule the two lock maps
+    /// must keep.
     pub async fn create(&self, parent: NodeId, name: &str) -> Result<(NodeId, FileHandle)> {
         let parent_attr = self
             .tree
@@ -558,6 +714,9 @@ impl Vfs {
             .await?
             .context("create: unknown parent (readdir/lookup it first)")?;
         let remote_path = format!("{}/{name}", parent_attr.remote_path);
+
+        let open_lock = self.open_lock_for(&remote_path);
+        let _open_guard = open_lock.lock().await;
         let path_lock = self.draft_begin_lock_for(&remote_path);
         let _guard = path_lock.lock().await;
 
@@ -576,6 +735,14 @@ impl Vfs {
         // there is nothing on the server to conflict with.
         self.drafts.lock().await.begin(&attr.remote_path, "", DraftInit::Empty)?;
 
+        // Test-only pause point — see `CreatePauseHook`'s doc. A no-op
+        // (`create_pause_hook` is `None`) on every real call.
+        let pause_hook = self.create_pause_hook.lock().unwrap().clone();
+        if let Some(hook) = pause_hook {
+            hook.parked.notify_one();
+            hook.resume.notified().await;
+        }
+
         let key = FileKey { remote_path: attr.remote_path.clone(), etag: String::new() };
         self.cache.lock().await.retain(&key);
         // No remote counterpart exists yet, so there is nothing to fetch a
@@ -584,6 +751,16 @@ impl Vfs {
         let handle_id = self.next_handle.fetch_add(1, Ordering::SeqCst);
         self.open_files.write().await.insert(handle_id, open_file);
         Ok((node, FileHandle(handle_id)))
+    }
+
+    /// Test-only: makes every subsequent `create()` call pause mid-body —
+    /// after the new draft begins, before this call registers its own
+    /// handle in `open_files` — until the test notifies `hook.resume`. See
+    /// `CreatePauseHook`'s doc for why this exists instead of a plain
+    /// racing-tasks test. Same non-`#[cfg(test)]` reasoning as
+    /// `set_debounce_for_tests`.
+    pub fn pause_create_before_registration_for_tests(&self, hook: Arc<CreatePauseHook>) {
+        *self.create_pause_hook.lock().unwrap() = Some(hook);
     }
 
     /// Creates a folder, synchronously — unlike `create`'s files, a folder
@@ -704,29 +881,21 @@ impl Vfs {
     /// so its eventual upload (successful or not) always lands under the
     /// NEW path, never the old one.
     ///
-    /// KNOWN PHASE-3 BLOCKER — renaming a file with an OPEN handle is
-    /// unsupported: an `OpenFile`'s `key.remote_path` is fixed at
-    /// `open`/`create` time and this method never touches it, so the
-    /// handle keeps pointing at the OLD path even after this call returns
-    /// successfully. Two failure modes follow, and they're inconsistent
-    /// with each other depending on pure cache-state luck:
-    /// - If the file's blocks are still cached under the old key, a
-    ///   subsequent `write` on that handle silently `ensure_drafted`s (or
-    ///   writes into an already-open draft) under the OLD path — the
-    ///   write appears to succeed, but it re-diverges a file this call
-    ///   already renamed, and whatever eventually uploads does so to the
-    ///   OLD name, not the one the caller renamed it to.
-    /// - If the blocks are gone (evicted, or the remote entry no longer
-    ///   resolves under the old path at all), the same `write` instead
-    ///   fails loudly — a materialization attempt with nothing left at the
-    ///   old path to read.
-    ///
-    /// Either way the handle's view of "which file this is" has silently
-    /// diverged from reality the instant `rename` returns. Phase 3's NFS/
-    /// FUSE frontends MUST serialize (block the rename until every handle
-    /// on the source closes) or deny (`EBUSY`/equivalent) a rename while a
-    /// handle is open on the entry — this facade does not do either for
-    /// them.
+    /// EBUSY CONTRACT (cycle A of the phase-2 debt burn-down, replacing the
+    /// phase-2 "known blocker" this used to document): a handle open on the
+    /// entry being renamed makes this call fail with [`RenameBusyError`]
+    /// rather than silently proceeding. Phase 2 let the rename go through
+    /// while an `OpenFile`'s `key.remote_path` — fixed at `open`/`create`
+    /// time and never touched here — kept pointing at the OLD path, so a
+    /// subsequent `write`/`read` on that handle would silently diverge from
+    /// what the caller just renamed (or fail confusingly, depending on pure
+    /// cache-state luck). The guard below closes that off at the source
+    /// instead: no rename ever completes while a stale handle could result.
+    /// Frontends (NFS/FUSE) map `RenameBusyError` to `EBUSY`, the same
+    /// answer POSIX gives for an analogous conflict; closing every handle
+    /// on the entry and retrying succeeds (see the guard's own doc, and
+    /// `open_locks`'s field doc, for why this is race-free rather than a
+    /// mere check-then-act).
     pub async fn rename(
         &self,
         parent: NodeId,
@@ -748,6 +917,18 @@ impl Vfs {
 
         if old_path == new_path {
             return Ok(()); // renaming onto itself: nothing to do.
+        }
+
+        // EBUSY guard: see `RenameBusyError`'s and `open_locks`'s docs for
+        // why taking this specific lock, and holding it for the whole rest
+        // of this call, is what makes the check race-free rather than a
+        // check-then-act TOCTOU — dropped automatically at the end of this
+        // function (early return on the busy path, or falling off the end
+        // on success).
+        let open_lock = self.open_lock_for(&old_path);
+        let _open_guard = open_lock.lock().await;
+        if self.is_path_open(&old_path).await {
+            return Err(anyhow::Error::new(RenameBusyError { remote_path: old_path }));
         }
 
         let existed_remotely = match self.drafts.lock().await.base_etag(&old_path) {
@@ -952,6 +1133,23 @@ impl Vfs {
             .entry(remote_path.to_string())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
+    }
+
+    /// Gets (creating if needed) the per-path async lock `open` and `rename`
+    /// share — see `open_locks`'s field doc for the race it closes.
+    fn open_lock_for(&self, remote_path: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.open_locks.lock().unwrap();
+        locks
+            .entry(remote_path.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    /// Whether any live handle currently points at `remote_path`. Callers
+    /// needing a race-free answer must hold `open_lock_for(remote_path)`
+    /// across both this check and whatever it gates — see `rename`'s guard.
+    async fn is_path_open(&self, remote_path: &str) -> bool {
+        self.open_files.read().await.values().any(|of| of.key.remote_path == remote_path)
     }
 
     /// D2's materialization: pulls the whole file's current content through
