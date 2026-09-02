@@ -879,6 +879,8 @@ dependencies = [
  "chrono",
  "cloudreve-api",
  "cloudreve-uploader",
+ "libc",
+ "nfs3_server",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -3127,9 +3129,9 @@ dependencies = [
 
 [[package]]
 name = "libc"
-version = "0.2.186"
+version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
+checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "libdbus-sys"
@@ -3424,6 +3426,38 @@ name = "new_debug_unreachable"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
+
+[[package]]
+name = "nfs3_macros"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06d8fb377e6efeb91911a8ed962a69615535e167e675025a2be8fa109751426a"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "nfs3_server"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "96d135ac708765b71461a1465cf4a25f009a44d33d9d15ab07e0c00d446d4a0c"
+dependencies = [
+ "anyhow",
+ "nfs3_types",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "nfs3_types"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5d5ab1a9fdfeab2f03b36b6300dea4ea3806e6a057cb479628b41d65e356b94"
+dependencies = [
+ "nfs3_macros",
+]
 
 [[package]]
 name = "nix"

@@ -5,6 +5,8 @@
 //! over it. Nothing in this crate mounts anything.
 
 pub mod cache;
+pub mod frontend_util;
+pub mod nfs;
 pub mod tree;
 pub mod vfs;
 pub mod writeback;
