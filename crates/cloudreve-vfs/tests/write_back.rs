@@ -13,7 +13,7 @@ use std::time::Duration;
 use cloudreve_uploader::{
     NoSessionStore, ProgressCallback, ProgressUpdate, UploadParams, Uploader, UploaderConfig,
 };
-use cloudreve_vfs::vfs::{Vfs, VfsEvent, DEFAULT_CACHE_MAX_BYTES};
+use cloudreve_vfs::vfs::{StaleHandleError, Vfs, VfsEvent, DEFAULT_CACHE_MAX_BYTES};
 use cloudreve_vfs::writeback::{DraftState, UPLOAD_RETRIES};
 use common::{remote_file, uri_of, VfsTestEnv};
 use tempfile::NamedTempFile;
@@ -924,5 +924,177 @@ async fn a_stuck_uploading_draft_is_recovered_by_retry() {
         env.uploaded_content("stuck.txt"),
         Some(saved),
         "the stranded draft must eventually reach the server once recovered"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Final review, finding 1 (critical): a write acknowledged while an upload
+// of the SAME draft is in flight must never be lost. Sequence: close arms
+// the debounce, the timer fires, the upload starts (slowly); the user
+// reopens (the timer already fired, so `cancel` correctly declines to flip
+// the state) and writes new bytes into the still-existing draft; the upload
+// then succeeds. The success handler used to `remove` the draft
+// unconditionally — deleting the data file WITH the post-snapshot bytes.
+// That write was acknowledged; losing it violates spec §5 ("never lose a
+// byte").
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_write_during_an_inflight_upload_is_never_lost() {
+    let env = VfsTestEnv::new().await;
+    env.expect_uploads().await;
+    env.set_remote_files(vec![remote_file("live.txt", 5, "e1")]).await;
+    env.serve_file_content("live.txt", b"abcde").await;
+
+    let (vfs, _rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+    vfs.set_debounce_for_tests(Duration::from_millis(20));
+    // Slow every chunk so the first upload verifiably stays in flight while
+    // the reopen+write below happens: 13 bytes over 5-byte chunks is three
+    // chunks, ≥450ms in flight — orders of magnitude wider than the purely
+    // local reopen/write/close it must overlap with.
+    env.slow_down_chunk_uploads(Duration::from_millis(150));
+
+    let node = vfs.tree().lookup(vfs.tree().root(), "live.txt").await.unwrap().unwrap().0;
+    let h1 = vfs.open(node).await.unwrap();
+    vfs.truncate(h1, 0).await.unwrap();
+    let first = b"first version".to_vec();
+    vfs.write(h1, 0, &first).await.unwrap();
+    vfs.close(h1).await.unwrap(); // Pending, debounce armed.
+
+    // Wait (bounded) until the upload is genuinely in flight: the session
+    // only exists once the timer fired and `process` flipped the draft to
+    // `Uploading` — the exact window the reopen below must land in.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while env.upload_session_count() == 0 {
+        assert!(tokio::time::Instant::now() < deadline, "the armed upload never started");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // Reopen mid-upload and write NEW bytes. `write` returning Ok is the
+    // acknowledgment — from this point on, these bytes must reach the
+    // server no matter what the in-flight upload does.
+    let h2 = vfs.open(node).await.unwrap();
+    let second = b"SECOND WRITE MUST WIN".to_vec();
+    vfs.write(h2, 0, &second).await.unwrap();
+    vfs.close(h2).await.unwrap();
+    env.slow_down_chunk_uploads(Duration::ZERO); // the follow-up needn't crawl
+
+    vfs.wait_for_writeback_idle().await;
+
+    assert_eq!(
+        env.uploaded_content("live.txt"),
+        Some(second),
+        "the FINAL uploaded content must be the write acknowledged during the in-flight upload"
+    );
+    assert_eq!(
+        env.upload_session_count(),
+        2,
+        "the newer bytes must go up in a second session, after the in-flight one landed"
+    );
+    assert_eq!(
+        vfs.retry_pending_uploads().await,
+        0,
+        "once the second upload landed, nothing may be left parked"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Final review, finding 2 (important): a handle opened while a draft
+// existed carries no download URL and a frozen pre-upload size. Once the
+// upload succeeds and removes the draft, such a handle's reads used to fall
+// through to the block cache — silently serving stale materialization-era
+// blocks (or empty reads for created files). Ruling shipped: purge the
+// file's block-cache entry on upload success, and make the no-draft+no-URL
+// read fail loudly with a distinct error — loud beats silently-stale.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_handle_kept_open_across_its_upload_fails_loudly() {
+    let env = VfsTestEnv::new().await;
+    env.expect_uploads().await;
+    let original: Vec<u8> = (0..=255u8).cycle().take(4096).collect();
+    env.set_remote_files(vec![remote_file("held.bin", original.len() as i64, "e1")]).await;
+    env.serve_file_content("held.bin", &original).await;
+
+    let (vfs, _rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+    vfs.set_debounce_for_tests(Duration::from_millis(20));
+
+    let node = vfs.tree().lookup(vfs.tree().root(), "held.bin").await.unwrap().unwrap().0;
+    let h1 = vfs.open(node).await.unwrap();
+    // Partial write: materializes the original through the cache (warming
+    // it under etag e1 — exactly the stale blocks a broken read would later
+    // serve) and patches the draft.
+    vfs.write(h1, 100, b"PATCHED!!!").await.unwrap();
+
+    // Opened WHILE the draft exists: no download URL, reads from the draft.
+    let h2 = vfs.open(node).await.unwrap();
+    let during = vfs.read(h2, 100, 10).await.unwrap();
+    assert_eq!(during.as_ref(), b"PATCHED!!!", "a drafted handle reads the draft");
+
+    vfs.close(h1).await.unwrap(); // arms; the upload runs and removes the draft.
+    vfs.wait_for_writeback_idle().await;
+
+    // The draft is gone and h2's frozen view cannot be served honestly any
+    // more: the read must fail loudly with the distinct stale-handle error,
+    // never silently serve the pre-edit bytes still cached under e1.
+    let read = vfs.read(h2, 100, 10).await;
+    let err = read.expect_err(
+        "a read on a handle that outlived its draft's upload must fail loudly, \
+         not serve stale pre-edit blocks",
+    );
+    assert!(
+        err.downcast_ref::<StaleHandleError>().is_some(),
+        "the failure must be the distinct stale-handle error (frontends map it \
+         to EIO/ESTALE), got: {err:#}"
+    );
+    vfs.close(h2).await.unwrap(); // closing the stale handle stays clean
+}
+
+/// Finding 2's purge, observed through the facade: after an upload lands,
+/// a FRESH open must genuinely refetch the file — never serve the
+/// pre-upload blocks the materialization warmed the cache with. The mock's
+/// listing etag deliberately does NOT change across the upload, mirroring
+/// the real-world window where the listing hasn't caught up with the new
+/// entity yet (D6's etag refresh is explicitly best-effort): the fresh
+/// open then keys the OLD etag, so `read_block`'s etag-mismatch
+/// self-invalidation cannot help — only the success-path purge does.
+#[tokio::test]
+async fn a_fresh_open_after_upload_serves_the_uploaded_content_not_stale_blocks() {
+    let env = VfsTestEnv::new().await;
+    env.expect_uploads().await;
+    let original: Vec<u8> = (0..=255u8).cycle().take(4096).collect();
+    env.set_remote_files(vec![remote_file("refetch.bin", original.len() as i64, "e1")]).await;
+    env.serve_file_content("refetch.bin", &original).await;
+
+    let (vfs, _rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+    vfs.set_debounce_for_tests(Duration::from_millis(20));
+
+    let node = vfs.tree().lookup(vfs.tree().root(), "refetch.bin").await.unwrap().unwrap().0;
+    let h1 = vfs.open(node).await.unwrap();
+    let warmed = vfs.read(h1, 0, original.len() as u32).await.unwrap();
+    assert_eq!(warmed.as_ref(), &original[..]);
+    vfs.write(h1, 100, b"PATCHED!!!").await.unwrap(); // draft = original + patch
+    vfs.close(h1).await.unwrap();
+    vfs.wait_for_writeback_idle().await;
+
+    let mut edited = original.clone();
+    edited[100..110].copy_from_slice(b"PATCHED!!!");
+    assert_eq!(env.uploaded_content("refetch.bin"), Some(edited.clone()));
+    // The "server" now stores what was uploaded — same etag in the listing.
+    env.serve_file_content("refetch.bin", &edited).await;
+
+    let h2 = vfs.open(node).await.unwrap();
+    let back = vfs.read(h2, 0, edited.len() as u32).await.unwrap();
+    assert_eq!(
+        back.as_ref(),
+        &edited[..],
+        "a fresh open after the upload must refetch the uploaded content, not \
+         serve the pre-upload blocks still cached under the unchanged etag"
     );
 }

@@ -88,7 +88,10 @@ struct OpenFile {
     /// with no remote counterpart yet, or any handle opened on a path that
     /// already has an active draft (Task 9's promoted fix). Both read
     /// exclusively from the draft (see `Vfs::read`) and so never reach
-    /// `fetch_range_with_retry`, the only consumer of this field.
+    /// `fetch_range_with_retry`, the only consumer of this field. Should
+    /// such a handle OUTLIVE its draft (the upload landed and removed it),
+    /// reads fail loudly with [`StaleHandleError`] rather than falling
+    /// through to the (purged) block cache — see `Vfs::read`.
     download_url: RwLock<Option<String>>,
 }
 
@@ -119,6 +122,34 @@ pub enum VfsEvent {
     UploadFailed { remote_path: String, error: String, will_retry: bool },
     ConflictSaved { original: String, conflict_copy: String },
 }
+
+/// Distinct error returned by [`Vfs::read`] for a handle that outlived its
+/// draft: the handle was opened while a draft existed for its path (so it
+/// carries no download URL and a frozen pre-upload size), and that draft has
+/// since been uploaded and removed. The handle's frozen view of the file can
+/// no longer be served honestly — the block cache was purged of the file's
+/// pre-upload blocks on upload success, and the handle has no URL (nor the
+/// file's new etag/size) to refetch with. Frontends translate this to
+/// `EIO`/`ESTALE`; reopening the file yields a fresh handle with the
+/// current key, size, and URL. Detectable via
+/// `anyhow::Error::downcast_ref::<StaleHandleError>()`.
+#[derive(Debug, Clone)]
+pub struct StaleHandleError {
+    pub remote_path: String,
+}
+
+impl std::fmt::Display for StaleHandleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "stale file handle for {}: its draft was uploaded and removed while the handle \
+             stayed open — reopen the file",
+            self.remote_path
+        )
+    }
+}
+
+impl std::error::Error for StaleHandleError {}
 
 pub struct Vfs {
     /// `Arc`-wrapped (not owned outright) because the write-back queue's
@@ -189,8 +220,10 @@ impl Vfs {
         // `drafts/` would destroy every draft at startup the first time a
         // draft directory (which has no `meta.json`, only `draft.json`) is
         // scanned. Segregate the two roots before either is ever opened.
-        let cache = BlockCache::open(&cache_dir.join("blocks"), cache_max_bytes)
-            .context("failed to open block cache")?;
+        let cache = Arc::new(Mutex::new(
+            BlockCache::open(&cache_dir.join("blocks"), cache_max_bytes)
+                .context("failed to open block cache")?,
+        ));
         let drafts_store =
             DraftStore::open(&cache_dir.join("drafts")).context("failed to open draft store")?;
         // Task 9: every draft still `Pending` here survived an unclean
@@ -208,8 +241,13 @@ impl Vfs {
             .build()
             .context("failed to build the vfs http client")?;
         let (events_tx, events_rx) = mpsc::unbounded_channel();
-        let write_queue =
-            WriteBackQueue::new(client.clone(), tree.clone(), drafts.clone(), events_tx.clone());
+        let write_queue = WriteBackQueue::new(
+            client.clone(),
+            tree.clone(),
+            drafts.clone(),
+            cache.clone(),
+            events_tx.clone(),
+        );
         // Re-enqueue them for an immediate upload attempt now, before this
         // constructor returns — synchronously bumping the queue's `busy`
         // counter here (not from a spawned task) closes the race a test
@@ -220,7 +258,7 @@ impl Vfs {
         Ok((
             Self {
                 tree,
-                cache: Arc::new(Mutex::new(cache)),
+                cache,
                 drafts,
                 write_queue,
                 client,
@@ -336,6 +374,24 @@ impl Vfs {
             if drafts.state(&of.key.remote_path).is_some() {
                 return drafts.read(&of.key.remote_path, offset, len);
             }
+        }
+
+        // No draft + no download URL: this handle was opened while a draft
+        // existed (see `download_url`'s field doc) and that draft has since
+        // uploaded and been removed. Its frozen key/size describe a version
+        // of the file that no longer exists anywhere reachable — the
+        // upload's success purged the pre-upload blocks, and the handle has
+        // no URL to refetch with. Fail loudly with the distinct error
+        // rather than falling through to `read_from_cache`, which would
+        // silently serve whatever stale bytes (or emptiness, for a created
+        // file whose frozen size is 0) the caches happen to hold. Checked
+        // BEFORE `read_from_cache`'s EOF clamp on purpose: that clamp would
+        // otherwise answer a created-file handle's reads with clean empty
+        // results forever.
+        if of.download_url.read().await.is_none() {
+            return Err(anyhow::Error::new(StaleHandleError {
+                remote_path: of.key.remote_path.clone(),
+            }));
         }
 
         self.read_from_cache(&of, offset, len).await

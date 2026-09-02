@@ -69,7 +69,7 @@ struct DraftMeta {
     last_write_unix: i64,
 }
 
-/// In-memory state for one draft. Mirrors `DraftMeta` plus nothing else —
+/// In-memory state for one draft. Mirrors `DraftMeta` plus `write_seq` —
 /// unlike `BlockCache`'s `Entry`, a draft has no derived/recency state, so
 /// this struct exists only to avoid re-parsing JSON on every accessor call.
 struct Entry {
@@ -78,6 +78,18 @@ struct Entry {
     size: u64,
     state: DraftState,
     last_write_unix: i64,
+    /// Monotonic count of content mutations (`write`/`truncate`), bumped on
+    /// every one. The write-back queue snapshots it when it flips a draft to
+    /// `Uploading` and compares on success: a changed count means bytes were
+    /// acknowledged AFTER the upload's snapshot, so the draft must survive
+    /// and re-upload rather than be removed (spec §5, "never lose a byte").
+    /// A counter, not `last_write_unix`: wall-clock seconds cannot tell a
+    /// write landing in the same second as the snapshot apart from none at
+    /// all. Deliberately in-memory only (never part of `DraftMeta`): the
+    /// comparison never spans processes — after a crash, `open()` demotes
+    /// every `Uploading` draft back to `Pending` unconditionally, which
+    /// already forces a re-upload of whatever bytes are on disk.
+    write_seq: u64,
 }
 
 pub struct DraftStore {
@@ -142,6 +154,7 @@ impl DraftStore {
                 size: meta.size,
                 state: meta.state,
                 last_write_unix: meta.last_write_unix,
+                write_seq: 0,
             };
 
             if demoted {
@@ -193,6 +206,7 @@ impl DraftStore {
             size,
             state: DraftState::Editing,
             last_write_unix: now_unix(),
+            write_seq: 0,
         };
         write_meta(&self.root, &hash, &entry)?;
         self.entries.insert(hash, entry);
@@ -221,6 +235,7 @@ impl DraftStore {
         let entry = self.entries.get_mut(&hash).expect("checked above");
         entry.size = entry.size.max(offset + data.len() as u64);
         entry.last_write_unix = now_unix();
+        entry.write_seq += 1;
         write_meta(&self.root, &hash, entry)?;
         Ok(())
     }
@@ -269,6 +284,7 @@ impl DraftStore {
         let entry = self.entries.get_mut(&hash).expect("checked above");
         entry.size = size;
         entry.last_write_unix = now_unix();
+        entry.write_seq += 1;
         write_meta(&self.root, &hash, entry)?;
         Ok(())
     }
@@ -317,6 +333,28 @@ impl DraftStore {
 
     pub fn base_etag(&self, remote_path: &str) -> Option<String> {
         self.entries.get(&hash16(remote_path)).map(|e| e.base_etag.clone())
+    }
+
+    /// The draft's content-mutation counter — see `Entry::write_seq`'s doc.
+    pub fn write_seq(&self, remote_path: &str) -> Option<u64> {
+        self.entries.get(&hash16(remote_path)).map(|e| e.write_seq)
+    }
+
+    /// Rebases the draft onto a new remote etag. Only the write-back queue
+    /// calls this, and only after an in-place upload landed a snapshot of a
+    /// draft that was written again mid-flight: the server now holds the
+    /// snapshot under `etag`, so the surviving draft's next conflict check
+    /// (D5) must compare against THAT, or it would flag the draft's own
+    /// landed upload as someone else's conflicting edit.
+    pub fn set_base_etag(&mut self, remote_path: &str, etag: &str) -> Result<()> {
+        let hash = hash16(remote_path);
+        let entry = self
+            .entries
+            .get_mut(&hash)
+            .ok_or_else(|| anyhow::anyhow!("no draft open for {remote_path}"))?;
+        entry.base_etag = etag.to_string();
+        write_meta(&self.root, &hash, entry)?;
+        Ok(())
     }
 
     /// The path the Uploader reads the draft's bytes from directly.
@@ -459,6 +497,14 @@ pub struct WriteBackQueue {
     client: Arc<cloudreve_api::Client>,
     tree: Arc<crate::tree::VfsTree>,
     drafts: Arc<TokioMutex<DraftStore>>,
+    /// The facade's block cache — the queue's only use of it is the purge on
+    /// upload success: the moment an upload replaces the file's remote
+    /// content, every block cached for that path (materialization-era bytes
+    /// under the pre-upload etag) is stale, and the etag-mismatch check in
+    /// `BlockCache::read_block` alone can't retire them — a fresh open can
+    /// still key the OLD etag while the server's listing lags behind the
+    /// upload (the same lag that makes D6's etag refresh best-effort).
+    cache: Arc<TokioMutex<crate::cache::BlockCache>>,
     events: mpsc::UnboundedSender<crate::vfs::VfsEvent>,
     /// Serializes actual upload attempts: the plan is explicit that the
     /// queue drains sequentially, one upload at a time (YAGNI on
@@ -505,12 +551,14 @@ impl WriteBackQueue {
         client: Arc<cloudreve_api::Client>,
         tree: Arc<crate::tree::VfsTree>,
         drafts: Arc<TokioMutex<DraftStore>>,
+        cache: Arc<TokioMutex<crate::cache::BlockCache>>,
         events: mpsc::UnboundedSender<crate::vfs::VfsEvent>,
     ) -> Self {
         Self {
             client,
             tree,
             drafts,
+            cache,
             events,
             upload_gate: Arc::new(TokioMutex::new(())),
             timers: Arc::new(StdMutex::new(HashMap::new())),
@@ -752,12 +800,24 @@ impl WriteBackQueue {
             tracing::warn!(remote_path, %err, "writeback: failed to mark draft Uploading");
         }
 
-        let (data_path, size, mtime) = {
+        // `snapshot_seq` is captured in the same lock hold as the size the
+        // uploader will declare: any write acknowledged after this point may
+        // or may not make it into the bytes the uploader reads off disk, so
+        // the success handler below treats "seq changed since the snapshot"
+        // as "the draft must survive and re-upload" — conservatively
+        // re-uploading a write that happened to land in time, never losing
+        // one that didn't.
+        let (data_path, size, mtime, snapshot_seq) = {
             let drafts = self.drafts.lock().await;
             let Some(data_path) = drafts.data_path(remote_path) else {
                 return; // draft vanished mid-flight.
             };
-            (data_path, drafts.size(remote_path).unwrap_or(0), drafts.mtime_unix(remote_path))
+            (
+                data_path,
+                drafts.size(remote_path).unwrap_or(0),
+                drafts.mtime_unix(remote_path),
+                drafts.write_seq(remote_path).unwrap_or(0),
+            )
         };
 
         let params = UploadParams {
@@ -799,29 +859,51 @@ impl WriteBackQueue {
                     // invalidate both paths so a subsequent lookup sees the
                     // new copy and refetches the original's now-known-
                     // divergent state, and drop the draft — its content is
-                    // safe under the copy.
+                    // safe under the copy. UNLESS the draft was written
+                    // again while this upload was in flight: then only the
+                    // snapshot is safe under the copy, and the draft (with
+                    // its acknowledged newer bytes) must survive and re-arm
+                    // — see `settle_uploaded_draft`.
                     self.tree.invalidate_path(&conflict_path).await;
                     self.tree.invalidate_path(remote_path).await;
-                    let _ = self.drafts.lock().await.remove(remote_path);
+                    let rearm = self.settle_uploaded_draft(remote_path, snapshot_seq, None).await;
                     let _ = self.events.send(crate::vfs::VfsEvent::ConflictSaved {
                         original: remote_path.to_string(),
                         conflict_copy: conflict_path,
                     });
+                    if rearm {
+                        self.arm(remote_path.to_string());
+                    }
                 }
                 None => {
                     // D6: record the new etag (best-effort — a listing that
                     // doesn't yet reflect the upload just yields an empty
-                    // string), delete the draft, and leave the block cache
-                    // untouched/empty for this file so the next read
-                    // refetches rather than serving stale or converted
-                    // content.
+                    // string), purge the file's now-stale block-cache entry
+                    // so every future read refetches rather than serving
+                    // pre-upload content (the etag-mismatch check alone
+                    // can't retire blocks while the listing still reports
+                    // the old etag), and settle the draft: removed if
+                    // untouched since the upload's snapshot, kept and
+                    // re-armed if written again mid-flight.
                     let new_etag =
                         self.tree.refresh_etag(remote_path).await.ok().flatten().unwrap_or_default();
-                    let _ = self.drafts.lock().await.remove(remote_path);
+                    if let Err(err) = self.cache.lock().await.purge(remote_path) {
+                        tracing::warn!(
+                            remote_path,
+                            %err,
+                            "writeback: failed to purge stale blocks after upload"
+                        );
+                    }
+                    let rearm = self
+                        .settle_uploaded_draft(remote_path, snapshot_seq, Some(&new_etag))
+                        .await;
                     let _ = self.events.send(crate::vfs::VfsEvent::UploadSucceeded {
                         remote_path: remote_path.to_string(),
                         new_etag,
                     });
+                    if rearm {
+                        self.arm(remote_path.to_string());
+                    }
                 }
             },
             Some(err) => {
@@ -835,6 +917,71 @@ impl WriteBackQueue {
                     error: err.to_string(),
                     will_retry: true,
                 });
+            }
+        }
+    }
+
+    /// Decides what happens to a draft whose upload just SUCCEEDED, by
+    /// comparing its current `write_seq` against the one captured when the
+    /// upload snapshotted the file:
+    ///
+    /// - Unchanged (or the draft is gone — removed concurrently by e.g.
+    ///   `unlink`/`rename`): the upload carried everything ever
+    ///   acknowledged, so the draft is removed outright — the pre-fix
+    ///   behavior, now conditional. Returns `false`.
+    /// - Changed: bytes were acknowledged AFTER the snapshot, and removing
+    ///   the draft would delete them unrecoverably (spec §5, "never lose a
+    ///   byte"). The draft survives, parked `Pending`, and the caller must
+    ///   re-`arm` it (return `true`) so the newer bytes upload through the
+    ///   normal machinery. `Pending` (not `Editing`) regardless of whether
+    ///   a handle is still open: `arm`'s debounce timer is what re-uploads
+    ///   it, and the existing open/close discipline composes — a still-open
+    ///   handle's eventual `close` finds `Pending` and correctly does not
+    ///   double-arm, while a reopen inside the window cancels the timer and
+    ///   flips it back to `Editing` exactly like any other pending draft.
+    ///
+    /// For an in-place upload (`landed_etag` is `Some`), a surviving draft
+    /// is also rebased onto the new etag when one is known — the server now
+    /// holds this draft's own snapshot, so the next conflict check must
+    /// compare against it, not the pre-upload etag. An empty/unknown etag
+    /// (best-effort refresh came back blank) keeps the old base: the next
+    /// cycle then at worst degrades to a conflict copy — conservative,
+    /// never lossy. A conflict-copy upload (`landed_etag` is `None`) never
+    /// rebases: the original's remote etag genuinely still differs, and the
+    /// next cycle detecting the same conflict again (another copy) is the
+    /// honest outcome.
+    async fn settle_uploaded_draft(
+        &self,
+        remote_path: &str,
+        snapshot_seq: u64,
+        landed_etag: Option<&str>,
+    ) -> bool {
+        let mut drafts = self.drafts.lock().await;
+        match drafts.write_seq(remote_path) {
+            Some(current_seq) if current_seq != snapshot_seq => {
+                if let Some(etag) = landed_etag {
+                    if !etag.is_empty() {
+                        if let Err(err) = drafts.set_base_etag(remote_path, etag) {
+                            tracing::warn!(
+                                remote_path,
+                                %err,
+                                "writeback: failed to rebase a mid-flight-written draft"
+                            );
+                        }
+                    }
+                }
+                if let Err(err) = drafts.set_state(remote_path, DraftState::Pending) {
+                    tracing::warn!(
+                        remote_path,
+                        %err,
+                        "writeback: failed to park a mid-flight-written draft"
+                    );
+                }
+                true
+            }
+            _ => {
+                let _ = drafts.remove(remote_path);
+                false
             }
         }
     }

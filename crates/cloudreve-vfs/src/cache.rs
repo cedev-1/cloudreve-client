@@ -427,6 +427,18 @@ impl BlockCache {
         Ok(())
     }
 
+    /// Drops every cached block of `remote_path`, whatever etag they were
+    /// stored under, deleting the entry directory on disk too. Idempotent: a
+    /// path with nothing cached is a no-op. Deliberately ignores `retains` —
+    /// unlike eviction, a purge means the stored bytes are known stale (the
+    /// write-back queue calls this the moment an upload replaces the file's
+    /// remote content), and a live handle must never shield bytes that no
+    /// longer match anything on the server. The retain count itself is left
+    /// untouched, so the handle's eventual `release` still balances.
+    pub fn purge(&mut self, remote_path: &str) -> Result<()> {
+        self.remove_entry(&hash_key(remote_path))
+    }
+
     fn remove_entry(&mut self, hash: &str) -> Result<()> {
         self.entries.remove(hash);
         let dir = self.entry_dir(hash);
@@ -660,6 +672,36 @@ mod tests {
         }
         let after = std::fs::metadata(&meta).unwrap().modified().unwrap();
         assert_eq!(before, after, "50 cached reads rewrote meta.json 50 times — SSD wear for nothing");
+    }
+
+    #[test]
+    fn purge_drops_every_block_of_a_path_even_while_retained() {
+        let dir = TempDir::new().unwrap();
+        let mut c = BlockCache::open(dir.path(), 100 * BLOCK_SIZE).unwrap();
+        c.write_block(&key("edited", "e1"), 0, &[1u8; 1024]).unwrap();
+        c.write_block(&key("edited", "e1"), 1, &[2u8; 1024]).unwrap();
+        c.write_block(&key("other", "e1"), 0, &[3u8; 1024]).unwrap();
+        // A still-open handle must not shield known-stale bytes: purge is
+        // invalidation ("these bytes no longer match the server"), not
+        // eviction, so it ignores retains where eviction honors them.
+        c.retain(&key("edited", "e1"));
+
+        c.purge("edited").unwrap();
+
+        assert!(
+            c.read_block(&key("edited", "e1"), 0).unwrap().is_none(),
+            "purged blocks must be gone even under the exact etag they were stored with"
+        );
+        assert!(c.read_block(&key("edited", "e1"), 1).unwrap().is_none());
+        assert!(
+            !dir.path().join(hash_key("edited")).exists(),
+            "the entry directory itself must be deleted, not just forgotten in memory"
+        );
+        assert!(
+            c.read_block(&key("other", "e1"), 0).unwrap().is_some(),
+            "purging one path must not touch another path's blocks"
+        );
+        c.purge("never-cached").unwrap(); // idempotent: purging nothing is fine
     }
 
     #[test]
