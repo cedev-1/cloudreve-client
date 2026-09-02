@@ -67,6 +67,42 @@ async fn new_test_vfs(env: &VfsTestEnv) -> Arc<Vfs> {
     Arc::new(vfs)
 }
 
+/// Polls until `env.uploaded_content(name)` matches `expected`, calling
+/// `vfs.wait_for_writeback_idle()` before each check, or panics past a
+/// bounded deadline. Needed specifically because of a FUSE quirk this
+/// crate's NFS frontend never has to deal with (CI fix round 1 diagnosis):
+/// `release()` — the call that actually reaches `Vfs::close()` and arms the
+/// write-back debounce — is fire-and-forget from the KERNEL's perspective
+/// on `close(2)`. `fuser::Filesystem::release`'s own doc says so plainly:
+/// "The filesystem may reply with an error, but error values are not
+/// returned to close()... which triggered the release" — only possible
+/// because the VFS's underlying `f_op->release` hook has a `void` return
+/// type, unlike `f_op->flush` (fuser's `flush`), which IS synchronous with
+/// `close(2)` and IS what can propagate a write error back to it. So
+/// `std::fs::write(...)` returning successfully proves CREATE, WRITE, and
+/// FLUSH all completed — it proves NOTHING about whether RELEASE (and
+/// therefore the debounce arm this whole assertion depends on) has even
+/// been dispatched by the kernel yet, let alone processed by `VfsFuse`'s
+/// one dedicated dispatch thread. Contrast `nfs.rs`, whose own `write` RPC
+/// handler calls `Vfs::close` INLINE before ever replying (see its module
+/// doc) — no such gap exists there, which is why `mounted_macos.rs`'s
+/// equivalent test needs no analogous helper.
+async fn wait_for_upload(vfs: &Vfs, env: &VfsTestEnv, name: &str, expected: &[u8]) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        vfs.wait_for_writeback_idle().await;
+        if env.uploaded_content(name).as_deref() == Some(expected) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "upload of {name} never landed within the timeout — last seen: {:?}",
+            env.uploaded_content(name)
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// The whole feature, through the OS: file-manager-equivalent std::fs calls
 /// against a real FUSE mount of an in-process `Vfs`.
 #[tokio::test(flavor = "multi_thread")]
@@ -108,13 +144,10 @@ async fn a_mounted_drive_lists_reads_and_writes_through_std_fs() {
     blocking_with_timeout(move || std::fs::write(&write_path, b"created through the mount").unwrap())
         .await;
 
-    vfs.wait_for_writeback_idle().await;
-
-    assert_eq!(
-        env.uploaded_content("new.txt").as_deref(),
-        Some(&b"created through the mount"[..]),
-        "the mock server never received new.txt's content"
-    );
+    // See `wait_for_upload`'s doc: `std::fs::write` returning does NOT mean
+    // `release()` (and therefore `Vfs::close`'s debounce arm) has run yet —
+    // that's fire-and-forget from the kernel's perspective on `close(2)`.
+    wait_for_upload(&vfs, &env, "new.txt", b"created through the mount").await;
 
     mounted.unmount().expect("unmount should succeed");
 
@@ -212,6 +245,17 @@ async fn renaming_an_open_file_through_the_mount_fails_with_ebusy() {
     let env = VfsTestEnv::new().await;
     env.set_remote_files(vec![remote_file("hello.txt", 11, "e1")]).await;
     env.serve_file_content("hello.txt", b"hello world").await;
+    // CI fix round 1: the FIRST rename (while busy) never reaches the API
+    // at all — `Vfs::rename`'s EBUSY guard returns before any HTTP call —
+    // but the SECOND, now-unblocked rename is a REAL `rename_file` API
+    // call (hello.txt is a genuine remote file, not a draft) and needs a
+    // mock to succeed against, same as `namespace_ops.rs`'s rename tests.
+    // Without this, that second rename failed with a generic (unmocked)
+    // error, classified as `Io` -> `EIO` — which is exactly what CI saw,
+    // and specifically NOT `EBUSY`, ruling out a release()-timing race as
+    // the cause here (see `wait_for_upload`'s doc for where that race
+    // DOES matter, in the other test).
+    env.expect_namespace_ops().await;
 
     let vfs = new_test_vfs(&env).await;
 
@@ -238,12 +282,34 @@ async fn renaming_an_open_file_through_the_mount_fails_with_ebusy() {
     );
 
     // Close the handle, then the same rename must succeed — the guard is a
-    // refusal, not a permanent lock.
+    // refusal, not a permanent lock. Polled rather than a single immediate
+    // retry: RELEASE (see `wait_for_upload`'s doc on the other test) is
+    // fire-and-forget from the kernel's perspective on `close(2)`, so
+    // `Vfs::open_files` may not have dropped this handle the very instant
+    // `drop(open_file)` returns — a bare retry could still see `EBUSY` and
+    // wrongly look like a regression. Anything OTHER than `EBUSY` fails
+    // immediately: this loop tolerates exactly the one known race, nothing
+    // else. (Not proven necessary by CI fix round 1's diagnosis — that
+    // failure was the missing `expect_namespace_ops` mock below, which
+    // surfaced as `EIO`, not `EBUSY` — added defensively since the same
+    // release()-timing gap applies here in principle.)
     blocking_with_timeout(move || drop(open_file)).await;
-
-    let from = mountpoint.join("hello.txt");
-    let to = mountpoint.join("renamed.txt");
-    blocking_with_timeout(move || std::fs::rename(&from, &to).unwrap()).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let from = mountpoint.join("hello.txt");
+        let to = mountpoint.join("renamed.txt");
+        match blocking_with_timeout(move || std::fs::rename(&from, &to)).await {
+            Ok(()) => break,
+            Err(err) if err.raw_os_error() == Some(libc::EBUSY) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "rename stayed EBUSY long after the handle was closed"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(err) => panic!("rename after closing the handle should succeed, got {err:?}"),
+        }
+    }
 
     let renamed_path = mountpoint.join("renamed.txt");
     let names: Vec<String> = blocking_with_timeout(move || {
