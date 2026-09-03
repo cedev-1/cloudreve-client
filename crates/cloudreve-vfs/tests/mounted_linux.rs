@@ -165,6 +165,29 @@ async fn a_mounted_drive_lists_reads_and_writes_through_std_fs() {
 /// own cleanup. `cleanup_stale_mount` must detect and force-unmount it so
 /// the SAME directory can be mounted again.
 ///
+/// CI fix round (post-Task-3 two-instance fix): `cleanup_stale_mount` is
+/// no longer "force-detect and force-unmount by path alone" — see
+/// `mount.rs`'s `linux_impl` module doc's "Stale-mount detection" section.
+/// It now additionally consults the `<cache_dir>/mount.port` marker
+/// `mount()` records (this process's pid on Linux — there is no port for a
+/// FUSE mount) and only treats a mount-table match as stale once that
+/// SPECIFIC recorded owner is confirmed dead. `abort_server_for_tests`
+/// alone (a `mem::forget`, not a real process death) leaves the mount's
+/// OWNER PID pointing at THIS VERY TEST PROCESS, which is very much still
+/// running — under the new semantics that is indistinguishable from a
+/// live sibling instance's healthy mount, and `cleanup_stale_mount`
+/// correctly refuses to touch it (this is the two-instance guarantee
+/// working as designed, not a bug: a real crash always means a dead pid,
+/// and an in-process test can't produce one just by abandoning a session
+/// while the test's own process keeps running). So this test now also
+/// overwrites the marker with a PROVABLY DEAD pid — the same technique
+/// `mounting_over_a_stale_leftover_mountpoint_succeeds_via_pre_clean`
+/// above already uses: spawn and wait out a trivial child process
+/// (`/bin/true`), then write its (now guaranteed-dead) pid over the real
+/// one `mount()` recorded — making the marker's owner genuinely
+/// unreachable without needing this test's own process to die, which is
+/// what a real crash actually leaves behind.
+///
 /// Deliberately weaker than `mounted_macos.rs`'s crash test in one respect,
 /// disclosed rather than hidden: that test needs a whole dedicated-runtime-
 /// shutdown dance to make its server GENUINELY unreachable, because
@@ -176,10 +199,11 @@ async fn a_mounted_drive_lists_reads_and_writes_through_std_fs() {
 /// separately hunt down. The mount left behind by `abort_server_for_tests`
 /// is therefore a LIVE, still-answering server nobody unmounted — not a
 /// genuinely dead one — but that difference doesn't matter for what this
-/// test is actually proving: `cleanup_stale_mount` never probes whether
-/// anything is alive behind a mount (see its own doc, both platforms);
-/// it force-detects and force-unmounts by path alone, which works
-/// identically against a live-but-abandoned mount or a truly dead one.
+/// test is actually proving: `cleanup_stale_mount` never probes the mount
+/// or session itself for liveness (see its own doc, both platforms); once
+/// its OWNER is confirmed dead, it force-detects and force-unmounts by
+/// path alone, which works identically against a live-but-abandoned mount
+/// or a truly dead one.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stale_mount_from_a_crashed_server_is_cleaned_and_remountable() {
     let env = VfsTestEnv::new().await;
@@ -200,6 +224,21 @@ async fn a_stale_mount_from_a_crashed_server_is_cleaned_and_remountable() {
     // see this test's own doc for why this is a sufficient (if weaker than
     // macOS's) stand-in for a genuinely dead server.
     mounted.abort_server_for_tests();
+
+    // Overwrite the marker `mount()` just wrote (this process's own, live
+    // pid) with one that is definitively dead — see the test's own doc.
+    // Without this, the marker's owner is THIS test process, still alive,
+    // and `cleanup_stale_mount` would (correctly, under the two-instance
+    // fix) refuse to touch it.
+    let dead_pid = blocking_with_timeout(|| {
+        let mut child = std::process::Command::new("/bin/true").spawn().expect("spawn /bin/true");
+        let pid = child.id();
+        child.wait().expect("wait for /bin/true");
+        pid
+    })
+    .await;
+    std::fs::write(env.cache_dir().join("mount.port"), dead_pid.to_string())
+        .expect("overwrite the mount marker with a dead pid");
 
     let cleaned = tokio::time::timeout(
         Duration::from_secs(15),
