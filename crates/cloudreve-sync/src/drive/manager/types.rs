@@ -2,6 +2,7 @@ use crate::drive::mounts::{DriveConfig, DriveMode};
 use crate::inventory::TaskRecord;
 use crate::tasks::TaskProgress;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DriveState {
@@ -23,6 +24,16 @@ pub struct StatusSummary {
     pub conflicts: Vec<ConflictInfo>,
     /// Drive IDs that are currently paused
     pub paused_drives: Vec<String>,
+    /// D7: pending on-demand upload count per drive id, keyed for every
+    /// `DriveMode::OnDemand` drive (a `FullMirror` drive is simply absent —
+    /// its pending count is tracked by `active_tasks` instead). Present
+    /// even while the drive is paused: the vfs event pump keeps running
+    /// across a pause/resume cycle (see `Mount::spawn_vfs_event_pump`'s
+    /// doc), so this is its last-known count, not necessarily "right now".
+    /// Mirrors `Mount::vfs_pending_uploads`; see that field's doc for the
+    /// counting rules.
+    #[serde(default)]
+    pub pending_uploads: HashMap<String, u64>,
 }
 
 /// A file conflict awaiting user resolution

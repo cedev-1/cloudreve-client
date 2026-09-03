@@ -185,6 +185,38 @@ pub struct Mount {
     /// channel, `None` under the same conditions as `vfs`. Task 5 consumes
     /// this.
     pub vfs_events: Mutex<Option<mpsc::UnboundedReceiver<VfsEvent>>>,
+    /// D6: background worker draining `vfs_events` into
+    /// `vfs_pending_uploads`/`vfs_failed_uploads` and toasts — see
+    /// `spawn_vfs_event_pump`'s doc. Unlike every other `*_handle` slot
+    /// below, `pause()` deliberately never aborts this one: see
+    /// `spawn_vfs_event_pump`'s doc for why.
+    vfs_event_pump_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    /// On-demand mode only (D6): count of upload cycles currently between
+    /// their `VfsEvent::UploadQueued` and one of the five terminal events
+    /// documented on `VfsEvent` (`UploadSucceeded`/`UploadFailed`/
+    /// `UploadCancelled`/`UploadRenamed`/`ConflictSaved`). Folded by
+    /// `fold_vfs_event`; read by `DriveManager::get_status_summary` (D7).
+    /// Reconciles against on-disk `DraftStore` state for free on every
+    /// (re)start: `Vfs::new` itself re-arms every still-`Pending` draft for
+    /// immediate upload before returning
+    /// (`WriteBackQueue::enqueue_immediate`), synchronously sending a
+    /// fresh `UploadQueued` for each one into the very channel this pump
+    /// drains — see `spawn_vfs_event_pump`'s doc for why none of those
+    /// startup events are ever lost.
+    pub vfs_pending_uploads: std::sync::atomic::AtomicU64,
+    /// On-demand mode only (D6): count of `VfsEvent::UploadFailed
+    /// { will_retry: false }` events observed since this `Mount` was
+    /// constructed — a permanent give-up for that particular upload cycle
+    /// (the draft itself survives, parked back `Pending` for a future
+    /// manual/automatic retry, which starts a brand new `UploadQueued`/
+    /// terminal cycle of its own rather than clearing this count). Purely
+    /// an in-session counter: `DraftState` has no on-disk "failed" variant
+    /// to reconcile against (unlike `vfs_pending_uploads` above) — a give-
+    /// up is persisted identically to an ordinary still-pending draft, so
+    /// there is nothing on disk this could resync from even if it wanted
+    /// to. A coarse dashboard signal (D6: "no task-row parity with
+    /// full-mirror in 1.1"), not an exact per-file ledger.
+    pub vfs_failed_uploads: std::sync::atomic::AtomicU64,
     /// Test-only: see `vfs_mode::MountTestHook`'s doc. `None` on every
     /// production path.
     vfs_mount_test_hook: Mutex<Option<Arc<MountTestHook>>>,
@@ -291,6 +323,9 @@ impl Mount {
             mounted_vfs: Mutex::new(None),
             vfs: Mutex::new(None),
             vfs_events: Mutex::new(None),
+            vfs_event_pump_handle: Arc::new(Mutex::new(None)),
+            vfs_pending_uploads: std::sync::atomic::AtomicU64::new(0),
+            vfs_failed_uploads: std::sync::atomic::AtomicU64::new(0),
             vfs_mount_test_hook: Mutex::new(None),
             sync_lock: Mutex::new(()),
             cr_client,
@@ -699,6 +734,143 @@ impl Mount {
         Self::replace_worker(&self.remote_event_handle, handle).await;
     }
 
+    /// D6: spawn the `VfsEvent` pump — takes ownership of `vfs_events` (the
+    /// receiver `start_on_demand` populated) and folds every event it sees
+    /// into `vfs_pending_uploads`/`vfs_failed_uploads` plus a toast for the
+    /// two user-facing terminals (`ConflictSaved`, `UploadFailed` with
+    /// `will_retry: false`). A no-op for a `FullMirror` drive, or if this
+    /// is called a second time for the same on-demand drive: `vfs_events`
+    /// is `Mutex<Option<...>>` and `.take()`n exactly once, mirroring
+    /// `mounted_vfs`/`vfs`'s own "only ever set once per lifetime" shape —
+    /// see the field's own doc.
+    ///
+    /// DELIBERATELY never re-spawned or torn down by `pause()`/
+    /// `resume_drive` (unlike `remote_event_handle`/`periodic_sync_handle`/
+    /// `props_refresh_handle`, all stopped while paused and respawned on
+    /// resume): `remount_on_demand` (D5) reuses the SAME `Vfs` instance —
+    /// and therefore the SAME `VfsEvent` channel — across a pause/resume
+    /// cycle rather than rebuilding it, so the receiver this pump owns is
+    /// the only one that will ever exist for this `Mount`'s whole
+    /// lifetime. Aborting the task that owns it (as `pause()` does to the
+    /// other workers) would drop that receiver for good — `vfs_events`
+    /// only ever gets set once, by `start_on_demand` — permanently
+    /// freezing the counters with no way to recover on resume. There is
+    /// also nothing network-related here to stop: unlike the SSE
+    /// worker/periodic sync/props refresh, this pump makes no requests of
+    /// its own — it only observes activity the `Vfs`'s own write-back queue
+    /// keeps running regardless of pause (only the OS-level mount attachment
+    /// goes away on pause, per `unmount_on_demand`'s doc). `shutdown()`
+    /// aborts it like every other worker, since that IS real teardown with
+    /// no resume to come back from.
+    pub async fn spawn_vfs_event_pump(self: &Arc<Self>) {
+        let Some(mut events) = self.vfs_events.lock().await.take() else {
+            return;
+        };
+        let mount = self.clone();
+        let handle = tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                mount.fold_vfs_event(event).await;
+            }
+        });
+        Self::replace_worker(&self.vfs_event_pump_handle, handle).await;
+    }
+
+    /// D6: folds one `VfsEvent` into the counters/toasts — see
+    /// `spawn_vfs_event_pump`'s doc and `vfs_pending_uploads`/
+    /// `vfs_failed_uploads`'s field docs for the accounting rules. Every
+    /// terminal variant (all but `UploadQueued`) decrements
+    /// `vfs_pending_uploads` exactly once, matching the "one `UploadQueued`,
+    /// exactly one terminal" contract documented on `VfsEvent` itself —
+    /// including `UploadRenamed`, whose immediately-following fresh
+    /// `UploadQueued` (per that same contract) re-increments it right back,
+    /// net zero, correctly reflecting that the cycle merely continued under
+    /// a new name rather than actually finishing.
+    async fn fold_vfs_event(&self, event: VfsEvent) {
+        use std::sync::atomic::Ordering;
+
+        let dec_pending = || {
+            let _ = self.vfs_pending_uploads.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_sub(1))
+            });
+        };
+
+        match event {
+            VfsEvent::UploadQueued { .. } => {
+                self.vfs_pending_uploads.fetch_add(1, Ordering::Relaxed);
+            }
+            VfsEvent::UploadSucceeded { .. } => {
+                dec_pending();
+            }
+            VfsEvent::UploadCancelled { .. } => {
+                dec_pending();
+            }
+            VfsEvent::UploadRenamed { .. } => {
+                dec_pending();
+            }
+            VfsEvent::UploadFailed { remote_path, error, will_retry } => {
+                dec_pending();
+                if !will_retry {
+                    self.vfs_failed_uploads.fetch_add(1, Ordering::Relaxed);
+                    let display_path = self.remote_uri_to_display_path(&remote_path).await;
+                    toast::send_warning_toast(
+                        "Upload failed",
+                        &format!("{}: {error}", display_path.display()),
+                    );
+                }
+            }
+            VfsEvent::ConflictSaved { original, conflict_copy: _ } => {
+                dec_pending();
+                // Reviewer fix (Task 5): `original` is a facade-internal
+                // `cloudreve://…` remote uri (`VfsEvent`'s own doc; traced
+                // to `ConflictSaved`'s emission site in `writeback.rs`,
+                // which passes `remote_path.to_string()` straight through —
+                // `NodeAttr::remote_path` for a child is built as
+                // `format!("{parent_path}/{name}")` off the tree's
+                // `remote_base`, so it is NEVER a local path). Every OTHER
+                // `send_conflict_toast` call site (`tasks/upload.rs`,
+                // `tasks/download.rs`, `drive/sync.rs`) passes a genuine
+                // local filesystem path — `toast.rs` renders it with
+                // `path.display()` on that assumption. Passing the raw uri
+                // straight through leaked "cloudreve://my/sync/…" to the
+                // user instead of a path they'd recognize; map it onto the
+                // drive's local mounted path first, the exact inverse of
+                // D8's `handle_view_online` mapping.
+                let display_path = self.remote_uri_to_display_path(&original).await;
+                toast::send_conflict_toast(&self.id, &display_path, 0);
+            }
+        }
+    }
+
+    /// Maps a facade-internal `cloudreve://…` remote uri (as carried by
+    /// `VfsEvent::ConflictSaved`/`UploadFailed`) onto the local path a user
+    /// would recognize under this drive's mounted `sync_path` — the exact
+    /// inverse of `local_path_to_cr_uri` (D8's `handle_view_online`
+    /// mapping), reusing the existing `remote_path_to_local_relative_path`
+    /// helper rather than duplicating its uri-relativization logic.
+    ///
+    /// Falls back to just the uri's last path segment (its file/dir name)
+    /// if the inversion is ever unsound — `remote_path` failing to parse as
+    /// a `CrUri`, or not actually living under this drive's `remote_path`
+    /// (shouldn't happen: every uri this is called with was built from THIS
+    /// drive's own tree) — an honest best-effort display, never the raw uri.
+    async fn remote_uri_to_display_path(&self, remote_path: &str) -> PathBuf {
+        let (remote_base, sync_path) = {
+            let config = self.config.read().await;
+            (config.remote_path.clone(), config.sync_path.clone())
+        };
+        let mapped = (|| -> Result<PathBuf> {
+            use cloudreve_api::models::uri::CrUri;
+            let remote = CrUri::new(remote_path)?;
+            let base = CrUri::new(&remote_base)?;
+            let relative = crate::drive::utils::remote_path_to_local_relative_path(&remote, &base)?;
+            Ok(sync_path.join(relative))
+        })();
+        mapped.unwrap_or_else(|_| {
+            let name = remote_path.rsplit('/').next().unwrap_or(remote_path);
+            sync_path.join(name)
+        })
+    }
+
     /// Spawn a task to periodically refresh drive properties (quota, etc.)
     pub async fn spawn_props_refresh_task(self: &Arc<Self>) {
         let mount = self.clone();
@@ -866,6 +1038,12 @@ impl Mount {
             h.abort();
         }
         if let Some(h) = self.props_refresh_handle.lock().await.take() {
+            h.abort();
+        }
+        // Unlike pause() (see `vfs_event_pump_handle`'s field doc), real
+        // teardown DOES abort the vfs event pump — there is no resume to
+        // come back from here.
+        if let Some(h) = self.vfs_event_pump_handle.lock().await.take() {
             h.abort();
         }
 
