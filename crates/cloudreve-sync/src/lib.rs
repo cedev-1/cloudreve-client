@@ -14,7 +14,7 @@ pub use cloudreve_uploader as uploader;
 // Re-export commonly used types
 pub use config::{AppConfig, ConfigManager};
 pub use drive::manager::{ConflictInfo, ConflictResolution, DriveInfo, DriveInfoStatus, DriveManager, StatusSummary, TaskWithProgress};
-pub use drive::mounts::{Credentials, DriveConfig};
+pub use drive::mounts::{Credentials, DriveConfig, DriveMode};
 pub use events::{Event, EventBroadcaster, SummaryNotifier};
 pub use logging::{LogConfig, LogGuard};
 

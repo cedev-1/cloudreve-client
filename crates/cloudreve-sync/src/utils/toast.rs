@@ -15,6 +15,13 @@ static OS_NOTIFIER: OnceLock<UnboundedSender<(String, String)>> = OnceLock::new(
 static LOW_DISK_THROTTLE: LazyLock<Throttle> =
     LazyLock::new(|| Throttle::new(Duration::from_secs(3600)));
 
+/// An on-demand drive's effective cache cap (D3) is recomputed on every
+/// mount/remount (pause+resume, app relaunch), which would otherwise repeat
+/// the same warning every time — throttled per drive like the low-disk-space
+/// warning above.
+static SMALL_VFS_CACHE_THROTTLE: LazyLock<Throttle> =
+    LazyLock::new(|| Throttle::new(Duration::from_secs(3600)));
+
 /// Rate limiter keyed by an arbitrary string (a drive id, in practice).
 /// Keeps a bulk operation from producing one notification per file.
 struct Throttle {
@@ -128,6 +135,27 @@ pub fn send_low_disk_space_toast(drive_id: &str, drive_name: &str, required: u64
         "Low disk space notification"
     );
     push_notification("Not enough disk space", message);
+}
+
+/// Warn that an on-demand drive's effective cache cap (D3) was clamped
+/// below the 10 GiB default because of limited free space. Throttled to at
+/// most one notification per hour per drive.
+pub fn send_small_vfs_cache_toast(drive_id: &str, drive_name: &str, cap: u64) {
+    if !SMALL_VFS_CACHE_THROTTLE.allow(drive_id) {
+        return;
+    }
+    let clamp = |b: u64| b.min(i64::MAX as u64) as i64;
+    let message = format!(
+        "{drive_name}'s on-demand cache is limited to {} because of low disk space.",
+        format_bytes(clamp(cap)),
+    );
+    tracing::warn!(
+        target: "toast",
+        drive_id = drive_id,
+        cap = cap,
+        "Small on-demand cache cap notification"
+    );
+    push_notification("Limited on-demand cache", message);
 }
 
 #[cfg(test)]

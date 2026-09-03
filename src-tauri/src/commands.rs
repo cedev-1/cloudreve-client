@@ -2,7 +2,7 @@ use crate::AppStateHandle;
 use chrono::{Duration, Utc};
 use cloudreve_api::api::UserApi;
 use cloudreve_sync::{
-    config::LogLevel, ConfigManager, ConflictResolution, Credentials, DriveConfig, DriveInfo,
+    config::LogLevel, ConfigManager, ConflictResolution, Credentials, DriveConfig, DriveInfo, DriveMode,
     StatusSummary,
 };
 #[cfg(target_os = "macos")]
@@ -112,6 +112,10 @@ pub async fn add_drive(
         ignore_patterns: Vec::new(),
         max_file_size_mb: 3072,
         sse_client_id,
+        // Task 6 threads the real value through `AddDriveArgs`; this keeps
+        // today's behavior (every drive added through this command is a
+        // full mirror) unchanged until that lands.
+        mode: DriveMode::FullMirror,
         extra: Default::default(),
     };
 

@@ -818,6 +818,7 @@ dependencies = [
  "chrono",
  "cloudreve-api",
  "cloudreve-uploader",
+ "cloudreve-vfs",
  "dark-light",
  "dashmap",
  "diesel",

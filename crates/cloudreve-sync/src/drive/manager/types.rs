@@ -1,4 +1,4 @@
-use crate::drive::mounts::DriveConfig;
+use crate::drive::mounts::{DriveConfig, DriveMode};
 use crate::inventory::TaskRecord;
 use crate::tasks::TaskProgress;
 use serde::{Deserialize, Serialize};
@@ -136,6 +136,8 @@ pub struct DriveInfo {
     pub status: DriveInfoStatus,
     /// Capacity summary (None if not available)
     pub capacity: Option<CapacitySummary>,
+    /// Full mirror vs. on-demand (D1)
+    pub mode: DriveMode,
 }
 
 /// Drive status for the settings UI
