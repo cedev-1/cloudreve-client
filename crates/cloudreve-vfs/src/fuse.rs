@@ -475,6 +475,10 @@ fn to_errno(errno: FrontendErrno) -> i32 {
         FrontendErrno::Stale => libc::ESTALE,
         FrontendErrno::Exist => libc::EEXIST,
         FrontendErrno::Busy => libc::EBUSY,
+        // Phase 4, deliverable D: unlike `nfs.rs`'s `JUKEBOX` stand-in for
+        // `Busy`, libc has a real, purpose-built errno for this exact
+        // condition.
+        FrontendErrno::NotEmpty => libc::ENOTEMPTY,
         FrontendErrno::Io => libc::EIO,
     }
 }
@@ -522,5 +526,58 @@ fn to_system_time(secs: i64) -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(secs as u64)
     } else {
         SystemTime::UNIX_EPOCH
+    }
+}
+
+// Errno-table mapping tests only (phase 4, deliverable D — mirrors
+// `nfs.rs`'s equivalent test module): this whole file is
+// `#[cfg(target_os = "linux")]`-gated (see the module doc), so these never
+// run or even compile on this (macOS) development machine — validated only
+// by the Linux CI job, same platform-honesty caveat as every other claim in
+// this file.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vfs::{DirNotEmptyError, RenameBusyError, StaleHandleError, UnlinkBusyError};
+
+    #[test]
+    fn not_found_maps_to_enoent() {
+        assert_eq!(to_errno(FrontendErrno::NotFound), libc::ENOENT);
+    }
+
+    #[test]
+    fn stale_handle_error_maps_to_estale() {
+        let err = anyhow::Error::new(StaleHandleError { remote_path: "x".into() });
+        assert_eq!(errno_for(&err), libc::ESTALE);
+    }
+
+    #[test]
+    fn rename_busy_error_maps_to_ebusy() {
+        let err = anyhow::Error::new(RenameBusyError { remote_path: "x".into() });
+        assert_eq!(errno_for(&err), libc::EBUSY);
+    }
+
+    #[test]
+    fn unlink_busy_error_maps_to_ebusy() {
+        let err = anyhow::Error::new(UnlinkBusyError { remote_path: "x".into() });
+        assert_eq!(errno_for(&err), libc::EBUSY);
+    }
+
+    #[test]
+    fn dir_not_empty_error_maps_to_enotempty() {
+        let err = anyhow::Error::new(DirNotEmptyError { remote_path: "x".into() });
+        assert_eq!(errno_for(&err), libc::ENOTEMPTY);
+    }
+
+    #[test]
+    fn eexist_marker_maps_to_eexist() {
+        let err = anyhow::anyhow!("EEXIST: an entry named \"dup.txt\" already exists");
+        assert_eq!(errno_for(&err), libc::EEXIST);
+    }
+
+    #[test]
+    fn an_unrecognized_error_maps_to_eio() {
+        let err = anyhow::anyhow!("some transient failure");
+        assert_eq!(errno_for(&err), libc::EIO);
     }
 }

@@ -386,6 +386,10 @@ fn to_nfsstat3(errno: FrontendErrno) -> nfsstat3 {
         // (Task 4) lands, since `fuser` handles persist across calls by
         // design rather than by scheduler timing.
         FrontendErrno::Busy => nfsstat3::NFS3ERR_JUKEBOX,
+        // D2 (phase 4, deliverable D): NFSv3's direct, purpose-built code
+        // for exactly this condition — a real REMOVE/RMDIR-equivalent
+        // refusal, unlike `Busy`'s judgment-call stand-in above.
+        FrontendErrno::NotEmpty => nfsstat3::NFS3ERR_NOTEMPTY,
         FrontendErrno::Io => nfsstat3::NFS3ERR_IO,
     }
 }
@@ -428,7 +432,7 @@ fn to_nfstime3(secs: i64) -> nfstime3 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vfs::{RenameBusyError, StaleHandleError};
+    use crate::vfs::{DirNotEmptyError, RenameBusyError, StaleHandleError, UnlinkBusyError};
 
     #[test]
     fn not_found_maps_to_noent() {
@@ -445,6 +449,18 @@ mod tests {
     fn rename_busy_error_maps_to_jukebox() {
         let err = anyhow::Error::new(RenameBusyError { remote_path: "x".into() });
         assert_eq!(to_errno(&err), nfsstat3::NFS3ERR_JUKEBOX);
+    }
+
+    #[test]
+    fn unlink_busy_error_maps_to_jukebox() {
+        let err = anyhow::Error::new(UnlinkBusyError { remote_path: "x".into() });
+        assert_eq!(to_errno(&err), nfsstat3::NFS3ERR_JUKEBOX);
+    }
+
+    #[test]
+    fn dir_not_empty_error_maps_to_notempty() {
+        let err = anyhow::Error::new(DirNotEmptyError { remote_path: "x".into() });
+        assert_eq!(to_errno(&err), nfsstat3::NFS3ERR_NOTEMPTY);
     }
 
     #[test]

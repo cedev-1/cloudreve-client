@@ -312,3 +312,48 @@ async fn readdir_reports_a_preexisting_remote_directory_as_a_directory() {
     let attr = fs.getattr(&id).await.unwrap();
     assert_eq!(attr.type_, nfs3_server::nfs3_types::nfs3::ftype3::NF3DIR);
 }
+
+/// Phase 4, deliverable D: `remove` (NFSv3's single call for both files and
+/// directories, see `nfs.rs`'s doc) on a non-empty directory must surface
+/// `NFS3ERR_NOTEMPTY`, driven through the real `NfsFileSystem` trait object
+/// (not just a unit test of the mapping function) — this facade never does a
+/// recursive delete.
+#[tokio::test]
+async fn removing_a_non_empty_directory_maps_to_notempty() {
+    let env = VfsTestEnv::new().await;
+    env.expect_namespace_ops().await;
+    env.set_remote_files(vec![remote_dir("docs")]).await;
+    let mut inside = remote_file("inside.txt", 5, "e1");
+    inside["path"] = serde_json::json!(format!("{}/docs/inside.txt", common::REMOTE_BASE));
+    env.set_remote_files_at("docs", vec![inside]).await;
+
+    let (vfs, _rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+    let fs = VfsNfs::new(Arc::new(vfs));
+    let root = fs.root_dir();
+
+    let err = fs.remove(&root, &fname("docs")).await.unwrap_err();
+    assert_eq!(err, nfsstat3::NFS3ERR_NOTEMPTY);
+    assert_eq!(env.delete_call_count(), 0, "a refused rmdir must never have reached the server");
+    assert!(fs.lookup(&root, &fname("docs")).await.is_ok(), "the directory must still resolve");
+}
+
+/// The positive case: an empty directory removes cleanly through `remove`.
+#[tokio::test]
+async fn removing_an_empty_directory_succeeds() {
+    let env = VfsTestEnv::new().await;
+    env.expect_namespace_ops().await;
+    env.set_remote_files(vec![remote_dir("empty-dir")]).await;
+    env.set_remote_files_at("empty-dir", vec![]).await;
+
+    let (vfs, _rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+    let fs = VfsNfs::new(Arc::new(vfs));
+    let root = fs.root_dir();
+
+    fs.remove(&root, &fname("empty-dir")).await.expect("removing an empty directory should succeed");
+    assert_eq!(env.delete_call_count(), 1);
+    assert_eq!(fs.lookup(&root, &fname("empty-dir")).await.unwrap_err(), nfsstat3::NFS3ERR_NOENT);
+}

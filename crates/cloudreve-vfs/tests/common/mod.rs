@@ -472,6 +472,24 @@ impl VfsTestEnv {
                     let (parent_uri, _old_name) =
                         request.uri.rsplit_once('/').unwrap_or(("", request.uri.as_str()));
                     let new_path = format!("{parent_uri}/{}", request.new_name);
+                    // Fix round 1 (C1): the REAL Cloudreve server refuses a
+                    // rename onto an existing sibling name with
+                    // `ErrFileExisted`/`ObjectExisted` (40004) —
+                    // `dbfs/manage.go`'s `Rename` returns it on the
+                    // sibling-name uniqueness constraint violation. An
+                    // earlier version of this mock made this an overwrite
+                    // instead, which is NOT what the real server does; the
+                    // facade (`Vfs::rename`) is what bridges POSIX/NFSv3's
+                    // replace-on-rename expectation, not this mock. No
+                    // state is mutated on refusal — same idiom
+                    // `expect_uploads`'s `ObjectExisted` simulation already
+                    // uses for the identical code.
+                    if path_exists_in_files(&files, &new_path) {
+                        return ResponseTemplate::new(200).set_body_json(json!({
+                            "code": 40004,
+                            "msg": "mock: object already exists (rename destination)",
+                        }));
+                    }
                     let mut entry = remove_entry_by_path(&mut files, &request.uri)
                         .expect("mock: rename_file on an unknown uri");
                     entry["name"] = json!(request.new_name.clone());
@@ -503,6 +521,23 @@ impl VfsTestEnv {
                         req.body_json().expect("decode MoveFileService body");
                     *last_move.lock().unwrap() = Some((request.uris.clone(), request.dst.clone()));
                     let mut files = files.lock().unwrap();
+                    // Fix round 1 (C1): same real-server refusal as
+                    // `rename_file` above — `SetParent` (the move path)
+                    // returns the identical `ErrFileExisted` on a
+                    // destination-name collision. Checked for every source
+                    // uri BEFORE mutating anything, so a batch that would
+                    // partially collide fails atomically rather than
+                    // relocating some entries and refusing others.
+                    for uri in &request.uris {
+                        let name = uri.rsplit('/').next().unwrap_or_default();
+                        let new_path = format!("{}/{name}", request.dst);
+                        if path_exists_in_files(&files, &new_path) {
+                            return ResponseTemplate::new(200).set_body_json(json!({
+                                "code": 40004,
+                                "msg": "mock: object already exists (move destination)",
+                            }));
+                        }
+                    }
                     for uri in &request.uris {
                         let Some(mut entry) = remove_entry_by_path(&mut files, uri) else {
                             continue;

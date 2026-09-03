@@ -5,7 +5,10 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use cloudreve_vfs::vfs::{CreatePauseHook, RenameBusyError, Vfs, DEFAULT_CACHE_MAX_BYTES};
+use cloudreve_vfs::vfs::{
+    CreatePauseHook, DirNotEmptyError, OpenPauseHook, RenameBusyError, UnlinkBusyError, Vfs,
+    DEFAULT_CACHE_MAX_BYTES,
+};
 use common::{remote_dir, remote_file, VfsTestEnv};
 use serde_json::json;
 
@@ -192,6 +195,15 @@ async fn renaming_a_drafted_new_file_uploads_to_the_new_name_with_no_rename_call
 
 /// Unlinking a file that was `create`d but never uploaded must never call
 /// the delete API: nothing exists remotely to delete.
+///
+/// Phase 4 (deliverable B) closes the handle before unlinking, unlike this
+/// test's original phase-2 form: `create`'s own handle stays registered in
+/// `open_files` until explicitly closed, and unlinking a file that is still
+/// open is now correctly refused with `UnlinkBusyError` (see that guard's
+/// own tests) — this test's actual point (a never-uploaded draft's unlink
+/// skips the delete API) is unaffected by closing the handle first, which
+/// is also the sequence any real editor/frontend produces anyway (save,
+/// then delete, never delete while still holding the fd open).
 #[tokio::test]
 async fn unlinking_a_drafted_new_file_makes_no_delete_call() {
     let env = VfsTestEnv::new().await;
@@ -205,6 +217,7 @@ async fn unlinking_a_drafted_new_file_makes_no_delete_call() {
 
     let (_node, h) = vfs.create(root, "ephemeral.txt").await.unwrap();
     vfs.write(h, 0, b"short lived").await.unwrap();
+    vfs.close(h).await.unwrap();
 
     vfs.unlink(root, "ephemeral.txt").await.expect("unlink should succeed locally");
 
@@ -608,4 +621,300 @@ async fn renaming_a_directory_ignores_an_open_handle_in_a_same_prefixed_sibling(
             .expect("renaming docs2 while docs/file.txt is open must succeed");
         assert!(vfs.lookup(root, "docs2-renamed").await.unwrap().is_some());
     }
+}
+
+// ---------------------------------------------------------------------
+// Phase 4, Task 2: the hierarchical namespace lock (D10), editor-save
+// semantics (unlink-of-open-file, rename-onto-open-destination), and
+// rmdir NOTEMPTY.
+// ---------------------------------------------------------------------
+
+/// D10's whole point: without `namespace_lock`, a directory rename's
+/// subtree check and a BRAND-NEW descendant `open` racing it use unrelated
+/// per-path lock keys and can interleave — the phase-3 final review's
+/// disclosed "check-then-act across different lock keys" residual. This
+/// test proves the FIX is a real WAIT, not just an eventual busy answer: the
+/// racing `open` is parked deterministically (via `OpenPauseHook`, the same
+/// widening idiom `CreatePauseHook` already uses for `create`'s analogous
+/// window) mid-registration, and the rename must be observably STILL
+/// BLOCKED while the open sits parked — only completing (as EBUSY) once the
+/// open resumes and actually registers its handle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_directory_rename_waits_for_a_racing_descendant_open_then_refuses_it() {
+    let env = VfsTestEnv::new().await;
+    env.expect_namespace_ops().await;
+    env.set_remote_files(vec![remote_dir("docs")]).await;
+    env.set_remote_files_at("docs", vec![nested_remote_file("docs", "inside.txt", 5, "e1")]).await;
+    env.serve_file_content("inside.txt", b"hello").await;
+
+    let (vfs, _rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+    let vfs = Arc::new(vfs);
+    let root = vfs.tree().root();
+    let docs = vfs.lookup(root, "docs").await.unwrap().unwrap().0;
+    let inside = vfs.lookup(docs, "inside.txt").await.unwrap().unwrap().0;
+
+    let hook = Arc::new(OpenPauseHook::new());
+    vfs.pause_open_before_registration_for_tests(hook.clone());
+
+    let vfs_a = vfs.clone();
+    let open_task = tokio::spawn(async move { vfs_a.open(inside).await });
+
+    // Wait until `open` has resolved the descendant's attrs and is parked
+    // just before registering its handle — the exact window D10 must close.
+    hook.parked.notified().await;
+
+    let vfs_b = vfs.clone();
+    let rename_task =
+        tokio::spawn(async move { vfs_b.rename(root, "docs", root, "docs-renamed").await });
+
+    // The rename must still be blocked on `namespace_lock` (held `read()`
+    // by the parked open). Give it a real chance to have reached that
+    // point, then prove it has NOT finished (i.e. did not interleave with
+    // the still-parked open) while the open sits parked.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        !rename_task.is_finished(),
+        "the directory rename must wait for the racing open to finish, not interleave with it"
+    );
+
+    hook.resume.notify_one();
+
+    let open_result = open_task.await.unwrap();
+    let h = open_result.expect("the racing open must still succeed once resumed");
+
+    let rename_result = rename_task.await.unwrap();
+    let err = rename_result.expect_err(
+        "a directory rename must refuse once it sees the descendant's now-registered open handle",
+    );
+    assert!(err.downcast_ref::<RenameBusyError>().is_some(), "expected a RenameBusyError, got: {err:#}");
+    assert_eq!(env.rename_call_count(), 0, "a refused directory rename must never have reached the server");
+
+    vfs.close(h).await.unwrap();
+    vfs.rename(root, "docs", root, "docs-renamed")
+        .await
+        .expect("renaming should succeed once the descendant's handle is closed");
+}
+
+/// Deliverable B: unlinking a file with a currently open handle must be
+/// refused — an open handle's later write must not be able to resurrect a
+/// file someone else just deleted. Closing the handle lifts the guard.
+#[tokio::test]
+async fn unlinking_a_file_with_an_open_handle_is_refused() {
+    let env = VfsTestEnv::new().await;
+    env.expect_namespace_ops().await;
+    env.add_remote_file("busy-unlink.txt", b"hello".to_vec(), "e1").await;
+
+    let (vfs, _rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+    let root = vfs.tree().root();
+    let node = vfs.lookup(root, "busy-unlink.txt").await.unwrap().unwrap().0;
+    let h = vfs.open(node).await.unwrap();
+
+    let result = vfs.unlink(root, "busy-unlink.txt").await;
+    let err = result.expect_err("unlinking a file with an open handle must be refused");
+    assert!(err.downcast_ref::<UnlinkBusyError>().is_some(), "expected an UnlinkBusyError, got: {err:#}");
+    assert_eq!(env.delete_call_count(), 0, "a refused unlink must never have reached the server");
+    assert!(
+        vfs.lookup(root, "busy-unlink.txt").await.unwrap().is_some(),
+        "the entry must still resolve while the handle is open"
+    );
+
+    vfs.close(h).await.unwrap();
+
+    vfs.unlink(root, "busy-unlink.txt")
+        .await
+        .expect("unlink should succeed once the handle is closed");
+    assert_eq!(env.delete_call_count(), 1);
+    assert!(vfs.lookup(root, "busy-unlink.txt").await.unwrap().is_none());
+}
+
+/// Deliverable C, scenario (a) — REMOTE-source atomic save (fix round 1,
+/// C1): the atomic-save idiom (write a tmp file, then rename it OVER the
+/// target) must not silently clobber a handle's view of a target it still
+/// has open. Closing the destination handle lifts the guard, and the rename
+/// then replaces the destination's content — against the mock's REFUSING
+/// `rename_file` (the real Cloudreve server's actual 40004 behavior, see
+/// `tests/common/mod.rs`), proving the facade's delete-then-rename bridge
+/// actually runs (`delete_call_count`), not that the mock quietly allows an
+/// overwrite it never would in production.
+#[tokio::test]
+async fn renaming_onto_an_open_destination_is_refused() {
+    let env = VfsTestEnv::new().await;
+    env.expect_namespace_ops().await;
+    env.add_remote_file("source.txt", b"new content".to_vec(), "e1").await;
+    env.add_remote_file("target.txt", b"old content".to_vec(), "e2").await;
+
+    let (vfs, _rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+    let root = vfs.tree().root();
+    let target_node = vfs.lookup(root, "target.txt").await.unwrap().unwrap().0;
+    let h = vfs.open(target_node).await.unwrap();
+
+    let result = vfs.rename(root, "source.txt", root, "target.txt").await;
+    let err = result.expect_err("renaming onto an open destination must be refused");
+    assert!(err.downcast_ref::<RenameBusyError>().is_some(), "expected a RenameBusyError, got: {err:#}");
+    assert_eq!(env.rename_call_count(), 0, "a refused rename must never have reached the server");
+    assert_eq!(env.move_call_count(), 0);
+    assert!(vfs.lookup(root, "source.txt").await.unwrap().is_some(), "the source must be untouched");
+    assert!(
+        vfs.lookup(root, "target.txt").await.unwrap().is_some(),
+        "the still-open destination must be untouched"
+    );
+
+    vfs.close(h).await.unwrap();
+
+    vfs.rename(root, "source.txt", root, "target.txt")
+        .await
+        .expect("renaming should succeed once the destination handle is closed");
+    assert_eq!(
+        env.delete_call_count(),
+        1,
+        "the bridge must delete the existing destination before the server-side rename \
+         (the real server refuses rename-onto-existing outright)"
+    );
+    assert!(vfs.lookup(root, "source.txt").await.unwrap().is_none(), "the old name must no longer resolve");
+    let (_, attr) = vfs
+        .lookup(root, "target.txt")
+        .await
+        .unwrap()
+        .expect("the destination name must still resolve, now to the source's entry");
+    assert_eq!(
+        attr.size,
+        "new content".len() as u64,
+        "the destination's old content must have been replaced by the source's"
+    );
+}
+
+/// Deliverable C, scenario (b) — the REAL atomic-save shape (fix round 1,
+/// C1): the tmp file an editor actually creates is DRAFT-ONLY (never
+/// uploaded yet, empty `base_etag`) at the moment it gets renamed over the
+/// target — unlike scenario (a) above, where both sides were already real
+/// remote files. `Vfs::rename` skips the server call entirely for a
+/// draft-only source (nothing remote to move), so the bridge here cannot be
+/// "delete then rename" — it must instead make the MIGRATED DRAFT adopt the
+/// destination's remote identity so its eventual upload lands as a rewrite,
+/// not a doomed `overwrite=false` collision that retries the identical
+/// 40004 forever (the exact bug this fix closes).
+#[tokio::test]
+async fn renaming_a_drafted_tmp_file_onto_an_existing_closed_destination_lands_the_save() {
+    let env = VfsTestEnv::new().await;
+    env.expect_namespace_ops().await;
+    env.expect_uploads().await;
+    env.add_remote_file("target.txt", b"old content".to_vec(), "e2").await;
+
+    let (vfs, _rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+    vfs.set_debounce_for_tests(Duration::from_millis(30));
+    let root = vfs.tree().root();
+
+    // The real atomic-save sequence: create a fresh tmp, write, close
+    // (Pending, debounce armed, base_etag == "") — BEFORE ever renaming it
+    // over the target. `target.txt` stays CLOSED throughout (no open
+    // handle) — this is deliberately NOT the EBUSY scenario, it's the
+    // "rename succeeds, then the save must actually land" scenario.
+    let (_node, h) = vfs.create(root, ".tmp-save").await.unwrap();
+    let new_bytes = b"freshly saved content".to_vec();
+    vfs.write(h, 0, &new_bytes).await.unwrap();
+    vfs.close(h).await.unwrap();
+
+    vfs.rename(root, ".tmp-save", root, "target.txt")
+        .await
+        .expect("renaming the drafted tmp onto the existing, closed destination should succeed");
+    assert_eq!(
+        env.delete_call_count(),
+        0,
+        "a draft-only source never existed remotely — there is nothing to delete/rename on \
+         the server, the bridge here is identity adoption, not delete-then-rename"
+    );
+    assert_eq!(env.rename_call_count(), 0);
+
+    vfs.wait_for_writeback_idle().await;
+
+    assert_eq!(
+        env.uploaded_content("target.txt"),
+        Some(new_bytes),
+        "the save must actually land on the server, not park retrying an identical 40004 \
+         forever"
+    );
+    assert_eq!(
+        env.upload_session_count(),
+        1,
+        "exactly one upload session — a correct rewrite-in-place, not a doomed \
+         overwrite=false retry loop"
+    );
+}
+
+/// Deliverable D: `rmdir` of a directory with a real, LISTED child must be
+/// refused as `NotEmpty` — this facade never does a recursive delete.
+#[tokio::test]
+async fn rmdir_with_a_listed_child_is_refused_as_not_empty() {
+    let env = VfsTestEnv::new().await;
+    env.expect_namespace_ops().await;
+    env.set_remote_files(vec![remote_dir("docs")]).await;
+    env.set_remote_files_at("docs", vec![nested_remote_file("docs", "inside.txt", 5, "e1")]).await;
+
+    let (vfs, _rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+    let root = vfs.tree().root();
+
+    let result = vfs.unlink(root, "docs").await;
+    let err = result.expect_err("rmdir of a non-empty directory must be refused");
+    assert!(err.downcast_ref::<DirNotEmptyError>().is_some(), "expected a DirNotEmptyError, got: {err:#}");
+    assert_eq!(env.delete_call_count(), 0, "a refused rmdir must never have reached the server");
+    assert!(vfs.lookup(root, "docs").await.unwrap().is_some(), "the directory must still resolve");
+}
+
+/// Deliverable D's sharper case: a child that only exists as a local,
+/// not-yet-uploaded `create()` draft (never confirmed by the server, so it
+/// would NOT show up in a real listing) must still count as an occupant —
+/// otherwise `rmdir` could destroy an unsaved edit the user just made inside
+/// the directory a moment ago.
+#[tokio::test]
+async fn rmdir_with_only_a_drafted_child_is_refused_as_not_empty() {
+    let env = VfsTestEnv::new().await;
+    env.expect_namespace_ops().await;
+    env.expect_uploads().await;
+    env.set_remote_files(vec![remote_dir("docs")]).await;
+    env.set_remote_files_at("docs", vec![]).await;
+
+    let (vfs, _rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+    let root = vfs.tree().root();
+    let docs = vfs.lookup(root, "docs").await.unwrap().unwrap().0;
+
+    let (_node, h) = vfs.create(docs, "draft.txt").await.unwrap();
+    vfs.write(h, 0, b"not uploaded yet").await.unwrap();
+    vfs.close(h).await.unwrap(); // Pending, no open handle — never uploaded.
+
+    let result = vfs.unlink(root, "docs").await;
+    let err =
+        result.expect_err("a drafted-but-unlisted child must still count as a non-empty occupant");
+    assert!(err.downcast_ref::<DirNotEmptyError>().is_some(), "expected a DirNotEmptyError, got: {err:#}");
+    assert_eq!(env.delete_call_count(), 0, "a refused rmdir must never have reached the server");
+}
+
+/// The positive case for both deliverable D tests above: an empty directory
+/// (no listed children, no drafted ones either) removes cleanly.
+#[tokio::test]
+async fn rmdir_of_an_empty_directory_succeeds() {
+    let env = VfsTestEnv::new().await;
+    env.expect_namespace_ops().await;
+    env.set_remote_files(vec![remote_dir("empty-dir")]).await;
+    env.set_remote_files_at("empty-dir", vec![]).await;
+
+    let (vfs, _rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+    let root = vfs.tree().root();
+
+    vfs.unlink(root, "empty-dir").await.expect("rmdir of an empty directory should succeed");
+    assert_eq!(env.delete_call_count(), 1);
+    assert!(vfs.lookup(root, "empty-dir").await.unwrap().is_none());
 }

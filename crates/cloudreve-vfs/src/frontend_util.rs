@@ -8,7 +8,7 @@
 //! nfs3-specific half.
 
 use crate::tree::NodeAttr;
-use crate::vfs::{RenameBusyError, StaleHandleError};
+use crate::vfs::{DirNotEmptyError, RenameBusyError, StaleHandleError, UnlinkBusyError};
 
 /// Portable classification of a facade error/outcome, independent of any
 /// frontend's own error enum. D2's mapping table, minus the lookup-miss case:
@@ -31,9 +31,17 @@ pub enum FrontendErrno {
     /// The facade's EEXIST-marker create error: an entry already exists
     /// under that name.
     Exist,
-    /// [`RenameBusyError`]: a handle is currently open on the entry being
-    /// renamed.
+    /// [`RenameBusyError`] (a handle is currently open on, or a live draft
+    /// sits on, the entry being renamed — either its source or its
+    /// destination) or [`UnlinkBusyError`] (a handle is currently open on
+    /// the file being deleted). Both classify identically: the split
+    /// between the two typed errors is about naming which OPERATION was
+    /// refused, not a different frontend-visible outcome (see
+    /// `UnlinkBusyError`'s own doc for why it's a separate type at all).
     Busy,
+    /// [`DirNotEmptyError`]: a non-empty directory was asked to be removed.
+    /// This facade never does a recursive delete.
+    NotEmpty,
     /// Everything else. The anyhow causal chain is logged at debug so a
     /// real bug stays diagnosable without ever leaking `anyhow::Error`
     /// details across the frontend boundary.
@@ -42,15 +50,23 @@ pub enum FrontendErrno {
 
 /// D2: classifies an `anyhow::Error` returned by any `Vfs` call into a
 /// protocol-agnostic errno. Keyed on typed errors first
-/// ([`StaleHandleError`], [`RenameBusyError`]), then on the one message
-/// marker the facade guarantees (`Vfs::create`'s `"EEXIST: ..."` prefix —
-/// see its doc); everything else falls through to [`FrontendErrno::Io`].
+/// ([`StaleHandleError`], [`RenameBusyError`], [`UnlinkBusyError`],
+/// [`DirNotEmptyError`] — phase 4 added the last two), then on the one
+/// message marker the facade guarantees (`Vfs::create`'s `"EEXIST: ..."`
+/// prefix — see its doc); everything else falls through to
+/// [`FrontendErrno::Io`].
 pub fn classify_error(err: &anyhow::Error) -> FrontendErrno {
     if err.downcast_ref::<StaleHandleError>().is_some() {
         return FrontendErrno::Stale;
     }
     if err.downcast_ref::<RenameBusyError>().is_some() {
         return FrontendErrno::Busy;
+    }
+    if err.downcast_ref::<UnlinkBusyError>().is_some() {
+        return FrontendErrno::Busy;
+    }
+    if err.downcast_ref::<DirNotEmptyError>().is_some() {
+        return FrontendErrno::NotEmpty;
     }
     if err.to_string().starts_with("EEXIST") {
         return FrontendErrno::Exist;
@@ -137,6 +153,18 @@ mod tests {
     fn rename_busy_error_classifies_as_busy() {
         let err = anyhow::Error::new(RenameBusyError { remote_path: "x".into() });
         assert_eq!(classify_error(&err), FrontendErrno::Busy);
+    }
+
+    #[test]
+    fn unlink_busy_error_classifies_as_busy() {
+        let err = anyhow::Error::new(UnlinkBusyError { remote_path: "x".into() });
+        assert_eq!(classify_error(&err), FrontendErrno::Busy);
+    }
+
+    #[test]
+    fn dir_not_empty_error_classifies_as_not_empty() {
+        let err = anyhow::Error::new(DirNotEmptyError { remote_path: "x".into() });
+        assert_eq!(classify_error(&err), FrontendErrno::NotEmpty);
     }
 
     #[test]

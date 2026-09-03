@@ -205,17 +205,23 @@ impl std::fmt::Display for StaleHandleError {
 
 impl std::error::Error for StaleHandleError {}
 
-/// Returned by [`Vfs::rename`] when a handle is currently open on the entry
-/// being renamed (its source path, before the change). Phase 2 shipped this
-/// as documented UB instead of a guard — an `OpenFile`'s `key.remote_path`
-/// is fixed at `open`/`create` time and `rename` never touches it, so a
-/// handle that outlived a rename kept reading/writing under the OLD path
-/// while the tree believed the entry lived at the new one. This error
-/// replaces that hazard with an explicit EBUSY-class refusal: frontends
-/// (NFS/FUSE) map it to `EBUSY`, exactly like renaming a file still open
-/// under POSIX on a filesystem that enforces the same restriction. Closing
-/// every handle on the entry (or letting the frontend serialize instead of
-/// deny, if it prefers) and retrying succeeds. Detectable via
+/// Returned by [`Vfs::rename`] when a handle is currently open (or a live
+/// draft sits) on the entry being renamed — its SOURCE path, before the
+/// change, or (phase 4, deliverable C) its DESTINATION path: the
+/// atomic-save idiom every real editor uses is "write a tmp file, then
+/// rename it OVER the target" — if the target is the file the user still
+/// has open, that rename must not silently clobber the handle's view of the
+/// world any more than renaming the source out from under an open handle
+/// may. Phase 2 shipped the source-side hazard as documented UB instead of
+/// a guard — an `OpenFile`'s `key.remote_path` is fixed at `open`/`create`
+/// time and `rename` never touches it, so a handle that outlived a rename
+/// kept reading/writing under the OLD path while the tree believed the
+/// entry lived at the new one. This error replaces that hazard (both
+/// sides) with an explicit EBUSY-class refusal: frontends (NFS/FUSE) map it
+/// to `EBUSY`, exactly like renaming a file still open under POSIX on a
+/// filesystem that enforces the same restriction. Closing every handle on
+/// the entry (or letting the frontend serialize instead of deny, if it
+/// prefers) and retrying succeeds. Detectable via
 /// `anyhow::Error::downcast_ref::<RenameBusyError>()`.
 #[derive(Debug, Clone)]
 pub struct RenameBusyError {
@@ -226,13 +232,76 @@ impl std::fmt::Display for RenameBusyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "cannot rename {}: a handle is still open on it — close it first",
+            "cannot rename {}: a handle is still open on it (or a live draft sits on it) — \
+             close it first",
             self.remote_path
         )
     }
 }
 
 impl std::error::Error for RenameBusyError {}
+
+/// Returned by [`Vfs::unlink`] when a handle is currently open on the FILE
+/// being removed (phase 4, deliverable B). Without this guard, deleting a
+/// file out from under an open handle risks silent resurrection: the
+/// handle's `download_url`/key stay valid (unlike a rename, `unlink` never
+/// touches `OpenFile` at all), so a subsequent `write` on it happily calls
+/// `ensure_drafted` -> `materialize`, re-fetching the (deleted, but perhaps
+/// not yet gone from the block cache or a soft-delete-lagging server) old
+/// content into a BRAND NEW draft and eventually re-uploading it — silently
+/// undoing the delete the user just performed elsewhere. A directory is
+/// never "open" in this sense at all (see `Vfs::open`'s doc, it bails on
+/// one) — see [`DirNotEmptyError`] for the guard that applies to a
+/// directory's removal instead.
+///
+/// A SEPARATE type from [`RenameBusyError`] rather than a rename of that
+/// type (least-churn judgment call, phase 4 task 2): `RenameBusyError` is a
+/// public type multiple call sites downcast on by name
+/// (`frontend_util::classify_error`, both adapters' tests) — renaming it to
+/// something generic would touch every one of those for no behavioral gain,
+/// whereas adding this sibling only requires one new downcast arm in
+/// `classify_error`. Both types classify to the same
+/// [`crate::frontend_util::FrontendErrno::Busy`] and thus the same wire/errno
+/// on both frontends — the split is about naming which OPERATION was
+/// refused, not about a different frontend-visible outcome. Detectable via
+/// `anyhow::Error::downcast_ref::<UnlinkBusyError>()`.
+#[derive(Debug, Clone)]
+pub struct UnlinkBusyError {
+    pub remote_path: String,
+}
+
+impl std::fmt::Display for UnlinkBusyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "cannot delete {}: a handle is still open on it — close it first", self.remote_path)
+    }
+}
+
+impl std::error::Error for UnlinkBusyError {}
+
+/// Returned by [`Vfs::unlink`] when asked to remove a DIRECTORY that is not
+/// empty (phase 4, deliverable D). This facade never does a recursive
+/// delete — POSIX `rmdir` itself refuses a non-empty directory
+/// (`ENOTDIR`/`ENOTEMPTY`), and silently cascading a delete through an
+/// entire subtree (potentially discarding unsaved drafts several levels
+/// down) is a far more destructive default than this crate should pick on
+/// a caller's behalf. "Empty" is judged the same way `Vfs::readdir` builds
+/// a listing: the real server listing PLUS the local overlay of any
+/// not-yet-confirmed `create()`d child — so a brand-new, never-uploaded
+/// file sitting in the directory counts as an occupant exactly like a real
+/// one, even though the server itself doesn't know it exists yet. Detectable
+/// via `anyhow::Error::downcast_ref::<DirNotEmptyError>()`.
+#[derive(Debug, Clone)]
+pub struct DirNotEmptyError {
+    pub remote_path: String,
+}
+
+impl std::fmt::Display for DirNotEmptyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "cannot remove {}: the directory is not empty", self.remote_path)
+    }
+}
+
+impl std::error::Error for DirNotEmptyError {}
 
 /// Test-only rendezvous for pausing `create()` mid-body — see
 /// `Vfs::pause_create_before_registration_for_tests`. Exists because the
@@ -261,7 +330,85 @@ impl Default for CreatePauseHook {
     }
 }
 
+/// Test-only rendezvous for pausing `open()` mid-body — see
+/// `Vfs::pause_open_before_registration_for_tests`. A separate type from
+/// [`CreatePauseHook`] rather than a shared one (same least-churn reasoning
+/// as [`UnlinkBusyError`] vs [`RenameBusyError`]): each hook name maps 1:1
+/// to the single method it pauses, and the two are never armed at once by
+/// any real test, so there is nothing to gain from unifying them beyond a
+/// cosmetic rename that would touch `namespace_ops.rs`'s existing import for
+/// no behavioral change. Same reasoning as `CreatePauseHook` for why this
+/// exists at all: the window `open()` needs to pause in (attrs resolved,
+/// locks held, but the handle not yet registered in `open_files`) has no
+/// `.await` of its own in production, so it's sub-microsecond and cannot be
+/// reliably raced by a plain concurrent-tasks test.
+pub struct OpenPauseHook {
+    /// Notified once by `open` the instant it reaches the pause point.
+    pub parked: tokio::sync::Notify,
+    /// Notified once by the test to let the parked `open` call continue.
+    pub resume: tokio::sync::Notify,
+}
+
+impl OpenPauseHook {
+    pub fn new() -> Self {
+        Self { parked: tokio::sync::Notify::new(), resume: tokio::sync::Notify::new() }
+    }
+}
+
+impl Default for OpenPauseHook {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct Vfs {
+    /// D10 (phase 4): the hierarchical namespace guard closing the
+    /// descendant check-then-act residual the phase-3 final review disclosed
+    /// (`is_subtree_open`'s doc, and `rename`'s: "closing it fully needs
+    /// hierarchical locking; tracked as a phase-4 obligation"). Without this,
+    /// a directory `rename`'s subtree busy-check
+    /// (`is_subtree_open`/`has_draft_strictly_under`, both keyed on
+    /// `old_path`'s exact string) and a BRAND-NEW descendant `open`/`create`
+    /// racing it (keyed on the DESCENDANT's own, different, path) use
+    /// unrelated lock keys and can interleave: the rename's check can run in
+    /// the instant between the descendant call resolving its attrs and it
+    /// registering its handle, see nothing, and let the rename through —
+    /// exactly the resurrection bug this whole guard family exists to close,
+    /// just one level up.
+    ///
+    /// THE NEW OUTERMOST LOCK LEVEL IN THIS CRATE — CRITICAL ORDERING RULE:
+    /// acquired BEFORE any `open_lock_for`/`open_locks` use, in EVERY method
+    /// that touches it, with NO exceptions. `open`/`create` take `read()`
+    /// across their full lookup-to-registration window (the same window
+    /// `open_locks` already serializes per-EXACT-path — this adds the
+    /// per-SUBTREE serialization `open_locks` structurally cannot); `rename`
+    /// takes `write()` across check+server-call+migration, but ONLY when the
+    /// entry being renamed is a DIRECTORY (a file has no descendants, so its
+    /// existing exact-path `open_locks` guard is already fully race-free —
+    /// see `rename`'s own doc for why it deliberately takes no namespace
+    /// lock at all in the file case); `unlink` of a DIRECTORY takes `write()`
+    /// the same way, across its emptiness check and the actual delete call
+    /// (a FILE `unlink` likewise takes none, same file-has-no-descendants
+    /// reasoning). Never acquired by `readdir`/`lookup`/`getattr`/`write`/
+    /// `truncate`/`close`/`mkdir` — none of them can create the
+    /// registration-window race this exists to close, and `unlink`'s
+    /// directory branch calls `Vfs::readdir` internally WHILE HOLDING
+    /// `write()`, which would deadlock instantly against a `read()`
+    /// acquisition inside `readdir` (a `tokio::sync::RwLock` is not
+    /// reentrant) — this is exactly why `readdir` must never take it.
+    ///
+    /// Read-mostly by construction: only a DIRECTORY rename/unlink ever
+    /// takes `write()`, an uncommon operation next to the steady stream of
+    /// `open`/`create` calls a mounted drive produces, so contention in
+    /// practice is rare and brief (one subtree op at a time, never blocking
+    /// other subtree ops from PROCEEDING once the current writer commits).
+    /// Coarse-grained on purpose (a single lock for the whole `Vfs`, not
+    /// keyed per-directory): D10 accepts this in exchange for having no new
+    /// lock-ordering pairs to reason about — see each acquiring method's own
+    /// doc for its exact position in the sequence, and the phase-4 task
+    /// report for the full per-method acquisition table.
+    namespace_lock: tokio::sync::RwLock<()>,
+
     /// `Arc`-wrapped (not owned outright) because the write-back queue's
     /// background tasks (Task 8) need a `'static` handle that outlives any
     /// particular `&Vfs` call — `tokio::spawn` requires it.
@@ -309,8 +456,10 @@ pub struct Vfs {
     /// removed, bounded by the number of distinct files ever drafted in
     /// this process — far too small to matter for a desktop sync client.
     ///
-    /// LOCK ORDERING RULE (with `open_locks` below): `open_lock` before
-    /// `draft_begin_lock`, ALWAYS. `create` is the only call site that ever
+    /// LOCK ORDERING RULE (with `open_locks` below): `namespace_lock` before
+    /// `open_lock` before `draft_begin_lock`, ALWAYS — see `namespace_lock`'s
+    /// own field doc for why it is the new outermost level (phase 4, D10).
+    /// `create` is the only call site that ever
     /// holds both for the same path at once (see its body), and it
     /// acquires `open_lock` first, `draft_begin_lock` nested inside it.
     /// `open`/`rename` only ever touch `open_locks`; `write`/`truncate`
@@ -341,11 +490,31 @@ pub struct Vfs {
     /// ordering rule the two lock maps must keep with respect to each
     /// other. Same non-removal/std-Mutex-only-for-the-instant-of-lookup
     /// discipline as `draft_begin_locks`.
+    ///
+    /// EXTENDED SCOPE (phase 4, deliverable C): `rename` now also takes the
+    /// lock keyed to its DESTINATION path (in addition to its source path,
+    /// unchanged from before), sorted lexicographically with the source
+    /// lock so the two are always acquired in the SAME global order
+    /// regardless of which one is the source and which the destination —
+    /// otherwise two concurrent renames that swap two paths (A onto B, and B
+    /// onto A, at once) could each hold one lock while waiting on the other.
+    /// `unlink` (phase 4, deliverable B) also takes this lock for its own
+    /// target path, unconditionally (file or directory) — see its own doc
+    /// for why a directory branch still takes it (to serialize against a
+    /// `rename` of that same directory) despite never checking
+    /// `is_subtree_open` itself. See `namespace_lock`'s doc above for the
+    /// new, stricter rule this map must now also respect:
+    /// `namespace_lock` before any use of this map, everywhere, no
+    /// exceptions.
     open_locks: std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Test-only pause point for `create` — see `CreatePauseHook`'s doc and
     /// `pause_create_before_registration_for_tests`. `None` (the default)
     /// means `create` never pauses, which is every non-test call.
     create_pause_hook: std::sync::Mutex<Option<Arc<CreatePauseHook>>>,
+    /// Test-only pause point for `open` — see `OpenPauseHook`'s doc and
+    /// `pause_open_before_registration_for_tests`. `None` (the default)
+    /// means `open` never pauses, which is every non-test call.
+    open_pause_hook: std::sync::Mutex<Option<Arc<OpenPauseHook>>>,
     /// Sender half of the `VfsEvent` channel returned by `new`. A clone of
     /// this lives inside `write_queue`, which emits most events; this
     /// facade-level copy is what `open`/`unlink` use for the two terminal
@@ -441,6 +610,7 @@ impl Vfs {
         write_queue.enqueue_immediate(resume_paths);
         Ok((
             Self {
+                namespace_lock: tokio::sync::RwLock::new(()),
                 tree,
                 cache,
                 drafts,
@@ -455,6 +625,7 @@ impl Vfs {
                 draft_begin_locks: std::sync::Mutex::new(HashMap::new()),
                 open_locks: std::sync::Mutex::new(HashMap::new()),
                 create_pause_hook: std::sync::Mutex::new(None),
+                open_pause_hook: std::sync::Mutex::new(None),
                 events: events_tx,
             },
             events_rx,
@@ -472,6 +643,17 @@ impl Vfs {
     /// must already be known to the tree (from an earlier `readdir`/
     /// `lookup`) and must not be a directory.
     pub async fn open(&self, node: NodeId) -> Result<FileHandle> {
+        // D10 (phase 4, outermost lock — see `namespace_lock`'s field doc):
+        // held `read()` across this ENTIRE call, including registration at
+        // the very end. Taken FIRST, before even resolving `attr` below —
+        // this is what makes a racing DIRECTORY `rename`/`unlink` (which
+        // takes `write()`) unable to even START its subtree busy-check while
+        // this open is still in flight, closing the phase-3-disclosed
+        // "check-then-act across different lock keys" residual: without
+        // this, the rename's check and this open's registration used
+        // unrelated per-path lock keys and could interleave.
+        let _ns_guard = self.namespace_lock.read().await;
+
         let attr = self
             .tree
             .getattr(node)
@@ -584,6 +766,19 @@ impl Vfs {
                     drafts.set_state(&attr.remote_path, DraftState::Editing)?;
                 }
             }
+        }
+
+        // Test-only pause point — see `OpenPauseHook`'s doc. A no-op
+        // (`open_pause_hook` is `None`) on every real call. Still holding
+        // `namespace_lock.read()` and `open_lock` across this pause, exactly
+        // as a real in-flight `open` would while awaiting the network calls
+        // above — the point is to widen this specific window
+        // (resolved-but-not-yet-registered) to something a test can
+        // deterministically land a racing directory rename in.
+        let pause_hook = self.open_pause_hook.lock().unwrap().clone();
+        if let Some(hook) = pause_hook {
+            hook.parked.notify_one();
+            hook.resume.notified().await;
         }
 
         let open_file =
@@ -726,6 +921,17 @@ impl Vfs {
         Ok(())
     }
 
+    /// Test-only: makes every subsequent `open()` call pause mid-body —
+    /// after resolving attrs and running the reopen-cancel dance, before
+    /// this call registers its own handle in `open_files` — until the test
+    /// notifies `hook.resume`. See `OpenPauseHook`'s doc for why this exists
+    /// instead of a plain racing-tasks test (deliverable A, phase 4: races a
+    /// directory `rename` against this exact window). Same non-`#[cfg(test)]`
+    /// reasoning as `pause_create_before_registration_for_tests`.
+    pub fn pause_open_before_registration_for_tests(&self, hook: Arc<OpenPauseHook>) {
+        *self.open_pause_hook.lock().unwrap() = Some(hook);
+    }
+
     /// Re-arms every draft still `Pending` for immediate upload, bypassing
     /// the debounce entirely — offline recovery: phase 4 calls this on
     /// reconnect. Returns how many were queued.
@@ -812,7 +1018,16 @@ impl Vfs {
     /// of one that already did. Taken FIRST, before `draft_begin_lock` — see
     /// `draft_begin_locks`'s doc for the ordering rule the two lock maps
     /// must keep.
+    ///
+    /// D10 (phase 4, outermost lock): `namespace_lock.read()` is held across
+    /// this entire call too, ahead of even `open_lock` — see
+    /// `namespace_lock`'s field doc. It plays the identical role here that it
+    /// plays in `open`: without it, a DIRECTORY rename's subtree check and
+    /// this call's own registration window use unrelated lock keys and can
+    /// interleave.
     pub async fn create(&self, parent: NodeId, name: &str) -> Result<(NodeId, FileHandle)> {
+        let _ns_guard = self.namespace_lock.read().await;
+
         let parent_attr = self
             .tree
             .getattr(parent)
@@ -924,12 +1139,87 @@ impl Vfs {
     /// (`create`'s brand-new-file case), the file never existed remotely and
     /// `delete_files` is skipped entirely: there is nothing on the server to
     /// remove.
+    ///
+    /// Two guards, phase 4:
+    /// - **EBUSY** ([`UnlinkBusyError`], deliverable B): a FILE with a
+    ///   currently open handle refuses deletion outright — see that error's
+    ///   own doc for the resurrection hazard this closes. A directory is
+    ///   never "open" (`open` bails on one), so this never applies to one.
+    /// - **NotEmpty** ([`DirNotEmptyError`], deliverable D): this facade
+    ///   never does a recursive delete — a non-empty DIRECTORY refuses
+    ///   removal outright, exactly like POSIX `rmdir`. "Empty" is judged by
+    ///   `readdir`'s own listing (real server listing + the local overlay of
+    ///   any not-yet-confirmed `create()`d child), so a drafted-but-unlisted
+    ///   child counts as an occupant too — see that error's own doc.
+    ///
+    /// D10 (outermost lock, see `namespace_lock`'s field doc): a DIRECTORY
+    /// removal takes `write()` across its emptiness check and the actual
+    /// delete call, closing the same check-then-act shape `rename` closes
+    /// for a directory rename (a concurrent `open`/`create` of a new child
+    /// landing between this call's check and its delete would otherwise be
+    /// silently destroyed, or the delete would wrongly proceed against a
+    /// directory that stopped being empty a moment before). A FILE removal
+    /// takes no namespace lock at all — it has no descendants to protect,
+    /// so its own `open_lock_for` guard below is already sufficient, exactly
+    /// like a file `rename`.
+    ///
+    /// `open_lock_for(remote_path)` (see `open_locks`'s field doc) is taken
+    /// unconditionally, file or directory, AFTER `namespace_lock` — for a
+    /// file this IS the EBUSY guard; for a directory it has no busy check of
+    /// its own to gate (an empty directory's emptiness check already implies
+    /// no descendant handle exists — see the NotEmpty check's own comment
+    /// below) but still serializes this call against a `rename` of the SAME
+    /// directory, which takes the identical lock key.
     pub async fn unlink(&self, parent: NodeId, name: &str) -> Result<()> {
-        let (_id, attr) = self
+        let (id, attr) = self
             .lookup(parent, name)
             .await?
             .with_context(|| format!("unlink: no such entry {name:?}"))?;
         let remote_path = attr.remote_path;
+
+        // D10: see this method's own doc above for why only a DIRECTORY
+        // takes this, and why it must be acquired before `open_lock_for`
+        // next, no exceptions.
+        let _ns_write_guard =
+            if attr.is_dir { Some(self.namespace_lock.write().await) } else { None };
+
+        let open_lock = self.open_lock_for(&remote_path);
+        let _open_guard = open_lock.lock().await;
+
+        if attr.is_dir {
+            // M1 (review fold-in): force a fresh listing before judging
+            // emptiness rather than trusting whatever `readdir` last cached
+            // (up to `LISTING_TTL` = 5s stale — tree.rs). Already holding
+            // `namespace_lock.write()` here (this whole branch only runs for
+            // a directory) and already tolerating a network round-trip in
+            // this call (the eventual `delete_files` below), so this one
+            // extra listing shrinks the advisory window from "up to 5s
+            // stale" to "a genuine in-flight race" for free.
+            self.tree.invalidate_path(&remote_path).await;
+            // NotEmpty guard (deliverable D): `readdir` merges the real
+            // server listing with any locally-created, not-yet-confirmed
+            // child (`create()`'s overlay), so a drafted-but-unlisted child
+            // counts as non-empty exactly like a real one. An open handle on
+            // a descendant implies that descendant is listed/known as a
+            // child too (it can only have been opened via a prior lookup/
+            // readdir that found it) — so this check alone also subsumes
+            // "does any descendant have an open handle", no separate
+            // `is_subtree_open` call is needed here. (Narrow documented
+            // residual: a descendant deleted REMOTELY, out from under an
+            // still-open local handle, in the instant between the
+            // invalidate above and this check, would not be counted — the
+            // same class of narrow, accepted external-change race this
+            // crate already lives with elsewhere, not something this guard
+            // newly introduces.)
+            if !self.readdir(id).await?.is_empty() {
+                return Err(anyhow::Error::new(DirNotEmptyError { remote_path }));
+            }
+        } else if self.is_subtree_open(&remote_path).await {
+            // EBUSY guard (deliverable B): exact-match only ever fires for a
+            // file (no descendants possible), same discipline `rename`'s
+            // guard already relies on for its own exact-path case.
+            return Err(anyhow::Error::new(UnlinkBusyError { remote_path }));
+        }
 
         // `cancel` is a harmless no-op if nothing is currently armed for
         // this path (draft still `Editing`, or an upload already
@@ -1017,13 +1307,37 @@ impl Vfs {
     ///
     /// For a DIRECTORY rename the same guard extends to descendants (any
     /// open handle or live draft strictly under the old path also answers
-    /// EBUSY), but with one honestly-narrower guarantee: `open_locks` is
+    /// EBUSY). Phase 3 left one honestly-narrower gap here: `open_locks` is
     /// keyed per exact path, so a brand-new open/create of a *descendant*
-    /// racing this call is not serialized against it — a check-then-act
-    /// window of about one HTTP round-trip remains, versus the
-    /// deterministic bypass of already-open handles this guard closes.
-    /// Closing it fully needs hierarchical locking; tracked as a phase-4
-    /// obligation.
+    /// racing this call was not serialized against it — a check-then-act
+    /// window of about one HTTP round-trip. D10's `namespace_lock` (phase 4)
+    /// closes exactly this gap: see its own field doc, and the paragraph
+    /// below.
+    ///
+    /// D10 (phase 4, outermost lock): when the entry being renamed is a
+    /// DIRECTORY, this call also takes `namespace_lock.write()` — acquired
+    /// BEFORE the `open_lock_for` guard below, held across the whole rest of
+    /// this call. While held, NO `open`/`create` ANYWHERE in this `Vfs` can
+    /// even start past their own first line (both take `namespace_lock.
+    /// read()` first) — that is what finally makes this call's subtree
+    /// check race-free against a descendant open/create in flight, not just
+    /// against one already registered. A FILE rename takes NO namespace
+    /// lock at all: a file has no descendants, so the exact-path
+    /// `open_locks` guard above is already fully race-free for it (see
+    /// `open`'s own doc for the one remaining, narrower, non-D10 caveat —
+    /// an open that resolved its attrs before this rename committed).
+    ///
+    /// DESTINATION busy check (phase 4, deliverable C): the SAME two checks
+    /// (`is_subtree_open`/`has_draft_strictly_under`) also run against
+    /// `new_path`, refusing with [`RenameBusyError`] if the destination (or,
+    /// for a directory destination, anything under it) is open or drafted —
+    /// the atomic-save idiom every real editor uses (write a tmp file, then
+    /// rename it OVER the target) must not silently clobber a handle's view
+    /// of the file it still has open. Both the source's and the
+    /// destination's `open_lock_for` are taken together, in a fixed
+    /// (lexicographic) order regardless of which is source/destination, so
+    /// two concurrent renames that swap two paths can never deadlock each
+    /// holding one lock while waiting on the other.
     ///
     /// Callers should also expect this call to sometimes BLOCK rather than
     /// answer immediately, even outside the EBUSY path: `open_locks` (the
@@ -1049,6 +1363,7 @@ impl Vfs {
             .await?
             .with_context(|| format!("rename: no such entry {name:?}"))?;
         let old_path = attr.remote_path;
+        let source_is_dir = attr.is_dir;
         let new_parent_attr = self
             .tree
             .getattr(new_parent)
@@ -1060,32 +1375,63 @@ impl Vfs {
             return Ok(()); // renaming onto itself: nothing to do.
         }
 
+        // D10 (phase 4, outermost lock — see `namespace_lock`'s and this
+        // method's own doc above): write() only when the SOURCE is a
+        // directory, acquired BEFORE `open_lock_for` next, no exceptions.
+        let _ns_write_guard =
+            if source_is_dir { Some(self.namespace_lock.write().await) } else { None };
+
         // EBUSY guard: see `RenameBusyError`'s and `open_locks`'s docs for
-        // why taking this specific lock, and holding it for the whole rest
-        // of this call, is what makes the check race-free rather than a
+        // why taking these locks, and holding them for the whole rest of
+        // this call, is what makes the checks race-free rather than a
         // check-then-act TOCTOU — dropped automatically at the end of this
-        // function (early return on the busy path, or falling off the end
-        // on success).
-        //
-        // Covers the whole SUBTREE, not just `old_path` itself: renaming a
-        // DIRECTORY must be refused if any descendant currently has an open
-        // handle OR a live draft — otherwise `DraftStore::rename` below
-        // (which only ever migrates the one exact path handed to it) would
-        // leave that descendant's draft targeting the OLD, just-renamed-away
-        // path, and its eventual upload would resurrect the renamed
-        // directory there with the user's edit inside (the master-index
-        // BLOCKER this guard exists to close). The draft check deliberately
-        // uses `has_draft_strictly_under`, NOT a plain exact-or-prefix
-        // match: a draft sitting AT `old_path` itself (the ordinary
-        // drafted-FILE-rename case, no descendants possible) must stay
-        // allowed through unmigrated-until-below, exactly as before this
-        // fix — see that method's doc.
-        let open_lock = self.open_lock_for(&old_path);
-        let _open_guard = open_lock.lock().await;
+        // function (early return on either busy path, or falling off the
+        // end on success). Both `old_path`'s and `new_path`'s locks are
+        // taken together, in a fixed lexicographic order — see this
+        // method's own doc for why.
+        let (first_path, second_path) = if old_path <= new_path {
+            (old_path.clone(), new_path.clone())
+        } else {
+            (new_path.clone(), old_path.clone())
+        };
+        let first_lock = self.open_lock_for(&first_path);
+        let _first_guard = first_lock.lock().await;
+        let second_lock = self.open_lock_for(&second_path);
+        let _second_guard = second_lock.lock().await;
+
+        // SOURCE side. Covers the whole SUBTREE, not just `old_path` itself:
+        // renaming a DIRECTORY must be refused if any descendant currently
+        // has an open handle OR a live draft — otherwise `DraftStore::rename`
+        // below (which only ever migrates the one exact path handed to it)
+        // would leave that descendant's draft targeting the OLD,
+        // just-renamed-away path, and its eventual upload would resurrect
+        // the renamed directory there with the user's edit inside (the
+        // master-index BLOCKER this guard exists to close). The draft check
+        // deliberately uses `has_draft_strictly_under`, NOT a plain
+        // exact-or-prefix match: a draft sitting AT `old_path` itself (the
+        // ordinary drafted-FILE-rename case, no descendants possible) must
+        // stay allowed through unmigrated-until-below, exactly as before
+        // this fix — see that method's doc.
         if self.is_subtree_open(&old_path).await
             || self.drafts.lock().await.has_draft_strictly_under(&old_path)
         {
             return Err(anyhow::Error::new(RenameBusyError { remote_path: old_path }));
+        }
+
+        // DESTINATION side (phase 4, deliverable C): the atomic-save idiom
+        // — write a tmp file, then rename it OVER the target — must not
+        // silently clobber a handle's (or a live draft's) view of whatever
+        // currently sits at `new_path`. Same subtree logic as the source
+        // check above (so a directory destination's open descendants are
+        // caught too); deliberately reuses the same "strictly under"
+        // draft check, so an existing EXACT-path draft at the destination
+        // (not open) is not itself treated as busy — this call has no
+        // narrower "would this rename orphan the destination's own draft"
+        // concern to add beyond what already existed for a plain overwrite.
+        if self.is_subtree_open(&new_path).await
+            || self.drafts.lock().await.has_draft_strictly_under(&new_path)
+        {
+            return Err(anyhow::Error::new(RenameBusyError { remote_path: new_path }));
         }
 
         let existed_remotely = match self.drafts.lock().await.base_etag(&old_path) {
@@ -1093,7 +1439,58 @@ impl Vfs {
             None => true, // no draft at all: an ordinary remote file/dir.
         };
 
+        // Fix round 1 (C1, protocol fidelity): resolved BEFORE either branch
+        // below decides what to do, since both need it. `None` covers both
+        // "nothing at all sits at `new_path`" and "only a brand-new,
+        // never-uploaded local draft sits there" (nothing on the server to
+        // collide with either way) — see the helper's own doc. Never a
+        // DIRECTORY destination: deleting one to "make room" for a file is
+        // far more destructive than this call should ever do on a caller's
+        // behalf, so a file renamed onto an existing directory name falls
+        // through to the server's own native refusal below, unchanged from
+        // before this fix (surfaces as EIO — an edge case outside the
+        // atomic-save idiom this deliverable targets).
+        let dest_remote = self
+            .remote_destination_if_exists(new_parent, new_name)
+            .await?
+            .filter(|a| !a.is_dir);
+
         if existed_remotely {
+            // REMOTE-SOURCE bridge: the real Cloudreve server refuses
+            // `rename_file`/`move_files` onto an existing sibling name
+            // outright (`ErrFileExisted`/`ObjectExisted`, 40004 — see
+            // `tests/common/mod.rs`'s mock, fixed to match) whereas POSIX
+            // `rename(2)` and NFSv3 `RENAME` both require silent replace.
+            // Bridged here, under the SAME locks already held for the whole
+            // rest of this call (`open_lock_for` on both paths, and
+            // `namespace_lock.write()` if the source is a directory): delete
+            // the existing destination FIRST, then perform the ordinary
+            // rename/move exactly as before this fix.
+            //
+            // CRASH-WINDOW DISCLOSURE: this facade has no cross-call
+            // transaction. If the process dies between the delete below and
+            // the rename/move call actually landing, `new_path` briefly (or
+            // permanently, absent a retry) resolves to NOTHING on the
+            // server — neither the destination's old content nor the
+            // source's new content. No byte loss for either side: the
+            // destination's old bytes were the ones this whole operation
+            // was asked to discard (ordinary overwrite-on-rename semantics,
+            // not data the caller wanted kept), and the source's bytes are
+            // still fully intact and readable under `old_path` (untouched
+            // by the delete call, which only ever names `new_path`) — a
+            // retried rename after restart completes it. The failure mode
+            // is a lagging NAME, never lost DATA.
+            if let Some(dest_attr) = &dest_remote {
+                self.client
+                    .delete_files(&DeleteFileService {
+                        uris: vec![dest_attr.remote_path.clone()],
+                        unlink: None,
+                        skip_soft_delete: None,
+                    })
+                    .await
+                    .context("failed to delete the rename destination")?;
+            }
+
             let same_dir = parent == new_parent;
             if same_dir {
                 self.client
@@ -1138,6 +1535,31 @@ impl Vfs {
             }
         };
         if had_draft {
+            if !existed_remotely {
+                if let Some(dest_attr) = &dest_remote {
+                    // DRAFTED-SOURCE bridge: the source never existed on the
+                    // server (empty `base_etag`), so no `delete`/`rename`
+                    // call was ever made above — there is nothing on the
+                    // server to move. Without this, the migrated draft would
+                    // keep its EMPTY `base_etag` and its eventual upload
+                    // would run `overwrite=false` against a uri that
+                    // ALREADY exists remotely (`dest_attr`) — the server
+                    // refuses with the same 40004, the upload treats that as
+                    // a plain transient failure (not a conflict — see
+                    // `WriteBackQueue::process`'s conflict-copy gate, which
+                    // only fires for a non-empty `base_etag`), and the draft
+                    // parks `Pending` to retry the IDENTICAL doomed request
+                    // forever. Adopting the destination's remote identity
+                    // instead — rebasing onto its current etag — makes the
+                    // eventual upload run as `overwrite=true,
+                    // previous_version=dest_attr.etag`: an ordinary
+                    // rewrite-in-place, arbitrated by the SAME D5 conflict
+                    // machinery an edit of an already-existing file always
+                    // goes through (a remote change since adoption correctly
+                    // becomes a conflict copy, not another 40004 loop).
+                    self.drafts.lock().await.set_base_etag(&new_path, &dest_attr.etag)?;
+                }
+            }
             // A no-op unless a debounce timer was actually armed for the
             // old path (see `migrate_armed_timer`'s doc) — a draft still
             // `Editing` or already `Uploading` has nothing to migrate here.
@@ -1145,7 +1567,13 @@ impl Vfs {
         }
 
         self.tree.invalidate_path(&old_path).await;
-        if existed_remotely {
+        if existed_remotely || dest_remote.is_some() {
+            // The destination side changed remotely — either the ordinary
+            // server-side rename/move landed there, or (drafted-source
+            // bridge) it stays the same already-real entry now carrying an
+            // adopted-identity draft overlay; either way the tree's cached
+            // view of `new_path` must be refetched, not treated as a
+            // client-side-only insert.
             self.tree.invalidate_path(&new_path).await;
         } else if had_draft {
             self.tree.insert_local_entry(new_parent, new_name).await?;
@@ -1316,11 +1744,13 @@ impl Vfs {
     /// one), so without it this check could never see a descendant's open
     /// handle at all. Callers needing a race-free answer must hold
     /// `open_lock_for(remote_path)` across both this check and whatever it
-    /// gates — see `rename`'s guard. Note that lock is keyed to
-    /// `remote_path` alone, not to every descendant's own path, so it does
-    /// NOT close the (pre-existing, narrower) race of a *new* open/create
-    /// arriving on a descendant while this check is already running — see
-    /// `rename`'s doc.
+    /// gates — see `rename`'s and `unlink`'s guards. That lock alone is
+    /// keyed to `remote_path` only, not to every descendant's own path, so
+    /// by itself it does NOT close the race of a *new* open/create arriving
+    /// on a descendant while this check is already running for an ANCESTOR
+    /// path — closing THAT (phase-3-disclosed) gap is exactly what
+    /// `namespace_lock` (D10, phase 4) is for: see its field doc, and
+    /// `rename`'s own doc for how the two locks compose.
     async fn is_subtree_open(&self, remote_path: &str) -> bool {
         let nested_prefix = format!("{remote_path}/");
         self.open_files
@@ -1328,6 +1758,40 @@ impl Vfs {
             .await
             .values()
             .any(|of| of.key.remote_path == remote_path || of.key.remote_path.starts_with(&nested_prefix))
+    }
+
+    /// Resolves whether a REAL remote object currently sits at
+    /// `parent`/`name` — as opposed to nothing at all, or only a local-only,
+    /// never-uploaded `create()` draft with no remote counterpart yet (the
+    /// same "empty `base_etag`" test `existed_remotely` uses for a rename's
+    /// SOURCE, applied here to its DESTINATION). Used exclusively by
+    /// `rename`'s protocol-fidelity bridge (deliverable C, fix round 1): the
+    /// server refuses `rename_file`/`move_files`/an `overwrite=false` upload
+    /// session onto an existing sibling name outright
+    /// (`ErrFileExisted`/`ObjectExisted`, 40004), so the facade must know
+    /// BEFORE attempting either path whether the destination is real enough
+    /// to require bridging around that refusal.
+    ///
+    /// `Some(attr)` when a real remote object sits there — either an
+    /// ordinary, never-drafted entry, or one currently being edited
+    /// in-place (drafted with a non-empty `base_etag`, i.e. a real rewrite
+    /// in progress, not a brand-new file). `None` when nothing sits there at
+    /// all, or only a drafted-but-never-uploaded `create()`'d file — the
+    /// server has never heard of either, so there is nothing to collide
+    /// with and no bridge is needed.
+    async fn remote_destination_if_exists(
+        &self,
+        parent: NodeId,
+        name: &str,
+    ) -> Result<Option<NodeAttr>> {
+        let Some((_id, attr)) = self.lookup(parent, name).await? else {
+            return Ok(None);
+        };
+        let only_a_local_draft = matches!(
+            self.drafts.lock().await.base_etag(&attr.remote_path),
+            Some(base_etag) if base_etag.is_empty()
+        );
+        Ok((!only_a_local_draft).then_some(attr))
     }
 
     /// D2's materialization: pulls the whole file's current content through
