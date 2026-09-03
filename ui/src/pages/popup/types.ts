@@ -4,7 +4,12 @@ export interface DriveConfig {
   instance_url: string;
   sync_path: string;
   icon_path?: string;
+  mode: DriveMode;
 }
+
+// Must match `DriveMode`'s serde snake_case wire format exactly
+// (crates/cloudreve-sync/src/drive/mounts.rs).
+export type DriveMode = "full_mirror" | "on_demand";
 
 export interface TaskProgress {
   task_id: string;

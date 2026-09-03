@@ -13,6 +13,13 @@
     "finalSetupDescription": "选择一个本地文件夹作为网盘的挂载位置。",
     "localPath": "本地路径",
     "localDriveName": "挂载名称",
+    "modeChoice": {
+      "title": "同步模式",
+      "mirror": "完全镜像",
+      "mirrorHint": "所有文件都会下载并保持本地同步。",
+      "onDemand": "按需同步",
+      "onDemandHint": "文件仅在打开时才会下载。开始前本地文件夹必须为空。"
+    },
     "localPathPlaceholder": "/Users/username/CloudDrive",
     "browse": "浏览",
     "selectFolder": "选择文件夹",
@@ -119,6 +126,10 @@
       "eventPushLost": "实时事件推送丢失",
       "offline": "离线",
       "credentialExpired": "凭证已过期"
+    },
+    "driveMode": {
+      "mirror": "完全镜像",
+      "onDemand": "按需同步"
     },
     "networkSettings": "网络",
     "heartbeatInterval": "心跳间隔",

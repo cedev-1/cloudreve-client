@@ -13,6 +13,13 @@
     "finalSetupDescription": "Выберите локальную папку для монтирования облачного диска.",
     "localPath": "Локальный путь",
     "localDriveName": "Имя монтирования",
+    "modeChoice": {
+      "title": "Режим синхронизации",
+      "mirror": "Полное зеркало",
+      "mirrorHint": "Каждый файл загружается и синхронизируется локально.",
+      "onDemand": "По требованию",
+      "onDemandHint": "Файлы загружаются только при открытии. Для начала локальная папка должна быть пустой."
+    },
     "localPathPlaceholder": "/Users/username/CloudDrive",
     "browse": "Обзор",
     "selectFolder": "Выбрать папку",
@@ -119,6 +126,10 @@
       "eventPushLost": "Потеряна связь с push-событиями",
       "offline": "Не в сети",
       "credentialExpired": "Учётные данные истекли"
+    },
+    "driveMode": {
+      "mirror": "Полное зеркало",
+      "onDemand": "По требованию"
     },
     "networkSettings": "Сеть",
     "heartbeatInterval": "Интервал heartbeat",

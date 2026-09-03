@@ -13,6 +13,13 @@
     "finalSetupDescription": "Choose a local folder where your cloud drive will be mounted.",
     "localPath": "Local Path",
     "localDriveName": "Mount Name",
+    "modeChoice": {
+      "title": "Sync Mode",
+      "mirror": "Full Mirror",
+      "mirrorHint": "Every file is downloaded and kept in sync locally.",
+      "onDemand": "On-Demand",
+      "onDemandHint": "Files download only when you open them. The local folder must be empty to start."
+    },
     "localPathPlaceholder": "/Users/username/CloudDrive",
     "browse": "Browse",
     "selectFolder": "Select Folder",
@@ -122,6 +129,10 @@
       "eventPushLost": "Real time event push lost",
       "offline": "Offline",
       "credentialExpired": "Credential Expired"
+    },
+    "driveMode": {
+      "mirror": "Full Mirror",
+      "onDemand": "On-Demand"
     },
     "networkSettings": "Network",
     "heartbeatInterval": "Heartbeat interval",

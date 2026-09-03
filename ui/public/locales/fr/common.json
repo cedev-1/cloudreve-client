@@ -13,6 +13,13 @@
     "finalSetupDescription": "Choisissez un dossier local où votre disque cloud sera monté.",
     "localPath": "Chemin local",
     "localDriveName": "Nom du montage",
+    "modeChoice": {
+      "title": "Mode de synchronisation",
+      "mirror": "Miroir complet",
+      "mirrorHint": "Tous les fichiers sont téléchargés et synchronisés localement.",
+      "onDemand": "À la demande",
+      "onDemandHint": "Les fichiers ne sont téléchargés qu'à l'ouverture. Le dossier local doit être vide pour commencer."
+    },
     "localPathPlaceholder": "/Users/username/CloudDrive",
     "browse": "Parcourir",
     "selectFolder": "Sélectionner un dossier",
@@ -122,6 +129,10 @@
       "eventPushLost": "Perte du push d'événements en temps réel",
       "offline": "Hors ligne",
       "credentialExpired": "Identifiants expirés"
+    },
+    "driveMode": {
+      "mirror": "Miroir complet",
+      "onDemand": "À la demande"
     },
     "networkSettings": "Réseau",
     "heartbeatInterval": "Intervalle de heartbeat",

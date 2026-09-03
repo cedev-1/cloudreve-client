@@ -160,7 +160,26 @@ export default function DriveChips({
                 />
               ) : undefined
             }
-            label={drive.name}
+            label={
+              <Box component="span" sx={{ display: "inline-flex", alignItems: "center", gap: 0.5 }}>
+                <span>{drive.name}</span>
+                <Box
+                  component="span"
+                  sx={{
+                    fontSize: 10,
+                    lineHeight: 1.4,
+                    px: 0.5,
+                    borderRadius: 0.75,
+                    bgcolor: "action.selected",
+                    color: "text.secondary",
+                  }}
+                >
+                  {drive.mode === "on_demand"
+                    ? t("settings.driveMode.onDemand")
+                    : t("settings.driveMode.mirror")}
+                </Box>
+              </Box>
+            }
             size="small"
             selected={selectedDrive === drive.id}
             onClick={() => onDriveSelect(drive.id)}

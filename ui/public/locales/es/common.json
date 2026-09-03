@@ -13,6 +13,13 @@
     "finalSetupDescription": "Elija una carpeta local donde se montará su unidad en la nube.",
     "localPath": "Ruta local",
     "localDriveName": "Nombre del montaje",
+    "modeChoice": {
+      "title": "Modo de sincronización",
+      "mirror": "Espejo completo",
+      "mirrorHint": "Todos los archivos se descargan y se mantienen sincronizados localmente.",
+      "onDemand": "Bajo demanda",
+      "onDemandHint": "Los archivos se descargan solo al abrirlos. La carpeta local debe estar vacía para empezar."
+    },
     "localPathPlaceholder": "/Users/username/CloudDrive",
     "browse": "Examinar",
     "selectFolder": "Seleccionar carpeta",
@@ -119,6 +126,10 @@
       "eventPushLost": "Pérdida de notificaciones en tiempo real",
       "offline": "Fuera de línea",
       "credentialExpired": "Credenciales expiradas"
+    },
+    "driveMode": {
+      "mirror": "Espejo completo",
+      "onDemand": "Bajo demanda"
     },
     "networkSettings": "Red",
     "heartbeatInterval": "Intervalo de heartbeat",
