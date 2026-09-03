@@ -303,6 +303,41 @@ impl std::fmt::Display for DirNotEmptyError {
 
 impl std::error::Error for DirNotEmptyError {}
 
+/// Returned by [`Vfs::rename`] when a drafted (never-uploaded, empty
+/// `base_etag`) FILE source is renamed onto a destination name that
+/// currently resolves to an existing DIRECTORY (phase 4 task 3, R1 —
+/// routed from the task 2 re-review). Deleting a directory to "make room"
+/// for a file is far more destructive than this call should ever do on a
+/// caller's behalf (same reasoning `rename`'s own doc gives for never
+/// bridging a directory destination at all), so this refuses loudly instead
+/// of the alternative this fix replaces: silently letting `rename()` return
+/// `Ok(())` with the draft migrated in name only, its base etag still
+/// empty, so its eventual upload ran `overwrite=false` against the
+/// directory's own uri and retried an identical, doomed `ObjectExisted`
+/// (40004) forever — a different door onto the exact class of bug R2's
+/// bridge closes for the ordinary rename-onto-existing-FILE case. A REMOTE
+/// (already-uploaded) source hitting the same collision is NOT covered by
+/// this type: it still falls through to the server's own native refusal on
+/// the `rename_file`/`move_files` call (surfaces as a generic `Io`/`EIO`
+/// via `classify_error`'s fallback) — see `rename`'s own doc for why only
+/// the drafted-source path needed a facade-level guard at all: a remote
+/// source's collision is always caught by a real API call, a drafted
+/// source's never is, since nothing ever reaches the server until the
+/// eventual, decoupled upload. Detectable via
+/// `anyhow::Error::downcast_ref::<RenameOntoDirectoryError>()`.
+#[derive(Debug, Clone)]
+pub struct RenameOntoDirectoryError {
+    pub remote_path: String,
+}
+
+impl std::fmt::Display for RenameOntoDirectoryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "cannot rename onto {}: it is a directory", self.remote_path)
+    }
+}
+
+impl std::error::Error for RenameOntoDirectoryError {}
+
 /// Test-only rendezvous for pausing `create()` mid-body — see
 /// `Vfs::pause_create_before_registration_for_tests`. Exists because the
 /// window this is meant to test (`create` making a name visible before it
@@ -972,6 +1007,25 @@ impl Vfs {
         self.drafts.lock().await.set_state(remote_path, state)
     }
 
+    /// Test-only: reads a draft's current state directly, without going
+    /// through any facade-level overlay. The read-only counterpart of
+    /// `set_draft_state_for_tests` above — same non-`#[cfg(test)]`
+    /// reasoning. Used to observe a draft settle into `Uploading` (proving
+    /// a debounced upload attempt actually started) without depending on
+    /// `wait_for_writeback_idle`, which a still-in-flight or panicked
+    /// attempt may not resolve promptly (phase 4, this task's panic test).
+    pub async fn draft_state_for_tests(&self, remote_path: &str) -> Option<DraftState> {
+        self.drafts.lock().await.state(remote_path)
+    }
+
+    /// Test-only: makes the very next write-back `process` call panic right
+    /// before it would hand the draft's bytes to the uploader — see
+    /// `WriteBackQueue::panic_next_upload_for_tests`'s doc. Phase 4, this
+    /// task: pins the `in_flight` scope-guard fix.
+    pub fn panic_next_upload_for_tests(&self) {
+        self.write_queue.panic_next_upload_for_tests();
+    }
+
     /// Test-only: makes the very next `DraftStore::set_state` call anywhere
     /// (e.g. inside `open`'s reopen-cancel, or `close`'s arm) fail as if its
     /// disk persist step failed, without touching disk. Pins the ordering
@@ -1446,14 +1500,33 @@ impl Vfs {
         // collide with either way) — see the helper's own doc. Never a
         // DIRECTORY destination: deleting one to "make room" for a file is
         // far more destructive than this call should ever do on a caller's
-        // behalf, so a file renamed onto an existing directory name falls
-        // through to the server's own native refusal below, unchanged from
-        // before this fix (surfaces as EIO — an edge case outside the
-        // atomic-save idiom this deliverable targets).
-        let dest_remote = self
-            .remote_destination_if_exists(new_parent, new_name)
-            .await?
-            .filter(|a| !a.is_dir);
+        // behalf, so `dest_remote` itself always filters a directory out
+        // below, whatever the source turns out to be.
+        let dest_lookup = self.remote_destination_if_exists(new_parent, new_name).await?;
+
+        // R1 (phase 4 task 3, routed from the task 2 re-review): a
+        // DRAFTED-source FILE (`!existed_remotely` — a directory can never
+        // be `!existed_remotely`, it never has a draft at all, so
+        // `!source_is_dir` is technically implied but checked explicitly
+        // for clarity) hitting an existing DIRECTORY name must be refused
+        // loudly — see `RenameOntoDirectoryError`'s doc for the
+        // doomed-40004-retry-loop this closes. A REMOTE source colliding
+        // the same way is deliberately left to fall through to the server's
+        // own native refusal on the `rename_file`/`move_files` call just
+        // below (surfaces as a generic `Io`/`EIO`) — that path always
+        // reaches a real API call, unlike a drafted source's, which never
+        // does until its eventual, decoupled upload.
+        if !existed_remotely && !source_is_dir {
+            if let Some(dest_attr) = &dest_lookup {
+                if dest_attr.is_dir {
+                    return Err(anyhow::Error::new(RenameOntoDirectoryError {
+                        remote_path: new_path,
+                    }));
+                }
+            }
+        }
+
+        let dest_remote = dest_lookup.filter(|a| !a.is_dir);
 
         if existed_remotely {
             // REMOTE-SOURCE bridge: the real Cloudreve server refuses
@@ -1525,41 +1598,43 @@ impl Vfs {
             }
         }
 
+        // DRAFTED-SOURCE bridge (R2 fix, phase 4 task 3): when the source
+        // never existed on the server (empty `base_etag`, so no `delete`/
+        // `rename` call was ever made above — there is nothing on the
+        // server to move) AND a real object sits at the destination, the
+        // migrated draft must adopt the destination's remote identity —
+        // rebasing onto its current etag — so its eventual upload runs
+        // `overwrite=true, previous_version=dest_attr.etag`: an ordinary
+        // rewrite-in-place, arbitrated by the SAME D5 conflict machinery an
+        // edit of an already-existing file always goes through (a remote
+        // change since adoption correctly becomes a conflict copy, not a
+        // 40004 loop). Without this, the migrated draft would keep its
+        // EMPTY `base_etag` and its eventual upload would run
+        // `overwrite=false` against a uri that ALREADY exists remotely —
+        // refused with 40004, treated as a plain transient failure (not a
+        // conflict — see `WriteBackQueue::process`'s conflict-copy gate,
+        // which only fires for a non-empty `base_etag`), parking the draft
+        // to retry the IDENTICAL doomed request forever.
+        //
+        // Computed BEFORE the `rename` call below (not as a separate
+        // `set_base_etag` call afterward) and passed into it directly:
+        // `DraftStore::rename`'s single `write_meta` persists the migrated
+        // path and the adopted etag TOGETHER, so there is no window in
+        // which a crash (or a cancelled future) could land one without the
+        // other — see that method's own doc.
+        let adopted_etag =
+            if !existed_remotely { dest_remote.as_ref().map(|attr| attr.etag.clone()) } else { None };
+
         let had_draft = {
             let mut drafts = self.drafts.lock().await;
             if drafts.state(&old_path).is_some() {
-                drafts.rename(&old_path, &new_path)?;
+                drafts.rename(&old_path, &new_path, adopted_etag.as_deref())?;
                 true
             } else {
                 false
             }
         };
         if had_draft {
-            if !existed_remotely {
-                if let Some(dest_attr) = &dest_remote {
-                    // DRAFTED-SOURCE bridge: the source never existed on the
-                    // server (empty `base_etag`), so no `delete`/`rename`
-                    // call was ever made above — there is nothing on the
-                    // server to move. Without this, the migrated draft would
-                    // keep its EMPTY `base_etag` and its eventual upload
-                    // would run `overwrite=false` against a uri that
-                    // ALREADY exists remotely (`dest_attr`) — the server
-                    // refuses with the same 40004, the upload treats that as
-                    // a plain transient failure (not a conflict — see
-                    // `WriteBackQueue::process`'s conflict-copy gate, which
-                    // only fires for a non-empty `base_etag`), and the draft
-                    // parks `Pending` to retry the IDENTICAL doomed request
-                    // forever. Adopting the destination's remote identity
-                    // instead — rebasing onto its current etag — makes the
-                    // eventual upload run as `overwrite=true,
-                    // previous_version=dest_attr.etag`: an ordinary
-                    // rewrite-in-place, arbitrated by the SAME D5 conflict
-                    // machinery an edit of an already-existing file always
-                    // goes through (a remote change since adoption correctly
-                    // becomes a conflict copy, not another 40004 loop).
-                    self.drafts.lock().await.set_base_etag(&new_path, &dest_attr.etag)?;
-                }
-            }
             // A no-op unless a debounce timer was actually armed for the
             // old path (see `migrate_armed_timer`'s doc) — a draft still
             // `Editing` or already `Uploading` has nothing to migrate here.

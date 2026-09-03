@@ -24,27 +24,123 @@
 //! source, not from execution. See `fuse.rs`'s module doc for the same
 //! caveat about `VfsFuse` itself.
 //!
+//! ## Phase 4 (this task): mount robustness
+//!
+//! Three carried obligations, all shared (OS-agnostic) machinery below:
+//!
+//! - **Pre-clean.** `mount()` now calls `cleanup_stale_mount` FIRST, before
+//!   ever attempting its own bind/attach — D5's original intent, which
+//!   previously only ran when a caller remembered to invoke it by hand.
+//!   Best-effort: a pre-clean failure is logged and the mount is attempted
+//!   anyway, so a pre-clean bug never masks (or replaces) the real mount
+//!   attempt's own, more specific error.
+//! - **Bounded shell-outs.** Every subprocess call this module makes now
+//!   runs through [`blocking_bounded`]/[`run_ok_bounded`]: `spawn_blocking`
+//!   (so a wedged command blocks a blocking-pool thread, never an async
+//!   worker) plus `tokio::time::timeout` (so a wedged command still fails
+//!   the call rather than hanging it forever). [`MOUNT_BUDGET`],
+//!   [`UMOUNT_STEP_BUDGET`], and [`DETECT_BUDGET`] are the three documented
+//!   budgets. The one deliberate exception is `MountedVfs`'s `Drop`
+//!   fallback, which cannot `.await` at all (see `macos_impl`'s
+//!   `escalate_unmount_sync` doc) and keeps the pre-existing, unbounded,
+//!   best-effort behavior — disclosed there, not silently narrowed here.
+//! - **Two-instance false positive.** A mount-table match at a given path
+//!   only proves SOME mount from `127.0.0.1` (NFS) / some `fuse*` mount
+//!   (Linux) sits there — it cannot by itself tell "our own crashed
+//!   instance" apart from "a currently-alive sibling (another running copy
+//!   of this app, or a relaunch that reused the same mountpoint before the
+//!   old one fully exited) still correctly serving it". [`mount`] now
+//!   records an identity marker at `<cache_dir>/mount.port` on every
+//!   successful bind (macOS: the ephemeral TCP port `nfs3_server` bound;
+//!   Linux: this process's pid — there is no port at all for a FUSE mount,
+//!   see `linux_impl`'s doc for why a pid is the closest analogous
+//!   identity signal), and [`cleanup_stale_mount`] only ever force-unmounts
+//!   a mount-table match once that SPECIFIC recorded owner is provably
+//!   unreachable/dead — never on a bare path+source match alone. The
+//!   decision itself is pure/testable independent of any real OS call: see
+//!   [`is_stale`].
+//!
 //! ## Shared helpers
 //!
-//! `run_ok` (run a command, report success/failure) and
-//! `resolve_mountpoint_for_comparison` (resolve a mountpoint's ancestor
-//! symlinks without ever stat-ing the mountpoint itself — see that
-//! function's own doc for why) are pure, OS-agnostic logic used identically
-//! by both platforms' stale-mount detection and unmount escalation, so they
-//! live here, unconditionally compiled, rather than duplicated per OS. Their
-//! unit tests (bottom of this file) are the ONLY tests in this module that
-//! run on both CI platforms — everything mount-specific is real-mount E2E,
+//! `run_ok`/`run_ok_bounded`, `resolve_mountpoint_for_comparison`, the
+//! mount-marker read/write helpers, and `is_stale` are pure or
+//! OS-agnostic-I/O logic used identically by both platforms' stale-mount
+//! detection and unmount escalation, so they live here, unconditionally
+//! compiled, rather than duplicated per OS. Their unit tests (bottom of
+//! this file) are the ONLY tests in this module that run on both CI
+//! platforms — everything mount-specific is real-mount E2E,
 //! `tests/mounted_{macos,linux}.rs`.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+
+/// Total budget for the whole blocking OS attach step inside `mount()`
+/// (macOS: `mount_nfs`; see `linux_impl`'s doc for why `fuser::
+/// spawn_mount2` deliberately stays OUTSIDE this budget). Generous next to
+/// a healthy attach (sub-second in practice against a live in-process
+/// server on this machine) but still finite: a wedged mount helper must
+/// fail the call, not hang the caller — and everything transitively
+/// awaiting it — forever.
+const MOUNT_BUDGET: Duration = Duration::from_secs(15);
+
+/// Budget for ONE rung of an unmount escalation chain (plain `umount`, then
+/// `umount -f`, etc. — see each platform's `escalate_unmount`), not the
+/// whole chain. Each rung gets its own fresh budget so an early rung
+/// wedging (rather than cleanly failing) can't eat into the time a LATER,
+/// more forceful rung would have needed.
+const UMOUNT_STEP_BUDGET: Duration = Duration::from_secs(10);
+
+/// Budget for a single, local, read-only diagnostic step: listing the
+/// mount table, reading `/proc/mounts`, or a loopback TCP liveness probe.
+/// Much shorter than the two budgets above since none of these talk to the
+/// (possibly dead) mount itself — only to the OS's own bookkeeping, or a
+/// bare loopback socket — so a healthy answer is near-instant; this budget
+/// exists purely so a pathological hang here can't stall detection.
+const DETECT_BUDGET: Duration = Duration::from_secs(5);
 
 /// Runs `cmd args...`, returning whether it exited successfully. Spawn
 /// failures (binary missing, etc.) count as failure too — callers' own
-/// escalation chains just move on to the next attempt.
+/// escalation chains just move on to the next attempt. Synchronous:
+/// callers on the async paths below always reach this through
+/// [`run_ok_bounded`] instead; the one exception is `MountedVfs::Drop`'s
+/// fallback, which cannot `.await` — see `macos_impl::escalate_unmount_sync`.
 fn run_ok(cmd: &str, args: &[&OsStr]) -> bool {
     Command::new(cmd).args(args).output().map(|o| o.status.success()).unwrap_or(false)
+}
+
+/// Runs a blocking closure off the async executor via `spawn_blocking`,
+/// bounded by `budget`. Every mount/umount shell-out (and the loopback
+/// liveness probe) in this module goes through this, directly or via
+/// [`run_ok_bounded`] — a real subprocess or socket call can block for the
+/// OS's own timeout duration (or genuinely hang), which must never stall
+/// the calling task indefinitely. `budget` elapsing, or the blocking
+/// closure itself panicking, both surface as `Err`: callers already treat
+/// "this attempt failed" uniformly regardless of which.
+async fn blocking_bounded<T, F>(budget: Duration, f: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tokio::time::timeout(budget, tokio::task::spawn_blocking(f))
+        .await
+        .context("blocking shell-out exceeded its deadline")?
+        .context("blocking shell-out task panicked")
+}
+
+/// Async, bounded counterpart of [`run_ok`] for a single escalation rung.
+/// Takes owned `args` (not borrowed `&OsStr`s) since the closure it builds
+/// must be `'static` to cross into `spawn_blocking`.
+async fn run_ok_bounded(cmd: &'static str, args: Vec<OsString>, budget: Duration) -> bool {
+    blocking_bounded(budget, move || {
+        let arg_refs: Vec<&OsStr> = args.iter().map(OsString::as_os_str).collect();
+        run_ok(cmd, &arg_refs)
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// Resolves `mountpoint`'s ancestor symlinks WITHOUT ever stat-ing
@@ -72,17 +168,85 @@ fn resolve_mountpoint_for_comparison(mountpoint: &Path) -> PathBuf {
         .unwrap_or_else(|_| mountpoint.to_path_buf())
 }
 
+/// Where [`mount`] records its identity marker (this task's two-instance
+/// fix) — see the module doc's "Two-instance false positive" section for
+/// what each platform stores there and why.
+fn mount_marker_path(cache_dir: &Path) -> PathBuf {
+    cache_dir.join("mount.port")
+}
+
+/// Persists `value` (a port number on macOS, a pid on Linux — see the
+/// module doc) as this mount's identity marker. Best-effort from every call
+/// site (a failure here only degrades a FUTURE crash's pre-clean back to
+/// the pre-this-task "leave it for a human" behavior — it must never fail
+/// the mount that's already succeeded by the time this runs).
+fn write_mount_marker(cache_dir: &Path, value: &str) -> Result<()> {
+    std::fs::create_dir_all(cache_dir)
+        .with_context(|| format!("failed to create cache dir {}", cache_dir.display()))?;
+    let path = mount_marker_path(cache_dir);
+    std::fs::write(&path, value)
+        .with_context(|| format!("failed to write mount marker {}", path.display()))
+}
+
+/// Reads back whatever [`write_mount_marker`] last stored, trimmed.
+/// `None` covers both "never written" and "unreadable" alike — either way
+/// there is nothing to positively attribute a mount-table match to.
+fn read_mount_marker(cache_dir: &Path) -> Option<String> {
+    std::fs::read_to_string(mount_marker_path(cache_dir)).ok().map(|s| s.trim().to_string())
+}
+
+/// Best-effort delete of the marker — called once a mount is known gone
+/// (cleanly unmounted, or force-cleaned as stale) so a stale leftover
+/// marker never outlives the mount it described. Never fails the caller:
+/// a failure here only means a future pre-clean might (harmlessly) find a
+/// marker pointing at an owner that, on re-probing, is already gone.
+fn remove_mount_marker(cache_dir: &Path) {
+    let path = mount_marker_path(cache_dir);
+    if let Err(err) = std::fs::remove_file(&path) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(path = %path.display(), %err, "vfs mount: failed to remove the mount marker");
+        }
+    }
+}
+
+/// Decides whether a mount-table match at some path should be treated as
+/// stale, given what's known about OUR recorded identity marker for it —
+/// the pure decision core of this task's two-instance fix, deliberately
+/// factored out from any real OS call (`is_our_nfs_mount`/
+/// `is_our_fuse_mount` are the only callers) so it can be pinned by a
+/// deterministic unit test independent of any real mount.
+///
+/// - No mount-table match at all: never stale — nothing to clean.
+/// - A match, but no marker was ever recorded for this cache_dir (`None`):
+///   NOT treated as stale. Conservative on purpose: without a positive
+///   record of having mounted here ourselves, this match cannot be
+///   attributed to a dead instance of ours, so leaving it alone beats
+///   risking a force-unmount of someone else's live mount.
+/// - A match, a marker WAS recorded, and its owner (the process on the
+///   other end — a TCP listener on macOS, a pid on Linux) is still alive:
+///   NOT stale. This is the two-instance false positive itself: a
+///   currently-alive sibling still legitimately owns this mountpoint.
+/// - A match, a marker WAS recorded, and its owner is dead: stale.
+fn is_stale(mount_table_match: bool, marker_owner_alive: Option<bool>) -> bool {
+    if !mount_table_match {
+        return false;
+    }
+    matches!(marker_owner_alive, Some(false))
+}
+
 #[cfg(target_os = "macos")]
 mod macos_impl {
-    //! macOS mount lifecycle (phase 3, D1/D4/D5): shells out to the OS's
-    //! built-in `/sbin/mount_nfs` to attach [`VfsNfs`]'s in-process
-    //! `nfs3_server` listener — rclone's own `nfsmount` pattern, verified
-    //! live against this crate's `nfs3_server`. See [`MOUNT_OPTS`]'s doc for
-    //! exactly what the OS accepted.
+    //! macOS mount lifecycle (phase 3, D1/D4/D5; phase 4 this task):
+    //! shells out to the OS's built-in `/sbin/mount_nfs` to attach
+    //! [`VfsNfs`]'s in-process `nfs3_server` listener — rclone's own
+    //! `nfsmount` pattern, verified live against this crate's
+    //! `nfs3_server`. See [`MOUNT_OPTS`]'s doc for exactly what the OS
+    //! accepted.
     //!
     //! ## Lifecycle
     //!
-    //! [`MountedVfs`] owns the server's `JoinHandle` and the mountpoint.
+    //! [`MountedVfs`] owns the server's `JoinHandle`, the mountpoint, and
+    //! (this task) the `cache_dir` its identity marker lives under.
     //! `unmount()` runs the umount escalation chain (`umount`, then `umount
     //! -f`, then `diskutil unmount force`) and, only once that succeeds,
     //! aborts the server task — unmounting the OS side while the server can
@@ -98,14 +262,19 @@ mod macos_impl {
     //! [`cleanup_stale_mount`] is the D5 crash-recovery path: this
     //! in-process server cannot outlive the process that spawned it, so ANY
     //! mountpoint the OS still lists as an NFS mount sourced from
-    //! `127.0.0.1` is necessarily left over from an earlier, uncleanly-
-    //! terminated run — there is no "currently healthy" case to distinguish
-    //! it from. Detection is therefore a single, side-effect-free check
-    //! against `/sbin/mount`'s own listing (no probing `read_dir`/`statfs`
-    //! against the mountpoint itself, which would risk hanging on exactly
-    //! the dead mount it's trying to diagnose).
+    //! `127.0.0.1` is EITHER left over from an earlier, uncleanly-
+    //! terminated run of this app, OR (this task's fix) a currently-alive
+    //! sibling instance's legitimate mount — see the module doc's
+    //! "Two-instance false positive" section and [`is_our_nfs_mount`] for
+    //! how the two are told apart. Detection never probes the mountpoint
+    //! itself (no `read_dir`/`statfs`, which would risk hanging on exactly
+    //! the dead mount it's trying to diagnose) — only `/sbin/mount`'s own
+    //! listing and, for the port-liveness check, a bare loopback TCP
+    //! connect (never to the mountpoint, always to `127.0.0.1:<port>`
+    //! directly).
 
-    use std::ffi::OsStr;
+    use std::ffi::{OsStr, OsString};
+    use std::net::TcpStream;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::Arc;
@@ -114,7 +283,10 @@ mod macos_impl {
     use nfs3_server::tcp::{NFSTcp, NFSTcpListener};
     use tokio::task::JoinHandle;
 
-    use super::{resolve_mountpoint_for_comparison, run_ok};
+    use super::{
+        blocking_bounded, read_mount_marker, remove_mount_marker, resolve_mountpoint_for_comparison,
+        run_ok, run_ok_bounded, write_mount_marker, DETECT_BUDGET, MOUNT_BUDGET, UMOUNT_STEP_BUDGET,
+    };
     use crate::nfs::VfsNfs;
     use crate::vfs::Vfs;
 
@@ -145,7 +317,16 @@ mod macos_impl {
     /// want a specific drive name in Finder should name the mountpoint
     /// directory itself, not rely on this argument (it is still accepted
     /// and stored, matching the public surface the Linux branch needs —
-    /// `fuser`'s `fsname`/`subtype` options DO use it there).
+    /// `fuser`'s `fsname`/`subtype` options DO use it there). `cache_dir`
+    /// (this task) is where the mount's identity marker is written on
+    /// success and where a future call's pre-clean step looks for one —
+    /// callers should pass the SAME `cache_dir` they gave `Vfs::new` for
+    /// this drive.
+    ///
+    /// Pre-cleans (this task, D5's original intent): calls
+    /// [`cleanup_stale_mount`] on `mountpoint`/`cache_dir` FIRST,
+    /// best-effort — a pre-clean failure is logged, never returned, so it
+    /// can never mask the real mount attempt's own, more specific error.
     ///
     /// Async — not a bookkeeping choice but a genuine requirement:
     /// `nfs3_server` only exposes an async bind (`NFSTcpListener::bind`,
@@ -153,11 +334,24 @@ mod macos_impl {
     /// way to obtain the server's ephemeral port synchronously. Every
     /// caller in this codebase (Tauri commands, tests) already runs inside
     /// a tokio runtime.
-    pub async fn mount(vfs: Arc<Vfs>, mountpoint: &Path, volume_name: &str) -> Result<MountedVfs> {
+    pub async fn mount(
+        vfs: Arc<Vfs>,
+        mountpoint: &Path,
+        volume_name: &str,
+        cache_dir: &Path,
+    ) -> Result<MountedVfs> {
         // `volume_name` is genuinely unused on macOS (see the fn doc) — held
         // here only so the parameter's purpose is documented at the call
         // site rather than silently swallowed.
         let _ = volume_name;
+
+        if let Err(err) = cleanup_stale_mount(mountpoint, cache_dir).await {
+            tracing::warn!(
+                mountpoint = %mountpoint.display(),
+                ?err,
+                "vfs mount: pre-clean failed, attempting to mount anyway"
+            );
+        }
 
         let fs = VfsNfs::new(vfs);
         let listener = NFSTcpListener::bind("127.0.0.1:0", fs)
@@ -171,19 +365,37 @@ mod macos_impl {
             }
         });
 
-        if let Err(err) = run_mount_nfs(mountpoint, port) {
+        let mountpoint_owned = mountpoint.to_path_buf();
+        let mount_result =
+            blocking_bounded(MOUNT_BUDGET, move || run_mount_nfs(&mountpoint_owned, port))
+                .await
+                .and_then(std::convert::identity);
+        if let Err(err) = mount_result {
             // The OS never attached, so there is nothing mounted to clean up
             // — just stop the now-useless server task.
             server_task.abort();
             return Err(err);
         }
 
-        Ok(MountedVfs { mountpoint: mountpoint.to_path_buf(), server_task: Some(server_task) })
+        if let Err(err) = write_mount_marker(cache_dir, &port.to_string()) {
+            tracing::warn!(
+                ?err,
+                "vfs mount: failed to persist the mount.port marker — a future crash at this \
+                 mountpoint may not self-heal via pre-clean"
+            );
+        }
+
+        Ok(MountedVfs {
+            mountpoint: mountpoint.to_path_buf(),
+            cache_dir: cache_dir.to_path_buf(),
+            server_task: Some(server_task),
+        })
     }
 
     /// Runs `/sbin/mount_nfs` against the in-process server listening on
     /// `127.0.0.1:<port>`, attaching it at `mountpoint`. See [`MOUNT_OPTS`]'s
-    /// doc for why each flag is there.
+    /// doc for why each flag is there. Synchronous: always reached through
+    /// [`blocking_bounded`] (see `mount`'s body), never called directly.
     fn run_mount_nfs(mountpoint: &Path, port: u16) -> Result<()> {
         let mp = mountpoint.to_str().context("mountpoint path must be valid utf-8")?;
         let opts = format!("{MOUNT_OPTS},port={port},mountport={port}");
@@ -207,15 +419,19 @@ mod macos_impl {
     /// up" sentinel.
     pub struct MountedVfs {
         mountpoint: PathBuf,
+        cache_dir: PathBuf,
         server_task: Option<JoinHandle<()>>,
     }
 
     impl MountedVfs {
-        /// Unmounts cleanly: OS-level umount escalation chain first, then
-        /// the in-process server task is aborted. Order matters — see the
-        /// module doc.
-        pub fn unmount(mut self) -> Result<()> {
-            escalate_unmount(&self.mountpoint)?;
+        /// Unmounts cleanly: OS-level umount escalation chain first (each
+        /// rung bounded — see [`UMOUNT_STEP_BUDGET`]), then this mount's
+        /// identity marker is removed (best-effort — see
+        /// `remove_mount_marker`'s doc), then the in-process server task is
+        /// aborted. Order matters — see the module doc.
+        pub async fn unmount(mut self) -> Result<()> {
+            escalate_unmount(&self.mountpoint).await?;
+            remove_mount_marker(&self.cache_dir);
             if let Some(task) = self.server_task.take() {
                 task.abort();
             }
@@ -252,7 +468,7 @@ mod macos_impl {
             // `abort_server_for_tests`) already handled cleanup — see the
             // module doc's sentinel note.
             if let Some(task) = self.server_task.take() {
-                if let Err(err) = escalate_unmount(&self.mountpoint) {
+                if let Err(err) = escalate_unmount_sync(&self.mountpoint) {
                     tracing::warn!(
                         mountpoint = %self.mountpoint.display(),
                         ?err,
@@ -264,48 +480,145 @@ mod macos_impl {
         }
     }
 
-    /// D5: crash recovery. This in-process server cannot outlive the
-    /// process that spawned it, so any mountpoint the OS still lists as an
-    /// NFS mount sourced from `127.0.0.1` is necessarily a leftover from an
-    /// earlier, uncleanly-terminated run (see the module doc for why no
-    /// separate liveness probe is needed). Force-unmounts it if found.
-    /// Returns whether anything was cleaned.
-    pub fn cleanup_stale_mount(mountpoint: &Path) -> Result<bool> {
-        if !is_our_nfs_mount(mountpoint)? {
+    /// D5: crash recovery (phase 4 this task: now also the two-instance
+    /// fix). This in-process server cannot outlive the process that
+    /// spawned it, so any mountpoint the OS still lists as an NFS mount
+    /// sourced from `127.0.0.1` is either a genuine leftover from an
+    /// earlier, uncleanly-terminated run of THIS app, or a currently-alive
+    /// sibling's legitimate mount — [`is_our_nfs_mount`] tells the two
+    /// apart via the `cache_dir`-scoped port marker before this
+    /// force-unmounts anything. Returns whether anything was cleaned.
+    pub async fn cleanup_stale_mount(mountpoint: &Path, cache_dir: &Path) -> Result<bool> {
+        if !is_our_nfs_mount(mountpoint, cache_dir).await? {
             return Ok(false);
         }
-        escalate_unmount(mountpoint)?;
+        escalate_unmount_stale(mountpoint).await?;
+        remove_mount_marker(cache_dir);
         Ok(true)
     }
 
     /// Parses `/sbin/mount`'s own listing (no arguments — every current
     /// mount) looking for an entry whose local path is `mountpoint` and
-    /// whose source is an NFS mount from `127.0.0.1`. `mountpoint` is
-    /// resolved through its ancestor symlinks (macOS's temp directories
-    /// commonly go through one, e.g. `/tmp` -> `/private/tmp`) via
-    /// [`resolve_mountpoint_for_comparison`] before comparing — see that
-    /// function's doc for why the mountpoint itself is never touched here.
-    fn is_our_nfs_mount(mountpoint: &Path) -> Result<bool> {
-        let canonical = resolve_mountpoint_for_comparison(mountpoint);
-        let canonical = canonical.to_string_lossy();
+    /// whose source is an NFS mount from `127.0.0.1`; if one is found,
+    /// consults `cache_dir`'s recorded port marker and probes whether that
+    /// SPECIFIC port is still alive (a bare loopback TCP connect — see
+    /// [`is_port_alive`]) before concluding this match is actually stale.
+    /// `mountpoint` is resolved through its ancestor symlinks (macOS's temp
+    /// directories commonly go through one, e.g. `/tmp` -> `/private/tmp`)
+    /// via [`resolve_mountpoint_for_comparison`] before comparing — see
+    /// that function's doc for why the mountpoint itself is never touched
+    /// here. The actual stale/not-stale decision is [`super::is_stale`],
+    /// pure and unit-tested independent of both OS calls this function
+    /// makes.
+    async fn is_our_nfs_mount(mountpoint: &Path, cache_dir: &Path) -> Result<bool> {
+        let canonical = resolve_mountpoint_for_comparison(mountpoint).to_string_lossy().into_owned();
 
-        let output = Command::new("/sbin/mount").output().context("running /sbin/mount")?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            // Line shape: "<source> on <path> (<options>)".
-            let Some((source, rest)) = line.split_once(" on ") else { continue };
-            let Some((path_str, opts)) = rest.rsplit_once(" (") else { continue };
-            if path_str == canonical && source.starts_with("127.0.0.1:") && opts.contains("nfs") {
-                return Ok(true);
+        let mount_table_match: bool = blocking_bounded(DETECT_BUDGET, move || -> Result<bool> {
+            let output = Command::new("/sbin/mount").output().context("running /sbin/mount")?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                // Line shape: "<source> on <path> (<options>)".
+                let Some((source, rest)) = line.split_once(" on ") else { continue };
+                let Some((path_str, opts)) = rest.rsplit_once(" (") else { continue };
+                if path_str == canonical && source.starts_with("127.0.0.1:") && opts.contains("nfs") {
+                    return Ok(true);
+                }
             }
+            Ok(false)
+        })
+        .await
+        .and_then(std::convert::identity)?;
+
+        if !mount_table_match {
+            return Ok(false);
         }
-        Ok(false)
+
+        let marker_owner_alive = match read_mount_marker(cache_dir).and_then(|m| m.parse::<u16>().ok())
+        {
+            Some(port) => Some(is_port_alive(port).await),
+            None => None,
+        };
+
+        Ok(super::is_stale(mount_table_match, marker_owner_alive))
     }
 
-    /// Escalating unmount: plain `umount`, then `umount -f`, then `diskutil
-    /// unmount force` — the sequence D4 specifies, each one only attempted
-    /// after the previous one fails.
-    fn escalate_unmount(mountpoint: &Path) -> Result<()> {
+    /// Whether something is currently listening (and accepting a raw TCP
+    /// connect) on `127.0.0.1:<port>` — the two-instance liveness probe.
+    /// Deliberately just a bare connect, no NFS-level RPC: a TCP handshake
+    /// already answers "is the process that bound this port still alive
+    /// and accepting connections", and doing nothing more here means
+    /// nothing more that can itself hang. Never touches the mountpoint.
+    async fn is_port_alive(port: u16) -> bool {
+        blocking_bounded(DETECT_BUDGET, move || TcpStream::connect(("127.0.0.1", port)).is_ok())
+            .await
+            .unwrap_or(false)
+    }
+
+    /// Escalating unmount for an explicit, live `unmount()` call: plain
+    /// `umount`, then `umount -f`, then `diskutil unmount force` — the
+    /// sequence D4 specifies. A healthy, currently-served mount is expected
+    /// to yield to the very first, gentlest rung, so this always starts
+    /// there — see [`escalate_unmount_stale`] for the pre-diagnosed-dead
+    /// path, which skips it.
+    async fn escalate_unmount(mountpoint: &Path) -> Result<()> {
+        escalate_unmount_from(mountpoint, false).await
+    }
+
+    /// Escalating unmount for [`cleanup_stale_mount`]'s path: the mount was
+    /// already independently diagnosed dead (`is_our_nfs_mount` already
+    /// confirmed its recorded port is unreachable) before this is ever
+    /// called, so the plain `umount` rung would only wait out its own
+    /// failure against a server that's already known to be gone — this
+    /// starts directly at `umount -f`, halving the ~10s dead-mount latency
+    /// `MOUNT_OPTS`'s `timeo=30,retrans=2` soft-timeout budget would
+    /// otherwise cost the FIRST rung for nothing.
+    async fn escalate_unmount_stale(mountpoint: &Path) -> Result<()> {
+        escalate_unmount_from(mountpoint, true).await
+    }
+
+    async fn escalate_unmount_from(mountpoint: &Path, skip_plain_umount: bool) -> Result<()> {
+        let path = mountpoint.as_os_str().to_os_string();
+        if !skip_plain_umount
+            && run_ok_bounded("/sbin/umount", vec![path.clone()], UMOUNT_STEP_BUDGET).await
+        {
+            return Ok(());
+        }
+        if run_ok_bounded(
+            "/sbin/umount",
+            vec![OsString::from("-f"), path.clone()],
+            UMOUNT_STEP_BUDGET,
+        )
+        .await
+        {
+            return Ok(());
+        }
+        if run_ok_bounded(
+            "/usr/sbin/diskutil",
+            vec![OsString::from("unmount"), OsString::from("force"), path],
+            UMOUNT_STEP_BUDGET,
+        )
+        .await
+        {
+            return Ok(());
+        }
+        bail!("failed to unmount {} after exhausting the escalation chain", mountpoint.display());
+    }
+
+    /// Synchronous counterpart of [`escalate_unmount`], used ONLY by `Drop`
+    /// (which cannot `.await` — there is no async destructor in Rust). Kept
+    /// as a byte-for-byte copy of the pre-this-task escalation: unbounded,
+    /// best-effort, logged rather than propagated. Deliberately NOT
+    /// upgraded to reach for `tokio::task::block_in_place` +
+    /// `Handle::current().block_on(..)` to get the same bounded behavior
+    /// the async paths now have — that combination panics outside a
+    /// multi-thread runtime, and worse, can panic against a runtime that is
+    /// ALREADY shutting down, which is exactly the state
+    /// `tests/mounted_macos.rs`'s crash-recovery test's dedicated runtime is
+    /// in by the time cleanup runs. A hung command in this one fallback
+    /// path still blocks whatever thread drops the value, exactly as it
+    /// always has — this is a disclosed, deliberate scope limit of this
+    /// task, not an oversight.
+    fn escalate_unmount_sync(mountpoint: &Path) -> Result<()> {
         let path = mountpoint.as_os_str();
         if run_ok("/sbin/umount", &[path]) {
             return Ok(());
@@ -325,17 +638,20 @@ pub use macos_impl::{cleanup_stale_mount, mount, MountedVfs};
 
 #[cfg(target_os = "linux")]
 mod linux_impl {
-    //! Linux mount lifecycle (phase 3, D1/D6): [`VfsFuse`] mounted via
-    //! `fuser::spawn_mount2`, which itself spawns the request-dispatch
-    //! loop on a dedicated OS thread and returns a `fuser::BackgroundSession`
-    //! immediately (`session.rs::BackgroundSession::new`) — so, unlike the
-    //! macOS branch, there is no separate "spawn our own background task"
-    //! step here: `fuser` already does it.
+    //! Linux mount lifecycle (phase 3, D1/D6; phase 4 this task):
+    //! [`VfsFuse`] mounted via `fuser::spawn_mount2`, which itself spawns
+    //! the request-dispatch loop on a dedicated OS thread and returns a
+    //! `fuser::BackgroundSession` immediately (`session.rs::
+    //! BackgroundSession::new`) — so, unlike the macOS branch, there is no
+    //! separate "spawn our own background task" step here: `fuser` already
+    //! does it.
     //!
     //! **UNVERIFIED**: this module has never compiled or run — see this
     //! file's own top doc and `fuse.rs`'s module doc for what that means
     //! and what it's based on instead (reading the vendored `fuser =
-    //! "0.15.1"` source).
+    //! "0.15.1"` source). This task's own changes here (pre-clean, bounded
+    //! shell-outs, the pid-based two-instance marker) are held to the SAME
+    //! caveat — none of it has run.
     //!
     //! ## Why `default-features = false` on the `fuser` dependency
     //!
@@ -390,7 +706,7 @@ mod linux_impl {
     //! read-dispatch thread has noticed yet (its next blocking read from
     //! `/dev/fuse` will get `ENODEV` and it will exit on its own).
     //!
-    //! ## Stale-mount detection
+    //! ## Stale-mount detection (phase 4 this task: two-instance)
     //!
     //! [`is_our_fuse_mount`] reads `/proc/mounts` (a virtual procfs file —
     //! reading it never blocks on a dead mount, same "side-effect-free"
@@ -401,10 +717,23 @@ mod linux_impl {
     //! module's `mount()` sets `Subtype("cloudreve")`, which the standard
     //! FUSE mount helpers report as fstype `fuse.cloudreve`; the `starts_
     //! with` check does not depend on getting that exact string right).
-    //! Same reasoning as the macOS branch for why this can't be confused
-    //! with someone else's unrelated mount: this in-process server cannot
-    //! outlive the process that spawned it, so ANY fuse mount still
-    //! present at a path this code itself manages is necessarily ours.
+    //!
+    //! A match alone is no longer treated as proof of staleness (same fix
+    //! as the macOS branch, see the top module doc): FUSE has no TCP port
+    //! to probe liveness against, so this branch records THIS PROCESS'S
+    //! pid at `<cache_dir>/mount.port` on a successful mount instead, and
+    //! [`cleanup_stale_mount`] only force-unmounts once that recorded pid
+    //! is confirmed dead (`kill(pid, 0)` returning `ESRCH`) — the closest
+    //! analogous identity signal to the macOS branch's port-liveness probe
+    //! available for a mount type with no network endpoint at all.
+    //! **Weaker than the macOS check, disclosed rather than hidden**: a pid
+    //! can be reused by an unrelated process after this one exits, in which
+    //! case a stale marker would (incorrectly) read as "still alive" and
+    //! this mount would NOT be pre-cleaned — the conservative failure mode
+    //! (leaving a genuinely stale mount for a human) rather than the unsafe
+    //! one (force-unmounting a live sibling), consistent with [`super::
+    //! is_stale`]'s documented default for "cannot positively confirm
+    //! either way".
     //!
     //! **Known limitation, disclosed rather than handled**: `/proc/mounts`
     //! escapes whitespace/backslashes in paths as octal (`proc(5)`, e.g. a
@@ -414,13 +743,16 @@ mod linux_impl {
     //! not contain such characters, so this is a real but narrow gap, not
     //! exercised by any test here.
 
-    use std::ffi::OsStr;
+    use std::ffi::{OsStr, OsString};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
     use anyhow::{bail, Context, Result};
 
-    use super::{resolve_mountpoint_for_comparison, run_ok};
+    use super::{
+        blocking_bounded, read_mount_marker, remove_mount_marker, resolve_mountpoint_for_comparison,
+        run_ok_bounded, write_mount_marker, DETECT_BUDGET, MOUNT_BUDGET, UMOUNT_STEP_BUDGET,
+    };
     use crate::fuse::VfsFuse;
     use crate::vfs::Vfs;
 
@@ -430,15 +762,30 @@ mod linux_impl {
     /// `mount`/`df` output) — unlike macOS's `mount_nfs`, which has no
     /// equivalent, this genuinely reaches userspace tooling here. A fixed
     /// `Subtype("cloudreve")` is also set (see the module doc's stale-mount
-    /// detection section for why).
+    /// detection section for why). `cache_dir` (this task) mirrors the
+    /// macOS branch's parameter of the same name — see its doc.
+    ///
+    /// Pre-cleans (this task, D5's original intent, mirroring the macOS
+    /// branch): calls [`cleanup_stale_mount`] on `mountpoint`/`cache_dir`
+    /// FIRST, best-effort.
     ///
     /// Async for parity with the macOS branch's signature, not because
     /// `fuser::spawn_mount2` itself is async (it isn't — it performs a
     /// blocking `mount(2)`/`fusermount3` call synchronously before
-    /// returning). Called directly rather than via `spawn_blocking`,
-    /// mirroring the SAME accepted precedent the macOS branch already sets
-    /// with its own blocking `Command::output()` call inside `async fn
-    /// mount` — a one-off setup call, not a hot path.
+    /// returning). Called directly rather than via `spawn_blocking` +
+    /// `tokio::time::timeout` — the ONE call in this module that does NOT
+    /// go through [`blocking_bounded`], a deliberate, narrower exception
+    /// than it might first appear: every OTHER blocking call this task
+    /// bounds is a real subprocess (or `/proc` read) that can wedge waiting
+    /// on something external (a dead peer, a wedged mount table); this one
+    /// is a single local `mount(2)`-class syscall through `fuser`, with no
+    /// dead-peer wait built into it the way macOS's `mount_nfs` `soft`/
+    /// `timeo` negotiation has. It is also the harder call to move safely
+    /// without ever having compiled this module: `spawn_blocking` demands
+    /// `VfsFuse: Send + 'static`, unverified here. Kept as the pre-existing
+    /// direct call rather than risk an unverifiable `Send` bound on a
+    /// module that cannot be compile-checked on this development machine —
+    /// disclosed, not silently narrowed; see this task's report.
     ///
     /// `tokio::runtime::Handle::current()` captures the CALLING runtime,
     /// which `VfsFuse` then `block_on`s every facade call against from
@@ -448,7 +795,20 @@ mod linux_impl {
     /// whole lifetime; every caller in this codebase already runs inside
     /// one long-lived tokio runtime, same assumption the macOS branch
     /// already documents).
-    pub async fn mount(vfs: Arc<Vfs>, mountpoint: &Path, volume_name: &str) -> Result<MountedVfs> {
+    pub async fn mount(
+        vfs: Arc<Vfs>,
+        mountpoint: &Path,
+        volume_name: &str,
+        cache_dir: &Path,
+    ) -> Result<MountedVfs> {
+        if let Err(err) = cleanup_stale_mount(mountpoint, cache_dir).await {
+            tracing::warn!(
+                mountpoint = %mountpoint.display(),
+                ?err,
+                "vfs mount: pre-clean failed, attempting to mount anyway"
+            );
+        }
+
         let rt = tokio::runtime::Handle::current();
         let fs = VfsFuse::new(vfs, rt);
         let options = [
@@ -464,7 +824,20 @@ mod linux_impl {
                 mountpoint.display()
             )
         })?;
-        Ok(MountedVfs { mountpoint: mountpoint.to_path_buf(), session: Some(session) })
+
+        if let Err(err) = write_mount_marker(cache_dir, &std::process::id().to_string()) {
+            tracing::warn!(
+                ?err,
+                "vfs mount: failed to persist the mount.port marker — a future crash at this \
+                 mountpoint may not self-heal via pre-clean"
+            );
+        }
+
+        Ok(MountedVfs {
+            mountpoint: mountpoint.to_path_buf(),
+            cache_dir: cache_dir.to_path_buf(),
+            session: Some(session),
+        })
     }
 
     /// An active mount produced by [`mount`]. Dropping it performs a
@@ -473,24 +846,30 @@ mod linux_impl {
     /// module doc for the full unmount story.
     pub struct MountedVfs {
         mountpoint: PathBuf,
+        cache_dir: PathBuf,
         session: Option<fuser::BackgroundSession>,
     }
 
     impl MountedVfs {
         /// Unmounts cleanly. See the module doc for why dropping `session`
         /// IS the actual unmount (fuser's own escalation), and why this
-        /// does not call `BackgroundSession::join()`.
-        pub fn unmount(mut self) -> Result<()> {
+        /// does not call `BackgroundSession::join()`. Async (this task, for
+        /// signature parity with the macOS branch): the verification step
+        /// below (confirming the mount is really gone) now goes through
+        /// [`blocking_bounded`] rather than an unbounded direct
+        /// `/proc/mounts` read.
+        pub async fn unmount(mut self) -> Result<()> {
             if let Some(session) = self.session.take() {
                 drop(session);
             }
-            if is_our_fuse_mount(&self.mountpoint)? {
+            if is_our_fuse_mount(&self.mountpoint).await? {
                 bail!(
                     "failed to unmount {} — a fuse mount is still present after dropping the \
                      session",
                     self.mountpoint.display()
                 );
             }
+            remove_mount_marker(&self.cache_dir);
             Ok(())
         }
 
@@ -519,9 +898,9 @@ mod linux_impl {
         /// force-detects and force-unmounts a mount at a known path,
         /// without probing whether whatever is behind it is alive (see
         /// this file's own `cleanup_stale_mount` doc — neither branch
-        /// does liveness probing). See `tests/mounted_linux.rs`'s
-        /// crash-recovery test's own doc for the same point made from the
-        /// test's side.
+        /// does liveness probing beyond this task's own pid/port check).
+        /// See `tests/mounted_linux.rs`'s crash-recovery test's own doc for
+        /// the same point made from the test's side.
         #[doc(hidden)]
         pub fn abort_server_for_tests(mut self) {
             if let Some(session) = self.session.take() {
@@ -547,34 +926,62 @@ mod linux_impl {
     }
 
     /// D5: crash recovery, the Linux counterpart of the macOS branch's
-    /// function of the same name — see the module doc's "Stale-mount
-    /// detection" section for the detection strategy and its known
-    /// limitation.
-    pub fn cleanup_stale_mount(mountpoint: &Path) -> Result<bool> {
-        if !is_our_fuse_mount(mountpoint)? {
+    /// function of the same name (phase 4 this task: also the pid-based
+    /// two-instance fix) — see the module doc's "Stale-mount detection"
+    /// section for the detection strategy and its known limitations.
+    pub async fn cleanup_stale_mount(mountpoint: &Path, cache_dir: &Path) -> Result<bool> {
+        let mount_table_match = is_our_fuse_mount(mountpoint).await?;
+        if !mount_table_match {
             return Ok(false);
         }
-        escalate_unmount(mountpoint)?;
+        let marker_owner_alive =
+            match read_mount_marker(cache_dir).and_then(|m| m.parse::<i32>().ok()) {
+                Some(pid) => Some(is_pid_alive(pid)),
+                None => None,
+            };
+        if !super::is_stale(mount_table_match, marker_owner_alive) {
+            return Ok(false);
+        }
+        escalate_unmount(mountpoint).await?;
+        remove_mount_marker(cache_dir);
         Ok(true)
     }
 
-    fn is_our_fuse_mount(mountpoint: &Path) -> Result<bool> {
-        let canonical = resolve_mountpoint_for_comparison(mountpoint);
-        let canonical = canonical.to_string_lossy();
-
-        let contents = std::fs::read_to_string("/proc/mounts").context("reading /proc/mounts")?;
-        for line in contents.lines() {
-            // Line shape (proc(5)): "<source> <target> <fstype> <options> <freq> <passno>",
-            // whitespace-separated.
-            let mut fields = line.split_whitespace();
-            let Some(_source) = fields.next() else { continue };
-            let Some(target) = fields.next() else { continue };
-            let Some(fstype) = fields.next() else { continue };
-            if target == canonical && fstype.starts_with("fuse") {
-                return Ok(true);
+    async fn is_our_fuse_mount(mountpoint: &Path) -> Result<bool> {
+        let canonical = resolve_mountpoint_for_comparison(mountpoint).to_string_lossy().into_owned();
+        blocking_bounded(DETECT_BUDGET, move || -> Result<bool> {
+            let contents =
+                std::fs::read_to_string("/proc/mounts").context("reading /proc/mounts")?;
+            for line in contents.lines() {
+                // Line shape (proc(5)): "<source> <target> <fstype> <options> <freq> <passno>",
+                // whitespace-separated.
+                let mut fields = line.split_whitespace();
+                let Some(_source) = fields.next() else { continue };
+                let Some(target) = fields.next() else { continue };
+                let Some(fstype) = fields.next() else { continue };
+                if target == canonical && fstype.starts_with("fuse") {
+                    return Ok(true);
+                }
             }
-        }
-        Ok(false)
+            Ok(false)
+        })
+        .await
+        .and_then(std::convert::identity)
+    }
+
+    /// Whether pid `pid` currently names a live process — `kill(pid, 0)`
+    /// sends no signal, only checking permission/existence: `ESRCH` means
+    /// dead, anything else (success, or `EPERM` — the process exists but we
+    /// lack permission to signal it, still proof it's alive) means alive.
+    /// See the module doc's "Stale-mount detection" section for the known
+    /// pid-reuse weakness this inherits.
+    fn is_pid_alive(pid: i32) -> bool {
+        // SAFETY: `kill` with signal 0 sends nothing; it only queries
+        // existence/permission, and takes no pointer arguments — there is
+        // nothing here for the caller to uphold beyond a valid `pid`
+        // value, which every `i32` is.
+        let result = unsafe { libc::kill(pid, 0) };
+        result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
     }
 
     /// Escalating unmount for the crash-recovery path, where nothing is
@@ -592,18 +999,24 @@ mod linux_impl {
     /// symlinked between them), so resolving them through `$PATH` is more
     /// portable across distros than hardcoding one — this is the same
     /// lookup fuser's own `fuse_pure.rs::detect_fusermount_bin` performs.
-    fn escalate_unmount(mountpoint: &Path) -> Result<()> {
-        let path = mountpoint.as_os_str();
-        if run_ok("fusermount3", &[OsStr::new("-u"), path]) {
+    /// Every rung is bounded (this task) — see [`UMOUNT_STEP_BUDGET`].
+    async fn escalate_unmount(mountpoint: &Path) -> Result<()> {
+        let path = mountpoint.as_os_str().to_os_string();
+        if run_ok_bounded("fusermount3", vec![OsString::from("-u"), path.clone()], UMOUNT_STEP_BUDGET)
+            .await
+        {
             return Ok(());
         }
-        if run_ok("fusermount", &[OsStr::new("-u"), path]) {
+        if run_ok_bounded("fusermount", vec![OsString::from("-u"), path.clone()], UMOUNT_STEP_BUDGET)
+            .await
+        {
             return Ok(());
         }
-        if run_ok("umount", &[OsStr::new("-f"), path]) {
+        if run_ok_bounded("umount", vec![OsString::from("-f"), path.clone()], UMOUNT_STEP_BUDGET).await
+        {
             return Ok(());
         }
-        if run_ok("umount", &[OsStr::new("-l"), path]) {
+        if run_ok_bounded("umount", vec![OsString::from("-l"), path], UMOUNT_STEP_BUDGET).await {
             return Ok(());
         }
         bail!("failed to unmount {} after exhausting the escalation chain", mountpoint.display());
@@ -690,5 +1103,50 @@ mod tests {
         let resolved = resolve_mountpoint_for_comparison(&mountpoint);
         let expected = std::fs::canonicalize(dir.path()).unwrap().join("mnt");
         assert_eq!(resolved, expected);
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 4 (this task), Step 1(b): the two-instance false-positive fix
+    // — pure decision logic, independent of any real OS mount or marker
+    // file. `is_stale` is the ONLY thing `is_our_nfs_mount`/
+    // `is_our_fuse_mount` defer to for the actual stale/not-stale call, so
+    // pinning it here pins both platforms' behavior at once.
+    // -----------------------------------------------------------------
+
+    /// No match in the mount table at all: never stale, regardless of any
+    /// marker — there is nothing to clean either way.
+    #[test]
+    fn is_stale_is_false_with_no_mount_table_match() {
+        assert!(!is_stale(false, None));
+        assert!(!is_stale(false, Some(true)));
+        assert!(!is_stale(false, Some(false)));
+    }
+
+    /// A mount-table match, but no marker ever recorded: conservatively NOT
+    /// treated as stale — this is exactly what protects a mountpoint this
+    /// process never mounted itself from being force-unmounted.
+    #[test]
+    fn is_stale_is_false_with_a_match_but_no_recorded_marker() {
+        assert!(!is_stale(true, None));
+    }
+
+    /// The two-instance false positive itself: a match, AND a marker was
+    /// recorded, AND that marker's owner (port/pid) is still alive — this
+    /// must NOT be treated as stale, or a currently-running sibling's
+    /// perfectly healthy mount would be force-unmounted out from under it.
+    #[test]
+    fn is_stale_is_false_when_the_recorded_owner_is_still_alive() {
+        assert!(
+            !is_stale(true, Some(true)),
+            "a live sibling's own mount must never be treated as stale"
+        );
+    }
+
+    /// A match, a marker was recorded, and that owner is confirmed dead:
+    /// THIS is the genuinely-stale case — our own crashed instance's
+    /// leftover mount.
+    #[test]
+    fn is_stale_is_true_when_the_recorded_owner_is_dead() {
+        assert!(is_stale(true, Some(false)));
     }
 }

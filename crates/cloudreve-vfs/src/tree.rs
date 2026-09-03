@@ -415,14 +415,19 @@ impl VfsTree {
             .collect()
     }
 
-    /// D5 (write-back conflict check): forces a fresh listing of
-    /// `remote_path`'s parent directory and returns the server's current
-    /// etag for it — `None` if the parent directory isn't known to the tree
-    /// yet, or if the file no longer exists there (deleted remotely since
-    /// the draft began). Deliberately works from a bare remote path alone,
-    /// no `NodeId`: the write-back queue (Task 8) only ever holds paths —
-    /// `DraftStore` never allocates or tracks node ids.
-    pub async fn refresh_etag(&self, remote_path: &str) -> Result<Option<String>> {
+    /// Forces a fresh listing of `remote_path`'s parent directory and
+    /// returns the server's current full attributes for it — `None` if the
+    /// parent directory isn't known to the tree yet, or if the entry no
+    /// longer exists there (deleted remotely since the caller's own last
+    /// look). Deliberately works from a bare remote path alone, no
+    /// `NodeId`: the write-back queue (Task 8) only ever holds paths —
+    /// `DraftStore` never allocates or tracks node ids. Phase 4 task 3
+    /// (R3): factored out of `refresh_etag` below so a caller that needs
+    /// more than the etag (specifically, `is_dir` — is the uri colliding
+    /// with a 40004 actually a file this could safely adopt, or a
+    /// directory it must not) doesn't have to re-derive the same
+    /// parent-lookup dance a second time.
+    pub async fn refresh_attrs(&self, remote_path: &str) -> Result<Option<NodeAttr>> {
         let Some((parent_path, name)) = remote_path.rsplit_once('/') else {
             return Ok(None);
         };
@@ -436,7 +441,13 @@ impl VfsTree {
                 .map(|(id, _)| *id)
         };
         let Some(parent_id) = parent_id else { return Ok(None) };
-        Ok(self.lookup(parent_id, name).await?.map(|(_, attr)| attr.etag))
+        Ok(self.lookup(parent_id, name).await?.map(|(_, attr)| attr))
+    }
+
+    /// D5 (write-back conflict check): the etag-only projection of
+    /// [`refresh_attrs`] — see its doc for the full behavior.
+    pub async fn refresh_etag(&self, remote_path: &str) -> Result<Option<String>> {
+        Ok(self.refresh_attrs(remote_path).await?.map(|attr| attr.etag))
     }
 
     /// Force a directory's cached listing to be treated as expired,

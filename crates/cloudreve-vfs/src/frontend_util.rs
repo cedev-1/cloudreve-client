@@ -8,7 +8,9 @@
 //! nfs3-specific half.
 
 use crate::tree::NodeAttr;
-use crate::vfs::{DirNotEmptyError, RenameBusyError, StaleHandleError, UnlinkBusyError};
+use crate::vfs::{
+    DirNotEmptyError, RenameBusyError, RenameOntoDirectoryError, StaleHandleError, UnlinkBusyError,
+};
 
 /// Portable classification of a facade error/outcome, independent of any
 /// frontend's own error enum. D2's mapping table, minus the lookup-miss case:
@@ -42,6 +44,14 @@ pub enum FrontendErrno {
     /// [`DirNotEmptyError`]: a non-empty directory was asked to be removed.
     /// This facade never does a recursive delete.
     NotEmpty,
+    /// [`RenameOntoDirectoryError`] (phase 4 task 3, R1): a drafted FILE
+    /// source was renamed onto a destination name that resolves to an
+    /// existing DIRECTORY. Both real kernels already refuse this shape
+    /// themselves before the facade ever sees it (`EISDIR` on a plain
+    /// `rename(2)` over a directory), so this variant is defense-in-depth
+    /// for a facade-level caller, not something either mounted frontend has
+    /// been observed to actually need to produce.
+    IsDir,
     /// Everything else. The anyhow causal chain is logged at debug so a
     /// real bug stays diagnosable without ever leaking `anyhow::Error`
     /// details across the frontend boundary.
@@ -67,6 +77,9 @@ pub fn classify_error(err: &anyhow::Error) -> FrontendErrno {
     }
     if err.downcast_ref::<DirNotEmptyError>().is_some() {
         return FrontendErrno::NotEmpty;
+    }
+    if err.downcast_ref::<RenameOntoDirectoryError>().is_some() {
+        return FrontendErrno::IsDir;
     }
     if err.to_string().starts_with("EEXIST") {
         return FrontendErrno::Exist;
@@ -165,6 +178,12 @@ mod tests {
     fn dir_not_empty_error_classifies_as_not_empty() {
         let err = anyhow::Error::new(DirNotEmptyError { remote_path: "x".into() });
         assert_eq!(classify_error(&err), FrontendErrno::NotEmpty);
+    }
+
+    #[test]
+    fn rename_onto_directory_error_classifies_as_is_dir() {
+        let err = anyhow::Error::new(RenameOntoDirectoryError { remote_path: "x".into() });
+        assert_eq!(classify_error(&err), FrontendErrno::IsDir);
     }
 
     #[test]

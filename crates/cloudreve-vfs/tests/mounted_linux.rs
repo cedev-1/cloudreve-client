@@ -118,7 +118,7 @@ async fn a_mounted_drive_lists_reads_and_writes_through_std_fs() {
     let mountpoint = mp.path().to_path_buf();
     let _guard = MountpointGuard(mountpoint.clone());
 
-    let mounted = mount::mount(vfs.clone(), &mountpoint, "CloudreveTest")
+    let mounted = mount::mount(vfs.clone(), &mountpoint, "CloudreveTest", env.cache_dir())
         .await
         .expect("mount should succeed");
 
@@ -149,7 +149,7 @@ async fn a_mounted_drive_lists_reads_and_writes_through_std_fs() {
     // that's fire-and-forget from the kernel's perspective on `close(2)`.
     wait_for_upload(&vfs, &env, "new.txt", b"created through the mount").await;
 
-    mounted.unmount().expect("unmount should succeed");
+    mounted.unmount().await.expect("unmount should succeed");
 
     // Unmounted: the directory is a plain empty local dir again.
     let dir_for_check = mountpoint.clone();
@@ -192,25 +192,27 @@ async fn a_stale_mount_from_a_crashed_server_is_cleaned_and_remountable() {
     let mountpoint = mp.path().to_path_buf();
     let _guard = MountpointGuard(mountpoint.clone());
 
-    let mounted =
-        mount::mount(vfs.clone(), &mountpoint, "CloudreveTest").await.expect("mount should succeed");
+    let mounted = mount::mount(vfs.clone(), &mountpoint, "CloudreveTest", env.cache_dir())
+        .await
+        .expect("mount should succeed");
 
     // Simulate a crash: abandon the session without ever unmounting it —
     // see this test's own doc for why this is a sufficient (if weaker than
     // macOS's) stand-in for a genuinely dead server.
     mounted.abort_server_for_tests();
 
-    let cleaned = blocking_with_timeout({
-        let mp = mountpoint.clone();
-        move || mount::cleanup_stale_mount(&mp)
-    })
+    let cleaned = tokio::time::timeout(
+        Duration::from_secs(15),
+        mount::cleanup_stale_mount(&mountpoint, env.cache_dir()),
+    )
     .await
+    .expect("cleanup_stale_mount timed out")
     .expect("cleanup_stale_mount should not error");
     assert!(cleaned, "a mount left behind by an abandoned session must be detected as stale");
 
     // Mounting again on the SAME directory must succeed, and a read through
     // the fresh mount must actually work.
-    let mounted2 = mount::mount(vfs.clone(), &mountpoint, "CloudreveTest")
+    let mounted2 = mount::mount(vfs.clone(), &mountpoint, "CloudreveTest", env.cache_dir())
         .await
         .expect("remount after cleanup should succeed");
 
@@ -218,16 +220,77 @@ async fn a_stale_mount_from_a_crashed_server_is_cleaned_and_remountable() {
     let content = blocking_with_timeout(move || std::fs::read(&read_path).unwrap()).await;
     assert_eq!(content, b"hello world");
 
-    mounted2.unmount().expect("unmount should succeed");
+    mounted2.unmount().await.expect("unmount should succeed");
 }
 
 /// `cleanup_stale_mount` on a directory that was never mounted at all is a
 /// harmless no-op — it must never report cleaning something it didn't.
 #[tokio::test(flavor = "multi_thread")]
 async fn cleanup_on_a_plain_directory_is_a_noop() {
+    let env = VfsTestEnv::new().await;
     let mp = tempfile::tempdir().unwrap();
-    let cleaned = mount::cleanup_stale_mount(mp.path()).unwrap();
+    let cleaned = mount::cleanup_stale_mount(mp.path(), env.cache_dir()).await.unwrap();
     assert!(!cleaned, "an ordinary, never-mounted directory must never be reported as cleaned");
+}
+
+/// Phase 4 (this task), Step 1(a) counterpart: `mount()` now pre-cleans a
+/// deliberately stale leftover at the SAME mountpoint before attempting its
+/// own attach. Mirrors `mounted_macos.rs`'s test of the same intent.
+///
+/// The Linux two-instance marker is a PID, not a port (see `mount.rs`'s
+/// `linux_impl` module doc — FUSE has no network endpoint to probe), so
+/// this test needs a marker pointing at a PROVABLY DEAD pid to make
+/// `cleanup_stale_mount` actually treat the leftover as stale — this
+/// process's own (very much alive) pid, which `mount()` records by
+/// default, would not do. Spawns and waits out a trivial child process
+/// (`/bin/true`) purely to obtain a pid guaranteed dead the instant
+/// `wait()` returns, then overwrites the marker `mount()` wrote with it —
+/// the same "recorded owner is provably gone" state a real crash leaves
+/// behind, without needing this test's own process to die.
+#[tokio::test(flavor = "multi_thread")]
+async fn mounting_over_a_stale_leftover_mountpoint_succeeds_via_pre_clean() {
+    let env = VfsTestEnv::new().await;
+    env.set_remote_files(vec![remote_file("hello.txt", 11, "e1")]).await;
+    env.serve_file_content("hello.txt", b"hello world").await;
+
+    let vfs = new_test_vfs(&env).await;
+
+    let mp = tempfile::tempdir().unwrap();
+    let mountpoint = mp.path().to_path_buf();
+    let _guard = MountpointGuard(mountpoint.clone());
+
+    let stale = mount::mount(vfs.clone(), &mountpoint, "CloudreveTest", env.cache_dir())
+        .await
+        .expect("mount should succeed");
+    stale.abort_server_for_tests();
+
+    // Overwrite the marker `mount()` just wrote (this process's own, live
+    // pid) with one that is definitively dead — see the test's own doc.
+    let dead_pid = blocking_with_timeout(|| {
+        let mut child = std::process::Command::new("/bin/true").spawn().expect("spawn /bin/true");
+        let pid = child.id();
+        child.wait().expect("wait for /bin/true");
+        pid
+    })
+    .await;
+    std::fs::write(env.cache_dir().join("mount.port"), dead_pid.to_string())
+        .expect("overwrite the mount marker with a dead pid");
+
+    // No explicit `cleanup_stale_mount` call here — `mount()` must pre-clean
+    // this leftover internally before attaching its own fresh mount.
+    let mounted = tokio::time::timeout(
+        Duration::from_secs(15),
+        mount::mount(vfs.clone(), &mountpoint, "CloudreveTest", env.cache_dir()),
+    )
+    .await
+    .expect("mount() timed out")
+    .expect("mount() must pre-clean the stale leftover and succeed, not refuse or hang");
+
+    let read_path = mountpoint.join("hello.txt");
+    let content = blocking_with_timeout(move || std::fs::read(&read_path).unwrap()).await;
+    assert_eq!(content, b"hello world", "the fresh mount must actually be functional after pre-clean");
+
+    mounted.unmount().await.expect("unmount should succeed");
 }
 
 /// The phase-2 rename-with-open-handle debt (D3, `RenameBusyError`) reaching
@@ -264,7 +327,9 @@ async fn renaming_an_open_file_through_the_mount_fails_with_ebusy() {
     let _guard = MountpointGuard(mountpoint.clone());
 
     let mounted =
-        mount::mount(vfs.clone(), &mountpoint, "CloudreveTest").await.expect("mount should succeed");
+        mount::mount(vfs.clone(), &mountpoint, "CloudreveTest", env.cache_dir())
+            .await
+            .expect("mount should succeed");
 
     let open_path = mountpoint.join("hello.txt");
     // Opened and kept alive for the rest of this test: the fd genuinely
@@ -322,5 +387,5 @@ async fn renaming_an_open_file_through_the_mount_fails_with_ebusy() {
     assert!(names.contains(&"renamed.txt".to_string()), "renamed.txt missing from {names:?}");
     assert!(!names.contains(&"hello.txt".to_string()), "hello.txt should be gone, saw {names:?}");
 
-    mounted.unmount().expect("unmount should succeed");
+    mounted.unmount().await.expect("unmount should succeed");
 }

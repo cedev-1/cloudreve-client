@@ -849,6 +849,55 @@ async fn renaming_a_drafted_tmp_file_onto_an_existing_closed_destination_lands_t
     );
 }
 
+/// R1 (phase 4 task 3, routed from the task 2 re-review): a DRAFTED-source
+/// (never-uploaded, empty `base_etag`) FILE renamed onto an existing
+/// DIRECTORY name must be refused loudly, not silently succeed. Before this
+/// fix, `remote_destination_if_exists`'s result was unconditionally
+/// filtered with `.filter(|a| !a.is_dir)` regardless of the SOURCE's type —
+/// for a drafted source this meant `dest_remote` became `None` no matter
+/// what sat at the destination, so no adoption ever happened, `rename()`
+/// returned `Ok(())`, and the eventual upload ran `overwrite=false` against
+/// the directory's own name — refused by the server with 40004 forever, the
+/// same doomed-retry shape R2's bridge exists to close, just through a
+/// different door this facade must not leave open. Detectable via
+/// `anyhow::Error::downcast_ref::<RenameOntoDirectoryError>()`.
+#[tokio::test]
+async fn renaming_a_drafted_new_file_onto_an_existing_directory_is_refused_loudly() {
+    let env = VfsTestEnv::new().await;
+    env.expect_namespace_ops().await;
+    env.expect_uploads().await;
+    env.set_remote_files(vec![remote_dir("a-directory")]).await;
+
+    let (vfs, _rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+    vfs.set_debounce_for_tests(Duration::from_millis(30));
+    let root = vfs.tree().root();
+
+    let (_node, h) = vfs.create(root, "draft.txt").await.unwrap();
+    vfs.write(h, 0, b"never touched the server yet").await.unwrap();
+    vfs.close(h).await.unwrap(); // Pending, debounce armed.
+
+    let result = vfs.rename(root, "draft.txt", root, "a-directory").await;
+    let err = result.expect_err(
+        "renaming a drafted file onto an existing directory name must be refused loudly, not \
+         silently succeed and let the eventual upload retry a doomed 40004 forever",
+    );
+    assert!(
+        err.downcast_ref::<cloudreve_vfs::vfs::RenameOntoDirectoryError>().is_some(),
+        "must be the distinct typed error (frontends map it to EISDIR), got: {err:#}"
+    );
+
+    // Nothing must have been silently migrated: the draft still targets its
+    // ORIGINAL name, and no upload ever races against the directory's name.
+    vfs.wait_for_writeback_idle().await;
+    assert_eq!(
+        env.uploaded_content("a-directory"),
+        None,
+        "the directory's name must never receive an upload attempt"
+    );
+}
+
 /// Deliverable D: `rmdir` of a directory with a real, LISTED child must be
 /// refused as `NotEmpty` — this facade never does a recursive delete.
 #[tokio::test]

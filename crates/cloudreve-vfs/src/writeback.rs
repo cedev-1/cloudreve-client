@@ -435,14 +435,27 @@ impl DraftStore {
     }
 
     /// Moves a draft to a new remote path (Task 10: the file being edited
-    /// gets renamed remotely while a draft is open on it).
-    pub fn rename(&mut self, from: &str, to: &str) -> Result<()> {
+    /// gets renamed remotely while a draft is open on it). `new_base_etag`
+    /// (phase 4 task 3, R2): when `Some`, rebases the draft onto that etag
+    /// in the SAME persisted `write_meta` call this method already makes —
+    /// folded in here rather than left to a separate `set_base_etag` call
+    /// afterward, specifically so a crash (or a cancelled future) between
+    /// the two can never leave the migrated draft on disk with its path
+    /// moved but its base etag NOT yet adopted (an empty base etag replayed
+    /// on restart is exactly the doomed-40004-retry-loop shape `Vfs::
+    /// rename`'s drafted-source bridge exists to avoid — see its call site
+    /// for the full story). `None` is the ordinary Task 10 rename with no
+    /// identity adoption involved.
+    pub fn rename(&mut self, from: &str, to: &str, new_base_etag: Option<&str>) -> Result<()> {
         let from_hash = hash16(from);
         let mut entry = self
             .entries
             .remove(&from_hash)
             .ok_or_else(|| anyhow::anyhow!("no draft open for {from}"))?;
         entry.remote_path = to.to_string();
+        if let Some(etag) = new_base_etag {
+            entry.base_etag = etag.to_string();
+        }
 
         let to_hash = hash16(to);
         if to_hash == from_hash {
@@ -600,7 +613,59 @@ pub struct WriteBackQueue {
     /// `migrate_armed_timer`'s doc for how a rename can cause exactly that)
     /// apart from one an active `run` call still genuinely owns — see
     /// `retry_pending`.
+    ///
+    /// Phase 4 (this task), two fixes:
+    ///
+    /// - **Panic safety.** Membership here is now maintained by a small
+    ///   RAII guard (see `run`'s body) constructed right after insertion
+    ///   and held for the rest of `run`'s call to `process` — so a PANIC
+    ///   unwinding through it (a bug, a dependency panicking, anything)
+    ///   still removes the path on the way out, exactly like a normal
+    ///   return. Before this fix, cleanup was a plain statement AFTER
+    ///   `process().await` returned: a panic there skipped it entirely,
+    ///   and since `arm`/`enqueue_immediate` never `.await` the
+    ///   `JoinHandle` they spawn `run` on, the panic is caught (and only
+    ///   logged) by tokio's own per-task `catch_unwind`, never observed by
+    ///   anything that could clean up after it — the path stayed in this
+    ///   set forever, in this process.
+    /// - **Single-flight `retry_pending`.** Broadened from "genuinely
+    ///   executing right now" to "claimed" — `retry_pending` itself now
+    ///   inserts a selected `Pending` candidate here WHILE STILL holding
+    ///   the `drafts` lock, before ever releasing it (see that method's
+    ///   doc) — so two callers racing the same reconnect moment, which can
+    ///   only ever interleave around that SAME lock (a real
+    ///   `tokio::sync::Mutex`, exclusive across threads, not just
+    ///   cooperative yielding), can never both see the same candidate as
+    ///   unclaimed. `run`'s own insert at the top of its body (unchanged)
+    ///   is then a harmless no-op for a path `retry_pending` already
+    ///   claimed — `HashSet::insert` on an existing member is idempotent.
     in_flight: Arc<StdMutex<HashSet<String>>>,
+    /// Test-only fault injection: when `true`, the NEXT `process` call
+    /// panics right before handing the draft's bytes to the uploader
+    /// (after the `Uploading` state transition has already landed, exactly
+    /// like a real panic partway through an upload attempt would). Not
+    /// `#[cfg(test)]` — same reasoning as `debounce`'s field doc. Exists to
+    /// pin the `in_flight` scope-guard fix above: `Vfs::
+    /// panic_next_upload_for_tests`/`tests/write_back.rs`'s panic test.
+    panic_next_upload: Arc<StdMutex<bool>>,
+}
+
+/// Scope guard for `WriteBackQueue::run` (phase 4, this task): removes
+/// `remote_path` from `in_flight` and decrements `busy` on drop —
+/// unconditionally, whether `run` returns normally or a panic unwinds
+/// through the `process` call it brackets. See `in_flight`'s field doc for
+/// the leak this closes and why a plain post-`.await` statement (the
+/// pre-this-task shape) cannot: a panic skips straight past it.
+struct RunGuard<'a> {
+    queue: &'a WriteBackQueue,
+    remote_path: &'a str,
+}
+
+impl Drop for RunGuard<'_> {
+    fn drop(&mut self) {
+        self.queue.in_flight.lock().unwrap().remove(self.remote_path);
+        self.queue.busy.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl WriteBackQueue {
@@ -623,7 +688,15 @@ impl WriteBackQueue {
             debounce: Arc::new(StdMutex::new(WRITEBACK_DEBOUNCE)),
             retry_backoff: Arc::new(StdMutex::new(UPLOAD_RETRY_BACKOFF)),
             in_flight: Arc::new(StdMutex::new(HashSet::new())),
+            panic_next_upload: Arc::new(StdMutex::new(false)),
         }
+    }
+
+    /// Test-only: makes the very next `process` call panic right before it
+    /// would hand the draft's bytes to the uploader — see the
+    /// `panic_next_upload` field's doc.
+    pub fn panic_next_upload_for_tests(&self) {
+        *self.panic_next_upload.lock().unwrap() = true;
     }
 
     /// Test-only override for the debounce delay. See the `debounce`
@@ -756,17 +829,45 @@ impl WriteBackQueue {
     /// still being processed by THIS queue (present in `in_flight`) is left
     /// alone — re-enqueueing it would race the upload already in flight for
     /// it.
+    ///
+    /// Phase 4 (this task): single-flight against ITSELF. Two callers
+    /// racing the same reconnect moment (e.g. overlapping "back online"
+    /// notifications) used to both read the SAME `Pending` draft as a
+    /// fresh, unclaimed candidate — nothing marked it as spoken for until
+    /// its eventual `run()` call reached `process`'s `Uploading` state
+    /// transition, well after both callers had already returned — so both
+    /// enqueued it, producing two independent, overlapping upload attempts
+    /// for the same draft (serialized by `upload_gate`, not deduplicated by
+    /// it). The fix: a selected `Pending` candidate is inserted into
+    /// `in_flight` HERE, still holding the `drafts` lock — see that
+    /// field's doc for why two callers can never both observe the same
+    /// candidate as unclaimed once this holds, whether they overlap via
+    /// true multi-thread parallelism or single-task cooperative
+    /// interleaving (`tokio::join!` on this exact method is both, depending
+    /// on the runtime — the `drafts` lock is what makes either case safe).
     pub async fn retry_pending(&self) -> usize {
-        let in_flight = self.in_flight.lock().unwrap().clone();
         let candidates: Vec<String> = {
             let mut drafts = self.drafts.lock().await;
+            let mut in_flight = self.in_flight.lock().unwrap();
             let mut candidates = Vec::new();
             for path in drafts.pending() {
+                if in_flight.contains(&path) {
+                    // Already genuinely running, OR already claimed by
+                    // this exact loop for a concurrent caller that got
+                    // here first — either way, not ours to re-enqueue.
+                    continue;
+                }
                 match drafts.state(&path) {
-                    Some(DraftState::Pending) => candidates.push(path),
-                    Some(DraftState::Uploading) if !in_flight.contains(&path) => {
+                    Some(DraftState::Pending) => {
+                        in_flight.insert(path.clone());
+                        candidates.push(path);
+                    }
+                    Some(DraftState::Uploading) => {
                         match drafts.set_state(&path, DraftState::Pending) {
-                            Ok(()) => candidates.push(path),
+                            Ok(()) => {
+                                in_flight.insert(path.clone());
+                                candidates.push(path);
+                            }
                             Err(err) => tracing::warn!(
                                 remote_path = %path,
                                 %err,
@@ -816,13 +917,19 @@ impl WriteBackQueue {
 
     /// Runs one draft's whole processing cycle behind `upload_gate`
     /// (sequential draining) and accounts for it in `busy` regardless of
-    /// outcome.
+    /// outcome — including a PANIC unwinding through `process` (phase 4,
+    /// this task): `RunGuard` below is constructed right after `in_flight`
+    /// registration and dropped either at the end of this function's normal
+    /// return OR while unwinding, so both cleanup steps it performs
+    /// (removing `remote_path` from `in_flight`, decrementing `busy`)
+    /// happen exactly once either way. Before this fix both were plain
+    /// statements AFTER `process().await`, skipped entirely by a panic —
+    /// see `in_flight`'s field doc for the full consequence.
     async fn run(&self, remote_path: String) {
         let _gate = self.upload_gate.lock().await;
         self.in_flight.lock().unwrap().insert(remote_path.clone());
+        let _guard = RunGuard { queue: self, remote_path: &remote_path };
         self.process(&remote_path).await;
-        self.in_flight.lock().unwrap().remove(&remote_path);
-        self.busy.fetch_sub(1, Ordering::SeqCst);
     }
 
     /// D5 (conflict check) + upload + D6 (success promotion) / retry, for
@@ -897,6 +1004,22 @@ impl WriteBackQueue {
             drive_id: "vfs".to_string(),
         };
 
+        // Test-only fault injection (phase 4, this task) — see
+        // `panic_next_upload`'s field doc. Deliberately placed here: the
+        // `Uploading` state transition above has already landed, exactly
+        // like a real panic mid-upload would leave the draft.
+        {
+            let mut panic_flag = self.panic_next_upload.lock().unwrap();
+            if *panic_flag {
+                *panic_flag = false;
+                drop(panic_flag);
+                panic!(
+                    "writeback: test-injected panic during upload for {remote_path} \
+                     (see panic_next_upload_for_tests)"
+                );
+            }
+        }
+
         let backoff = *self.retry_backoff.lock().unwrap();
         let uploader =
             Uploader::new(self.client.clone(), Arc::new(NoSessionStore), UploaderConfig::default());
@@ -907,30 +1030,17 @@ impl WriteBackQueue {
         // its deterministic name collides with the first copy's — the
         // server refuses with `ObjectExisted`. Only a conflict-copy upload
         // gets the uniqueness search below; a plain (non-conflict) upload's
-        // `ObjectExisted` (which would mean something else is racing this
-        // exact path) is left to the ordinary transient-failure retry loop
-        // beneath it, unchanged.
-        let (last_err, final_uri) = if conflict_copy.is_some() {
+        // `ObjectExisted` goes through R3's adaptive-adoption path instead
+        // (phase 4 task 3, routed from the task 2 re-review) — see
+        // `upload_plain_with_adoption`'s doc.
+        let (last_err, final_uri, terminal) = if conflict_copy.is_some() {
             let (uri, err) =
                 upload_conflict_copy(&uploader, params, upload_uri.clone(), backoff).await;
-            (err, uri)
+            (err, uri, false)
         } else {
-            let mut last_err = None;
-            for attempt in 0..UPLOAD_RETRIES {
-                match uploader.upload(params.clone(), NoOpProgress).await {
-                    Ok(()) => {
-                        last_err = None;
-                        break;
-                    }
-                    Err(err) => {
-                        last_err = Some(err);
-                        if attempt + 1 < UPLOAD_RETRIES {
-                            tokio::time::sleep(backoff[attempt as usize]).await;
-                        }
-                    }
-                }
-            }
-            (last_err, upload_uri.clone())
+            let (err, terminal) =
+                upload_plain_with_adoption(self, remote_path, params, backoff, &uploader).await;
+            (err, upload_uri.clone(), terminal)
         };
         // The conflict copy may have been retargeted to a uniqueness-
         // suffixed name above — the rest of this function (events, tree
@@ -998,10 +1108,21 @@ impl WriteBackQueue {
                 {
                     tracing::warn!(remote_path, %e, "writeback: failed to park draft back to Pending");
                 }
+                // `terminal` (phase 4 task 3, R3): `true` only for the ONE
+                // fallback case `upload_plain_with_adoption` itself
+                // documents — adoption was unsound because the uri
+                // colliding with a 40004 is a directory. The draft is
+                // STILL parked `Pending` either way (see `VfsEvent`'s own
+                // doc: `will_retry` describes the DRAFT's outlook, never
+                // whether this terminal event itself has a successor) —
+                // only the informational flag differs, so a caller
+                // surfacing this to a human knows not to expect an
+                // automatic retry to ever succeed here without
+                // intervention (e.g. the directory being renamed away).
                 let _ = self.events.send(crate::vfs::VfsEvent::UploadFailed {
                     remote_path: remote_path.to_string(),
                     error: err.to_string(),
-                    will_retry: true,
+                    will_retry: !terminal,
                 });
             }
         }
@@ -1135,6 +1256,124 @@ fn is_object_existed_error(err: &anyhow::Error) -> bool {
                 if *code == cloudreve_api::error::ErrorCode::ObjectExisted as i32
         )
     })
+}
+
+/// R3 (phase 4 task 3, routed from the task 2 re-review): uploads a PLAIN
+/// (non-conflict-copy) draft with the ordinary transient-retry loop, plus
+/// ONE adaptive escalation if the final attempt is refused with
+/// Cloudreve's `ObjectExisted` (40004). Before this existed, ANY path that
+/// reached "a plain upload runs `overwrite=false` (or a stale
+/// `overwrite=true, previous_version=<etag>`) against a uri that already
+/// exists" retried the IDENTICAL request forever, `UploadFailed{will_retry:
+/// true}`-parking without end — R1 and R2 closed the two doors into that
+/// shape their own bridges cover (a drafted rename onto an existing name),
+/// but a THIRD, residual door stays open regardless: the destination gets
+/// created remotely by someone else inside the listing-TTL window between
+/// `Vfs::create`'s own EEXIST check and this draft's eventual, decoupled
+/// upload. This closes the whole CLASS, not just the two known doors into
+/// it.
+///
+/// Controller ruling (routed from the task 2 review): prefer landing the
+/// user's bytes over a bare terminal failure. On a 40004, this resolves
+/// what is ACTUALLY at `remote_path` right now
+/// (`VfsTree::refresh_attrs`) and:
+/// - if it's an ordinary FILE, adopts its current etag (persisted via
+///   `queue`'s own `DraftStore` — a caller-visible rebase, not just a
+///   local retry parameter) and retries ONCE more as an ordinary
+///   overwrite-in-place (`overwrite=true, previous_version=<adopted
+///   etag>`) — the SAME D5 conflict machinery an edit of an
+///   already-existing file always goes through from here on (a remote
+///   change since adoption correctly becomes a conflict copy on the NEXT
+///   cycle, not another 40004 loop).
+/// - if it's a DIRECTORY, adoption is unsound (this facade never deletes a
+///   directory to make room for a file — same reasoning `Vfs::rename`'s
+///   own directory-destination guards give): returns `terminal = true`,
+///   the ONE case the controller ruling accepts a bare terminal failure
+///   for.
+/// - if the destination has already vanished again by the time this
+///   resolves, or the resolve itself fails: falls through to an ORDINARY
+///   (non-terminal) failure — the draft stays `Pending`, retried honestly
+///   on the next cycle rather than this call guessing further.
+///
+/// Adoption is attempted AT MOST ONCE per call: if the adopted retry
+/// itself ALSO fails (even with another 40004), that failure is returned
+/// as an ordinary non-terminal one rather than adopting again — this
+/// closes the loop instead of chasing a moving target indefinitely within
+/// one call. A genuinely still-racing destination is still recoverable: it
+/// just takes the ordinary next debounce/retry cycle, which re-resolves
+/// fresh rather than reusing a stale guess.
+///
+/// Returns `(error, terminal)` — `None` error means success.
+async fn upload_plain_with_adoption(
+    queue: &WriteBackQueue,
+    remote_path: &str,
+    mut params: UploadParams,
+    backoff: [Duration; 2],
+    uploader: &Uploader,
+) -> (Option<anyhow::Error>, bool) {
+    let err = match retry_plain_upload(uploader, &params, backoff).await {
+        Ok(()) => return (None, false),
+        Err(err) => err,
+    };
+
+    if !is_object_existed_error(&err) {
+        return (Some(err), false);
+    }
+
+    match queue.tree.refresh_attrs(remote_path).await {
+        Ok(Some(dest_attr)) if dest_attr.is_dir => {
+            tracing::warn!(
+                remote_path,
+                "writeback: 40004 destination is a directory — adoption is unsound, \
+                 terminal failure"
+            );
+            (Some(err), true)
+        }
+        Ok(Some(dest_attr)) => {
+            if let Err(e) = queue.drafts.lock().await.set_base_etag(remote_path, &dest_attr.etag) {
+                tracing::warn!(remote_path, %e, "writeback: failed to persist the adopted etag");
+            }
+            params.overwrite = true;
+            params.previous_version = dest_attr.etag;
+            match retry_plain_upload(uploader, &params, backoff).await {
+                Ok(()) => (None, false),
+                Err(second_err) => (Some(second_err), false),
+            }
+        }
+        Ok(None) => (Some(err), false), // vanished remotely again — ordinary retry next cycle
+        Err(resolve_err) => {
+            tracing::warn!(
+                remote_path,
+                %resolve_err,
+                "writeback: failed to resolve the 40004 destination for adoption"
+            );
+            (Some(err), false)
+        }
+    }
+}
+
+/// Shared plain (no uniqueness search) transient-retry loop: up to
+/// `UPLOAD_RETRIES` attempts of the exact same request, sleeping `backoff`
+/// between failures. Used both by `upload_plain_with_adoption`'s original
+/// attempt and its one adopted retry.
+async fn retry_plain_upload(
+    uploader: &Uploader,
+    params: &UploadParams,
+    backoff: [Duration; 2],
+) -> Result<()> {
+    let mut last_err = None;
+    for attempt in 0..UPLOAD_RETRIES {
+        match uploader.upload(params.clone(), NoOpProgress).await {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                last_err = Some(err);
+                if attempt + 1 < UPLOAD_RETRIES {
+                    tokio::time::sleep(backoff[attempt as usize]).await;
+                }
+            }
+        }
+    }
+    Err(last_err.expect("the loop always records an error before falling through"))
 }
 
 /// Uploads a conflict copy, searching for a free name if the deterministic
@@ -1362,7 +1601,7 @@ mod tests {
         let old_dir = s.data_path("old/report.txt").unwrap().parent().unwrap().to_path_buf();
         assert!(old_dir.exists());
 
-        s.rename("old/report.txt", "new/renamed.txt").unwrap();
+        s.rename("old/report.txt", "new/renamed.txt", None).unwrap();
 
         // This is a MOVE, not a copy: the old shard directory must not
         // survive it at all.
@@ -1392,6 +1631,50 @@ mod tests {
             meta["remote_path"], "new/renamed.txt",
             "draft.json on disk must be rewritten with the new remote_path, not just moved verbatim"
         );
+    }
+
+    /// R2 (phase 4 task 3, routed from the task 2 re-review): the
+    /// drafted-source rename-onto-existing-destination bridge used to call
+    /// `DraftStore::rename` and THEN a separate `DraftStore::set_base_etag`
+    /// to adopt the destination's etag — two independent persisted
+    /// `write_meta`s with an `.await` between them at the `Vfs::rename`
+    /// call site, so a crash (or a cancelled RPC future) in that
+    /// micro-window could leave the migrated draft at `new_path` with an
+    /// EMPTY base etag on disk, which a restart would replay straight into
+    /// the doomed 40004 retry loop this whole bridge exists to avoid. The
+    /// fix folds the rebase into `rename` itself: a single `write_meta`
+    /// call persists BOTH the new path and the adopted etag together, so
+    /// there is no intermediate on-disk state where one landed without the
+    /// other. This test never reads back through the in-memory `DraftStore`
+    /// accessors (which would trivially reflect the fix even with two calls
+    /// racing) — it reads `draft.json` OFF DISK straight after the single
+    /// `rename` call, so it can only pass if that one call's own persist
+    /// already carries the adopted etag.
+    #[test]
+    fn rename_with_an_adopted_etag_persists_both_in_the_one_call() {
+        let dir = TempDir::new().unwrap();
+        let mut s = DraftStore::open(dir.path()).unwrap();
+        s.begin("new/never-uploaded.txt", "", DraftInit::Empty).unwrap();
+        s.write("new/never-uploaded.txt", 0, b"local only content").unwrap();
+
+        s.rename("new/never-uploaded.txt", "existing/target.txt", Some("dest-etag-7")).unwrap();
+
+        let new_dir = s.data_path("existing/target.txt").unwrap().parent().unwrap().to_path_buf();
+        let raw = std::fs::read(new_dir.join("draft.json")).unwrap();
+        let meta: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(
+            meta["remote_path"], "existing/target.txt",
+            "the single persisted draft.json must carry the new path"
+        );
+        assert_eq!(
+            meta["base_etag"], "dest-etag-7",
+            "the SAME persisted draft.json must ALSO carry the adopted etag — from the one \
+             rename call, not a later separate write this test never makes"
+        );
+
+        // The in-memory accessor must agree too — the fix is not just about
+        // what's on disk.
+        assert_eq!(s.base_etag("existing/target.txt"), Some("dest-etag-7".to_string()));
     }
 
     #[test]

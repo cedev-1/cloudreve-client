@@ -390,6 +390,9 @@ fn to_nfsstat3(errno: FrontendErrno) -> nfsstat3 {
         // for exactly this condition — a real REMOVE/RMDIR-equivalent
         // refusal, unlike `Busy`'s judgment-call stand-in above.
         FrontendErrno::NotEmpty => nfsstat3::NFS3ERR_NOTEMPTY,
+        // Phase 4 task 3, R1: NFSv3's direct, purpose-built code for this
+        // exact condition (RFC 1813's own RENAME procedure lists it).
+        FrontendErrno::IsDir => nfsstat3::NFS3ERR_ISDIR,
         FrontendErrno::Io => nfsstat3::NFS3ERR_IO,
     }
 }

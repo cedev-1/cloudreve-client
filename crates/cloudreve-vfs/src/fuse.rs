@@ -479,6 +479,9 @@ fn to_errno(errno: FrontendErrno) -> i32 {
         // `Busy`, libc has a real, purpose-built errno for this exact
         // condition.
         FrontendErrno::NotEmpty => libc::ENOTEMPTY,
+        // Phase 4 task 3, R1: a real, purpose-built errno for this exact
+        // condition (`man 2 rename`'s "newpath is a non-empty directory").
+        FrontendErrno::IsDir => libc::EISDIR,
         FrontendErrno::Io => libc::EIO,
     }
 }

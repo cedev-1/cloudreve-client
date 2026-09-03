@@ -50,6 +50,29 @@ where
         .expect("blocking task panicked")
 }
 
+/// Counts how many entries in `/sbin/mount`'s listing name `path` as their
+/// local mountpoint — used by the pre-clean test to prove the stale
+/// leftover was actually detached before the fresh mount attached, rather
+/// than macOS silently STACKING the new mount on top of the old, still-
+/// registered one (which would make a plain `std::fs::read`/`unmount()`
+/// success alone a false-positive proof of pre-clean: mount stacking means
+/// the read could come from the NEW top mount while the dead OLD one is
+/// still there underneath, invisible to every other assertion this file
+/// otherwise makes).
+fn mount_table_entry_count(path: &std::path::Path) -> usize {
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let canonical = canonical.to_string_lossy();
+    let output = std::process::Command::new("/sbin/mount").output().expect("run /sbin/mount");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| {
+            line.rsplit_once(" on ")
+                .and_then(|(_, rest)| rest.rsplit_once(" ("))
+                .is_some_and(|(p, _)| p == canonical)
+        })
+        .count()
+}
+
 async fn new_test_vfs(env: &VfsTestEnv) -> Arc<Vfs> {
     let (vfs, _rx) =
         Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
@@ -73,7 +96,7 @@ async fn a_mounted_drive_lists_reads_and_writes_through_std_fs() {
     let mountpoint = mp.path().to_path_buf();
     let _guard = MountpointGuard(mountpoint.clone());
 
-    let mounted = mount::mount(vfs.clone(), &mountpoint, "CloudreveTest")
+    let mounted = mount::mount(vfs.clone(), &mountpoint, "CloudreveTest", env.cache_dir())
         .await
         .expect("mount should succeed");
 
@@ -107,7 +130,7 @@ async fn a_mounted_drive_lists_reads_and_writes_through_std_fs() {
         "the mock server never received new.txt's content"
     );
 
-    mounted.unmount().expect("unmount should succeed");
+    mounted.unmount().await.expect("unmount should succeed");
 
     // Unmounted: the directory is a plain empty local dir again.
     let dir_for_check = mountpoint.clone();
@@ -183,9 +206,16 @@ async fn a_stale_mount_from_a_crashed_server_is_cleaned_and_remountable() {
     let dedicated = tokio::runtime::Runtime::new().expect("build a dedicated runtime");
     let vfs_for_dead_server = vfs.clone();
     let mountpoint_for_dead_server = mountpoint.clone();
+    let cache_dir_for_dead_server = env.cache_dir().to_path_buf();
     let mounted = dedicated
         .spawn(async move {
-            mount::mount(vfs_for_dead_server, &mountpoint_for_dead_server, "CloudreveTest").await
+            mount::mount(
+                vfs_for_dead_server,
+                &mountpoint_for_dead_server,
+                "CloudreveTest",
+                &cache_dir_for_dead_server,
+            )
+            .await
         })
         .await
         .expect("mount task panicked")
@@ -199,11 +229,12 @@ async fn a_stale_mount_from_a_crashed_server_is_cleaned_and_remountable() {
     dedicated.shutdown_background();
     mounted.abort_server_for_tests();
 
-    let cleaned = blocking_with_timeout({
-        let mp = mountpoint.clone();
-        move || mount::cleanup_stale_mount(&mp)
-    })
+    let cleaned = tokio::time::timeout(
+        Duration::from_secs(15),
+        mount::cleanup_stale_mount(&mountpoint, env.cache_dir()),
+    )
     .await
+    .expect("cleanup_stale_mount timed out")
     .expect("cleanup_stale_mount should not error");
     assert!(
         cleaned,
@@ -212,7 +243,7 @@ async fn a_stale_mount_from_a_crashed_server_is_cleaned_and_remountable() {
 
     // Mounting again on the SAME directory must succeed, and a read through
     // the fresh mount must actually work.
-    let mounted2 = mount::mount(vfs.clone(), &mountpoint, "CloudreveTest")
+    let mounted2 = mount::mount(vfs.clone(), &mountpoint, "CloudreveTest", env.cache_dir())
         .await
         .expect("remount after cleanup should succeed");
 
@@ -220,15 +251,96 @@ async fn a_stale_mount_from_a_crashed_server_is_cleaned_and_remountable() {
     let content = blocking_with_timeout(move || std::fs::read(&read_path).unwrap()).await;
     assert_eq!(content, b"hello world");
 
-    mounted2.unmount().expect("unmount should succeed");
+    mounted2.unmount().await.expect("unmount should succeed");
 }
 
 /// `cleanup_stale_mount` on a directory that was never mounted at all is a
 /// harmless no-op — it must never report cleaning something it didn't.
 #[tokio::test(flavor = "multi_thread")]
 async fn cleanup_on_a_plain_directory_is_a_noop() {
+    let env = VfsTestEnv::new().await;
     let mp = tempfile::tempdir().unwrap();
-    let cleaned = mount::cleanup_stale_mount(mp.path()).unwrap();
+    let cleaned = mount::cleanup_stale_mount(mp.path(), env.cache_dir()).await.unwrap();
     assert!(!cleaned, "an ordinary, never-mounted directory must never be reported as cleaned");
+}
+
+/// Phase 4 (this task), Step 1(a): `mount()` now pre-cleans a deliberately
+/// stale leftover at the SAME mountpoint before attempting its own attach —
+/// D5's original intent, previously only reachable by a caller remembering
+/// to call `cleanup_stale_mount` by hand first. Constructs a genuinely dead
+/// leftover mount exactly like the crash-recovery test above (dedicated
+/// runtime, `shutdown_background()`), but this time calls `mount::mount`
+/// DIRECTLY on the same mountpoint with NO explicit `cleanup_stale_mount`
+/// call in between — the pre-clean must happen internally for this to
+/// succeed at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn mounting_over_a_stale_leftover_mountpoint_succeeds_via_pre_clean() {
+    let env = VfsTestEnv::new().await;
+    env.set_remote_files(vec![remote_file("hello.txt", 11, "e1")]).await;
+    env.serve_file_content("hello.txt", b"hello world").await;
+
+    let vfs = new_test_vfs(&env).await;
+
+    let mp = tempfile::tempdir().unwrap();
+    let mountpoint = mp.path().to_path_buf();
+    let _guard = MountpointGuard(mountpoint.clone());
+
+    // Leave a genuinely dead mount behind, exactly like the crash-recovery
+    // test: a dedicated runtime, killed outright.
+    let dedicated = tokio::runtime::Runtime::new().expect("build a dedicated runtime");
+    let vfs_for_dead_server = vfs.clone();
+    let mountpoint_for_dead_server = mountpoint.clone();
+    let cache_dir_for_dead_server = env.cache_dir().to_path_buf();
+    let stale = dedicated
+        .spawn(async move {
+            mount::mount(
+                vfs_for_dead_server,
+                &mountpoint_for_dead_server,
+                "CloudreveTest",
+                &cache_dir_for_dead_server,
+            )
+            .await
+        })
+        .await
+        .expect("mount task panicked")
+        .expect("mount should succeed");
+    dedicated.shutdown_background();
+    stale.abort_server_for_tests();
+
+    // No explicit `cleanup_stale_mount` call here — `mount()` must pre-clean
+    // this leftover internally before attaching its own fresh mount.
+    let mounted = tokio::time::timeout(
+        Duration::from_secs(15),
+        mount::mount(vfs.clone(), &mountpoint, "CloudreveTest", env.cache_dir()),
+    )
+    .await
+    .expect("mount() timed out")
+    .expect("mount() must pre-clean the stale leftover and succeed, not refuse or hang");
+
+    // The decisive check: exactly ONE nfs entry at this path, not two. If
+    // `mount()` skipped pre-clean, macOS would STACK the fresh mount on top
+    // of the still-registered dead one instead of refusing outright — a
+    // bare "mount() succeeded and reads work" assertion alone cannot tell
+    // that apart from a genuine pre-clean, since reads would come from the
+    // new top mount either way.
+    assert_eq!(
+        mount_table_entry_count(&mountpoint),
+        1,
+        "the stale leftover must be detached before the fresh mount attaches, not stacked \
+         underneath it"
+    );
+
+    let read_path = mountpoint.join("hello.txt");
+    let content = blocking_with_timeout(move || std::fs::read(&read_path).unwrap()).await;
+    assert_eq!(content, b"hello world", "the fresh mount must actually be functional after pre-clean");
+
+    mounted.unmount().await.expect("unmount should succeed");
+
+    assert_eq!(
+        mount_table_entry_count(&mountpoint),
+        0,
+        "after the fresh mount's own clean unmount, nothing must remain registered at this path \
+         — a stacked leftover would still show one entry here"
+    );
 }
 

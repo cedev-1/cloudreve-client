@@ -7,15 +7,51 @@
 //! writer at a time) instead of splitting it between interior mutability
 //! here and a mutex there.
 //!
-//! Layout on disk, under the cache root: one subdirectory per remote file,
-//! named with the first 16 hex chars of `sha256(remote_path)`, containing:
+//! Layout on disk, under the cache root: one subdirectory per (remote
+//! path, etag) PAIR, named with the first 16 hex chars of
+//! `sha256(remote_path || '\0' || etag)`, containing:
 //! - `data`: a sparse file, block `i` written at offset `i * BLOCK_SIZE`.
-//! - `meta.json`: `{"etag", "blocks": [u64...], "last_used_unix": i64}`.
+//! - `meta.json`: `{"remote_path", "etag", "blocks": [u64...],
+//!   "last_used_unix": i64}`.
 //!
-//! The directory name depends only on `remote_path`, never on the etag, so
-//! a file that gets a new etag reuses the same directory (after the stale
-//! contents are dropped) instead of leaking an orphaned one under the old
-//! etag's hash.
+//! ## Phase 4 (this task): the etag ping-pong fix
+//!
+//! Before this task, the directory name depended on `remote_path` ALONE,
+//! never the etag: a file that got a new etag reused the SAME directory
+//! (after the stale contents were dropped by `read_block`/`write_block`'s
+//! own etag-mismatch check), specifically to avoid leaking an orphaned
+//! directory under the old etag's hash. That single-directory-per-path
+//! design has a fatal flaw once TWO live handles disagree about which
+//! etag is current — exactly what happens when one handle opened before a
+//! remote rewrite and another opens after it, both still live: every read
+//! under either handle's (now-differing) etag found the OTHER handle's
+//! etag sitting in the shared directory, purged it, and re-fetched — and
+//! the NEXT read from the other handle did the same thing right back. An
+//! unbounded ping-pong of evict-then-refetch, one download per read,
+//! alternating forever between the two handles.
+//!
+//! The fix: the directory identity now includes the etag, so two different
+//! (path, etag) pairs simply never collide — each handle's cache entry
+//! lives in its own directory and neither can evict the other's blocks by
+//! reading under a different etag. `read_block`/`write_block` no longer
+//! need (or have) an etag-mismatch-triggers-purge branch at all: a
+//! mismatched etag is now just an ordinary cache MISS (a different
+//! directory that doesn't exist yet), not something to actively tear down.
+//!
+//! This reintroduces the exact orphan-leak the old design deliberately
+//! avoided — an old etag's directory now genuinely outlives its content
+//! becoming stale, until something reclaims it. Two things do:
+//! - `purge` (called by the write-back queue the moment ITS OWN upload
+//!   replaces a file's content) now removes every entry for a given
+//!   `remote_path`, across every etag it happens to be cached under, not
+//!   just the one at a single, pre-computed directory — see its doc.
+//! - Absent an explicit purge (e.g. the rewrite came from somewhere else
+//!   entirely, not this app's own write-back queue), an orphaned old-etag
+//!   entry is reclaimed the same way any other cold entry is: ordinary LRU
+//!   eviction once the cache is over `max_bytes`. This is a real, disclosed
+//!   trade-off — a drive that never gets read again might keep an
+//!   old-etag entry around indefinitely if the cache never fills up — but
+//!   is bounded and self-healing, unlike the ping-pong it replaces.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
@@ -34,22 +70,30 @@ use sha2::{Digest, Sha256};
 /// large = re-fetching a whole block for one changed byte).
 pub const BLOCK_SIZE: u64 = 1_048_576;
 
-/// Identifies one version of one remote file. The cache directory is keyed
-/// by `remote_path` alone (see module docs); `etag` is what `read_block`/
-/// `write_block` compare against the stored entry to detect that the
-/// server has since replaced the file's content.
+/// Identifies one version of one remote file. Phase 4 (this task): the
+/// on-disk directory identity is now `(remote_path, etag)` TOGETHER (see
+/// module docs) — a `FileKey` is that identity, not just a lookup
+/// convenience over a path-only directory any more.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FileKey {
     pub remote_path: String,
     pub etag: String,
 }
 
-/// What `meta.json` holds. Deliberately does not repeat `remote_path`: the
-/// directory name is already `hash(remote_path)`, so recovering the hash
-/// from a key never needs a reverse lookup — `open()` only needs to know
-/// which hash directories exist, not what path each one came from.
+/// What `meta.json` holds. `remote_path` (phase 4, this task: newly added)
+/// is what lets `purge` find every entry for a path without already
+/// knowing which etags it's cached under — the directory name alone no
+/// longer reveals `remote_path` now that it also folds in the etag (see
+/// module docs). `#[serde(default)]`: an on-disk `meta.json` from before
+/// this task (or, in principle, a directory this parser can't otherwise
+/// account for) has no such field; deserializing it to an empty string
+/// rather than failing outright degrades to "this entry never matches any
+/// `purge` call" — a lingering-until-evicted entry, never data loss, never
+/// a hard `open()` failure over one old file.
 #[derive(Debug, Serialize, Deserialize)]
 struct MetaFile {
+    #[serde(default)]
+    remote_path: String,
     etag: String,
     blocks: Vec<u64>,
     last_used_unix: i64,
@@ -57,6 +101,7 @@ struct MetaFile {
 
 /// In-memory state for one cached file.
 struct Entry {
+    remote_path: String,
     etag: String,
     /// Which block indices are actually present in `data`. Absence is not
     /// an error case: a file's blocks are typically filled in one at a
@@ -146,6 +191,7 @@ impl BlockCache {
             loaded.push((
                 hash,
                 Entry {
+                    remote_path: meta.remote_path,
                     etag: meta.etag,
                     blocks: meta.blocks.into_iter().collect(),
                     last_used_unix: meta.last_used_unix,
@@ -171,16 +217,13 @@ impl BlockCache {
         Ok(Self { root: root.to_path_buf(), max_bytes, entries, retains: HashMap::new(), next_seq })
     }
 
-    /// None if the block is absent OR the stored etag differs (stale).
+    /// `None` if the block is absent for this EXACT `(remote_path, etag)`
+    /// pair. Phase 4 (this task): no longer actively purges anything on a
+    /// mismatch — the directory identity now folds in the etag (see module
+    /// docs), so a different etag is simply a different, possibly-not-yet-
+    /// existing directory, an ordinary cache miss like any other.
     pub fn read_block(&mut self, key: &FileKey, block_idx: u64) -> Result<Option<Bytes>> {
-        let hash = hash_key(&key.remote_path);
-
-        // The server rewrote this file under a new etag: every block held
-        // under the old one belongs to different content and must never be
-        // served, so drop the whole entry before even checking `block_idx`.
-        if self.entries.get(&hash).is_some_and(|e| e.etag != key.etag) {
-            self.remove_entry(&hash)?;
-        }
+        let hash = hash_key(&key.remote_path, &key.etag);
 
         let Some(entry) = self.entries.get(&hash) else {
             return Ok(None);
@@ -249,11 +292,7 @@ impl BlockCache {
     /// with nothing else to evict — `an_open_files_first_write_never_evicts_itself`
     /// pins this down.
     pub fn write_block(&mut self, key: &FileKey, block_idx: u64, data: &[u8]) -> Result<()> {
-        let hash = hash_key(&key.remote_path);
-
-        if self.entries.get(&hash).is_some_and(|e| e.etag != key.etag) {
-            self.remove_entry(&hash)?;
-        }
+        let hash = hash_key(&key.remote_path, &key.etag);
 
         let dir = self.entry_dir(&hash);
         fs::create_dir_all(&dir)
@@ -276,6 +315,7 @@ impl BlockCache {
         let seq = self.next_seq;
         self.next_seq += 1;
         let entry = self.entries.entry(hash.clone()).or_insert_with(|| Entry {
+            remote_path: key.remote_path.clone(),
             etag: key.etag.clone(),
             blocks: BTreeSet::new(),
             last_used_unix: 0,
@@ -295,16 +335,19 @@ impl BlockCache {
 
     /// Registers a live file handle: while retained, this key's entry (or
     /// the entry `write_block` creates for it later, if none exists yet)
-    /// is never evicted. Two handles on the same file (e.g. Finder holding
-    /// it open while Quick Look previews it) each get their own call, and
-    /// the entry survives until both release — see `release`. Deliberately
-    /// keyed on `remote_path` alone, not `key.etag`: a handle stays open
-    /// across whatever entry churn happens for that path (an etag change
-    /// mid-read replaces the entry via `remove_entry`, unaffected by this
-    /// task), matching how `OpenFile` in the facade fixes its `FileKey`
-    /// for the handle's whole lifetime.
+    /// is never evicted. Two handles on the same file at the SAME etag
+    /// (e.g. Finder holding it open while Quick Look previews it) each get
+    /// their own call, and the entry survives until both release — see
+    /// `release`. Keyed on the same `(remote_path, etag)` hash as `entries`
+    /// (phase 4, this task — previously `remote_path` alone): each open
+    /// handle's `FileKey` is fixed at open time for its whole lifetime
+    /// (`OpenFile` in the facade never mutates it), and now that a
+    /// different etag is a genuinely different directory rather than
+    /// in-place churn of a shared one (see module docs), there is no
+    /// longer any "entry churn under a live handle" for this to need to
+    /// survive independently of the entry it protects.
     pub fn retain(&mut self, key: &FileKey) {
-        let hash = hash_key(&key.remote_path);
+        let hash = hash_key(&key.remote_path, &key.etag);
         *self.retains.entry(hash).or_insert(0) += 1;
     }
 
@@ -314,7 +357,7 @@ impl BlockCache {
     /// evicted out from under it just because a different handle closed
     /// first.
     pub fn release(&mut self, key: &FileKey) {
-        let hash = hash_key(&key.remote_path);
+        let hash = hash_key(&key.remote_path, &key.etag);
         if let std::collections::hash_map::Entry::Occupied(mut occ) = self.retains.entry(hash) {
             *occ.get_mut() -= 1;
             if *occ.get() == 0 {
@@ -392,6 +435,7 @@ impl BlockCache {
 
     fn write_meta(&self, hash: &str, entry: &Entry) -> Result<()> {
         let meta = MetaFile {
+            remote_path: entry.remote_path.clone(),
             etag: entry.etag.clone(),
             blocks: entry.blocks.iter().copied().collect(),
             last_used_unix: entry.last_used_unix,
@@ -428,15 +472,35 @@ impl BlockCache {
     }
 
     /// Drops every cached block of `remote_path`, whatever etag they were
-    /// stored under, deleting the entry directory on disk too. Idempotent: a
+    /// stored under, deleting each entry directory on disk too. Idempotent: a
     /// path with nothing cached is a no-op. Deliberately ignores `retains` —
     /// unlike eviction, a purge means the stored bytes are known stale (the
     /// write-back queue calls this the moment an upload replaces the file's
     /// remote content), and a live handle must never shield bytes that no
     /// longer match anything on the server. The retain count itself is left
     /// untouched, so the handle's eventual `release` still balances.
+    ///
+    /// Phase 4 (this task): iterates every entry looking for one matching
+    /// `remote_path` — a single `hash_key(remote_path, etag)` lookup is no
+    /// longer possible without already knowing which etag(s) to ask for,
+    /// now that the directory identity folds in the etag (see module docs).
+    /// A caller with only `remote_path` (this method's only caller,
+    /// `WriteBackQueue`, doesn't track every etag a path was ever cached
+    /// under) genuinely needs to purge ALL of them, which this now does —
+    /// strictly more thorough than the old single-directory purge, and
+    /// exactly what reclaims an old-etag entry's disk space once this
+    /// process's own upload is known to have made it stale.
     pub fn purge(&mut self, remote_path: &str) -> Result<()> {
-        self.remove_entry(&hash_key(remote_path))
+        let hashes: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.remote_path == remote_path)
+            .map(|(hash, _)| hash.clone())
+            .collect();
+        for hash in hashes {
+            self.remove_entry(&hash)?;
+        }
+        Ok(())
     }
 
     fn remove_entry(&mut self, hash: &str) -> Result<()> {
@@ -462,12 +526,21 @@ impl BlockCache {
     }
 }
 
-/// Directory name for a remote path: first 16 hex chars (8 bytes) of
-/// `sha256(remote_path)`. Truncated because this is a filesystem shard
+/// Directory name for a `(remote_path, etag)` pair (phase 4, this task —
+/// previously `remote_path` alone, see module docs): first 16 hex chars (8
+/// bytes) of `sha256(remote_path || '\0' || etag)`. The NUL separator
+/// prevents an ambiguous concatenation (`"ab" + "c"` vs `"a" + "bc"|`
+/// colliding without one) from ever mapping two genuinely different pairs
+/// onto the same directory. Truncated because this is a filesystem shard
 /// key, not a security boundary — 64 bits of collision resistance is far
-/// more than the number of files any one drive will ever cache.
-fn hash_key(remote_path: &str) -> String {
-    let digest = Sha256::digest(remote_path.as_bytes());
+/// more than the number of (path, etag) pairs any one drive will ever
+/// cache.
+fn hash_key(remote_path: &str, etag: &str) -> String {
+    let mut input = Vec::with_capacity(remote_path.len() + 1 + etag.len());
+    input.extend_from_slice(remote_path.as_bytes());
+    input.push(0);
+    input.extend_from_slice(etag.as_bytes());
+    let digest = Sha256::digest(&input);
     digest[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -540,7 +613,7 @@ mod tests {
         // not the file's highest index (block 1 is), so it must always be
         // a full block — this truncation can only be corruption, not a
         // legitimate short final block.
-        let hash = hash_key("a");
+        let hash = hash_key("a", "e1");
         let data_path = dir.path().join(&hash).join("data");
         let file = std::fs::OpenOptions::new().write(true).open(&data_path).unwrap();
         file.set_len(BLOCK_SIZE / 2).unwrap();
@@ -577,7 +650,7 @@ mod tests {
             let mut c = BlockCache::open(dir.path(), 100 * BLOCK_SIZE).unwrap();
             c.write_block(&key("a", "e1"), 0, &[1u8; 1024]).unwrap();
         }
-        let hash = hash_key("a");
+        let hash = hash_key("a", "e1");
         let entry_dir = dir.path().join(&hash);
         // Simulate a crash that left meta.json torn: garbage bytes rather
         // than the JSON `write_meta` would have produced.
@@ -664,7 +737,7 @@ mod tests {
         let mut c = BlockCache::open(dir.path(), 10 * BLOCK_SIZE).unwrap();
         let k = key("hot", "e");
         c.write_block(&k, 0, &[1u8; 1024]).unwrap();
-        let hash = hash_key("hot");
+        let hash = hash_key("hot", "e");
         let meta = dir.path().join(&hash).join("meta.json");
         let before = std::fs::metadata(&meta).unwrap().modified().unwrap();
         for _ in 0..50 {
@@ -694,7 +767,7 @@ mod tests {
         );
         assert!(c.read_block(&key("edited", "e1"), 1).unwrap().is_none());
         assert!(
-            !dir.path().join(hash_key("edited")).exists(),
+            !dir.path().join(hash_key("edited", "e1")).exists(),
             "the entry directory itself must be deleted, not just forgotten in memory"
         );
         assert!(

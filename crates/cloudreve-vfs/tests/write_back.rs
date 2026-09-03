@@ -15,7 +15,7 @@ use cloudreve_uploader::{
 };
 use cloudreve_vfs::vfs::{StaleHandleError, Vfs, VfsEvent, DEFAULT_CACHE_MAX_BYTES};
 use cloudreve_vfs::writeback::{DraftState, UPLOAD_RETRIES};
-use common::{remote_file, uri_of, VfsTestEnv};
+use common::{remote_dir, remote_file, uri_of, VfsTestEnv};
 use tempfile::NamedTempFile;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -1421,5 +1421,327 @@ async fn a_reopen_cancel_still_emits_cancelled_even_if_persisting_editing_fails(
     assert!(
         matches!(&event, VfsEvent::UploadCancelled { remote_path } if remote_path.ends_with("flaky-persist.txt")),
         "unexpected event: {event:?}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Phase 4 (this task): mount robustness + write-back hardening — the
+// three write-back-side deliverables from the task brief's Step 1(c-e).
+// ---------------------------------------------------------------------
+
+/// Step 1(c): the etag ping-pong. Two open handles on the SAME path,
+/// straddling a remote rewrite: `h1` opened against the original content
+/// (etag "e1"), then the "server" is rewritten under a NEW etag ("e2")
+/// before `h2` opens. Both handles then read repeatedly, alternating.
+/// Before this task's fix, the on-disk block-cache entry was keyed by
+/// PATH HASH ALONE, so every read under one handle's etag purged the
+/// OTHER handle's already-cached blocks (`BlockCache::read_block`'s old
+/// etag-mismatch branch) — an unbounded re-fetch storm, one download per
+/// alternating read. This asserts the total download count for the file
+/// stays bounded (exactly one fetch per handle's first read; every read
+/// after that must be served from each handle's own, no-longer-colliding
+/// cache entry) regardless of how many times the two handles alternate.
+#[tokio::test]
+async fn two_open_handles_across_a_remote_rewrite_do_not_ping_pong_downloads() {
+    let env = VfsTestEnv::new().await;
+    let original = vec![1u8; 4096];
+    let rewritten = vec![2u8; 4096];
+    env.set_remote_files(vec![remote_file("shared-read.bin", original.len() as i64, "e1")]).await;
+    env.serve_file_content("shared-read.bin", &original).await;
+
+    let (vfs, _rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+
+    let root = vfs.tree().root();
+    let node1 = vfs.lookup(root, "shared-read.bin").await.unwrap().unwrap().0;
+    let h1 = vfs.open(node1).await.unwrap();
+    let r1 = vfs.read(h1, 0, original.len() as u32).await.unwrap();
+    assert_eq!(r1.as_ref(), &original[..]);
+
+    // Someone else rewrites the file remotely, under a new etag — the
+    // tree's cached attrs for this path must be invalidated so the next
+    // lookup actually observes it (mirrors a real frontend's own
+    // lookup-before-open sequence).
+    env.set_remote_etag("shared-read.bin", "e2").await;
+    env.serve_file_content("shared-read.bin", &rewritten).await;
+    vfs.tree().invalidate_path(&uri_of("shared-read.bin")).await;
+
+    let node2 = vfs.lookup(root, "shared-read.bin").await.unwrap().unwrap().0;
+    let h2 = vfs.open(node2).await.unwrap();
+    let r2 = vfs.read(h2, 0, rewritten.len() as u32).await.unwrap();
+    assert_eq!(r2.as_ref(), &rewritten[..]);
+
+    // Alternate reads between the two still-open handles several times —
+    // the ping-pong storm (pre-fix) would re-download on EVERY one of
+    // these, since each handle's etag differs and shares the old
+    // path-hash-only cache directory with the other.
+    for _ in 0..5 {
+        let a = vfs.read(h1, 0, original.len() as u32).await.unwrap();
+        assert_eq!(a.as_ref(), &original[..], "h1 must keep reading the ORIGINAL content");
+        let b = vfs.read(h2, 0, rewritten.len() as u32).await.unwrap();
+        assert_eq!(b.as_ref(), &rewritten[..], "h2 must keep reading the REWRITTEN content");
+    }
+
+    // Bounded: exactly one download per handle's first read (2 total) is
+    // what a correct, non-colliding cache produces; the pre-fix ping-pong
+    // would have re-downloaded on every one of the 10 additional
+    // alternating reads above (up to 12 total). A generous-but-still-
+    // discriminating bound catches the storm without being brittle about
+    // the exact count.
+    let downloads = env.download_requests("shared-read.bin").len();
+    assert!(
+        downloads <= 3,
+        "etag ping-pong: {downloads} downloads for one file across two handles — each handle's \
+         own cache entry must survive the other handle's reads under a different etag, not \
+         evict it every time"
+    );
+}
+
+/// Step 1(d): two concurrent `retry_pending_uploads` callers (e.g. two
+/// overlapping reconnect events) must not both independently re-enqueue
+/// the SAME pending draft — exactly one recovery enqueue, hence exactly
+/// one upload session, no matter how many callers race the call at once.
+#[tokio::test]
+async fn concurrent_retry_pending_uploads_enqueue_exactly_once() {
+    let env = VfsTestEnv::new().await;
+    env.expect_uploads().await;
+    env.set_remote_files(vec![remote_file("racy-retry.txt", 5, "e1")]).await;
+    env.serve_file_content("racy-retry.txt", b"abcde").await;
+    // Every upload attempt fails, so the draft stays `Pending` forever —
+    // this test only cares about how many times an upload attempt (a
+    // session-creation request) is ever launched for the ONE draft, never
+    // about it actually succeeding.
+    env.fail_next_upload_sessions(1000);
+
+    let (vfs, _rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+    vfs.set_debounce_for_tests(Duration::from_millis(20));
+    // Small but real backoff: each of the (up to) two racing cycles below
+    // retries `UPLOAD_RETRIES` times before giving up, and this test needs
+    // both to fully settle quickly, not sit through minutes of backoff.
+    vfs.set_retry_backoff_for_tests([Duration::from_millis(5), Duration::from_millis(5)]);
+
+    let node = vfs.tree().lookup(vfs.tree().root(), "racy-retry.txt").await.unwrap().unwrap().0;
+    let h = vfs.open(node).await.unwrap();
+    vfs.write(h, 0, b"racy!").await.unwrap();
+    vfs.close(h).await.unwrap(); // Pending, debounce armed.
+
+    // Let the debounce fire and the first (failing) upload attempt run and
+    // park the draft back `Pending` — this is the ordinary "offline,
+    // exhausted retries, waiting for reconnect" state `retry_pending_uploads`
+    // is meant to recover from.
+    vfs.wait_for_writeback_idle().await;
+
+    let before = env.upload_session_count();
+
+    // Two callers racing `retry_pending_uploads` at once — e.g. two
+    // reconnect notifications arriving close together.
+    let (a, b) = tokio::join!(vfs.retry_pending_uploads(), vfs.retry_pending_uploads());
+    assert_eq!(a + b, 1, "exactly one of the two racing callers must claim the single pending draft");
+
+    vfs.wait_for_writeback_idle().await;
+
+    // Each independent recovery CYCLE retries `UPLOAD_RETRIES` times before
+    // giving up (every session-creation attempt is a mocked failure) — so
+    // a genuinely single recovery costs exactly `UPLOAD_RETRIES` session
+    // creations, while the pre-fix duplicate-enqueue bug would cost
+    // `2 * UPLOAD_RETRIES` (two independent, overlapping cycles for the
+    // same draft, serialized by `upload_gate` but never deduplicated).
+    let after = env.upload_session_count();
+    assert_eq!(
+        after - before,
+        UPLOAD_RETRIES as usize,
+        "two concurrent retry_pending_uploads callers must produce exactly ONE recovery cycle's \
+         worth of upload attempts for the one pending draft, not one per caller"
+    );
+}
+
+/// Step 1(e): a panic unwinding through an in-progress upload must not
+/// leak the draft's path in `WriteBackQueue`'s `in_flight` set forever.
+/// The panic hook (`panic_next_upload_for_tests`) fires right after
+/// `process` flips the draft's state to `Uploading`, so the draft is left
+/// stranded in that state — exactly the shape `retry_pending`'s
+/// stranded-`Uploading` recovery already exists to fix (see its own doc):
+/// it only demotes and re-enqueues when `!in_flight.contains(&path)`. If
+/// the panic leaked the `in_flight` entry (the pre-fix behavior), THIS
+/// check would stay permanently false and `retry_pending_uploads()` would
+/// return `0` forever, wedging the draft until a full app restart — that
+/// return value is the test's direct, deterministic signal, not a bare
+/// "did another upload eventually happen" race. A spawned task's panic
+/// never propagates to this test (tokio's own per-task `catch_unwind`
+/// contains it; only a warning is logged), which is exactly the
+/// "quietly stuck forever" failure mode this pins.
+#[tokio::test]
+async fn a_panic_during_upload_does_not_leak_in_flight_tracking() {
+    let env = VfsTestEnv::new().await;
+    env.expect_uploads().await;
+    env.set_remote_files(vec![remote_file("panicky.txt", 5, "e1")]).await;
+    env.serve_file_content("panicky.txt", b"abcde").await;
+
+    let (vfs, _rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+    vfs.set_debounce_for_tests(Duration::from_millis(20));
+    vfs.panic_next_upload_for_tests();
+
+    let node = vfs.tree().lookup(vfs.tree().root(), "panicky.txt").await.unwrap().unwrap().0;
+    let h = vfs.open(node).await.unwrap();
+    vfs.write(h, 0, b"boom!").await.unwrap();
+    vfs.close(h).await.unwrap(); // Pending, debounce armed.
+
+    // Wait for the debounce to fire and the panic to actually happen: the
+    // draft settles in `Uploading` (never advanced past it — the panic cut
+    // `process` off before its own failure-handling code could run) and
+    // stays there, since nothing else in this process will ever touch it
+    // again without an explicit retry.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if vfs.draft_state_for_tests(&uri_of("panicky.txt")).await == Some(DraftState::Uploading) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the draft never reached Uploading — the panic hook may not have fired"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Give the panicking task's unwind (and, with the bug, its skipped
+    // cleanup) a moment to fully settle before checking recovery below.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // The decisive check: `retry_pending`'s stranded-`Uploading` recovery
+    // must see this draft as recoverable. It returns 0 (silently, not an
+    // error) if `in_flight` still (wrongly) claims the path — the exact
+    // leak this task's `RunGuard` fix closes.
+    let queued = vfs.retry_pending_uploads().await;
+    assert_eq!(
+        queued, 1,
+        "a draft stranded Uploading by a panicking upload attempt must still be recoverable — \
+         a leaked in_flight entry would make retry_pending_uploads() silently return 0 forever"
+    );
+
+    vfs.wait_for_writeback_idle().await;
+    assert_eq!(
+        env.uploaded_content("panicky.txt"),
+        Some(b"boom!".to_vec()),
+        "the recovered retry must actually complete and upload the draft's real content"
+    );
+}
+
+/// R3 (phase 4 task 3, routed from the task 2 re-review): the plain
+/// (non-conflict) upload path in `WriteBackQueue::process` used to have no
+/// terminal/adaptive handling for Cloudreve's `ObjectExisted` (40004) at
+/// all — R1 and R2 closed the two known doors into "a plain upload runs
+/// overwrite=false against a uri that already exists", but a THIRD,
+/// residual door stays open even with both fixed: the destination gets
+/// created remotely by someone else inside the listing-TTL window between
+/// `Vfs::create`'s own EEXIST check (which only sees a locally-cached,
+/// possibly stale listing) and the eventual, debounced upload. This test
+/// exercises exactly that residual door, independent of R1/R2's rename
+/// machinery entirely: `create()` sees nothing at the name (empty local
+/// listing), the draft begins with an empty `base_etag` (D5's conflict
+/// check never even runs for it), and only AFTER `close()` arms the
+/// debounce does the mock's listing start reporting a real file already at
+/// that exact name — simulating the server-side race. Before this fix, the
+/// eventual upload's `overwrite=false` request was refused with 40004,
+/// exhausted its full transient-retry budget retrying the IDENTICAL
+/// request, and parked the draft `Pending` with `UploadFailed{will_retry:
+/// true}` — forever, since nothing about the identical retry could ever
+/// succeed. The fix (controller ruling: prefer landing the bytes) re-runs
+/// the adoption logic inline: resolves what's ACTUALLY at the path now,
+/// adopts its etag, and retries once as an ordinary overwrite-in-place —
+/// the bytes land, `UploadSucceeded` fires, in bounded time.
+#[tokio::test]
+async fn a_residual_40004_on_a_plain_upload_settles_via_adoption_not_endless_retry() {
+    let env = VfsTestEnv::new().await;
+    env.expect_uploads().await;
+    env.set_remote_files(vec![]).await; // nothing at all when `create()` runs.
+
+    let (vfs, mut rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+    vfs.set_debounce_for_tests(Duration::from_millis(20));
+    vfs.set_retry_backoff_for_tests([Duration::from_millis(5), Duration::from_millis(5)]);
+
+    let root = vfs.tree().root();
+    let (_node, h) = vfs.create(root, "raced.txt").await.unwrap();
+    let local_bytes = b"local draft bytes".to_vec();
+    vfs.write(h, 0, &local_bytes).await.unwrap();
+    vfs.close(h).await.unwrap(); // Pending, debounce armed, base_etag == "".
+
+    // The residual race: the server gets a same-named file from somewhere
+    // else (another client, another device) in the window before this
+    // draft's own upload attempt runs.
+    env.set_remote_files(vec![remote_file("raced.txt", 5, "server-side-etag")]).await;
+
+    let events = collect_events(&mut rx, 2).await;
+    match &events[..] {
+        [VfsEvent::UploadQueued { remote_path: q }, terminal] => {
+            assert!(q.ends_with("raced.txt"));
+            assert!(
+                matches!(terminal, VfsEvent::UploadSucceeded { .. }),
+                "a residual 40004 on a plain upload must settle via adoption (UploadSucceeded), \
+                 never park as UploadFailed{{will_retry:true}} to retry an identical doomed \
+                 request forever — got: {terminal:?}"
+            );
+        }
+        other => panic!("expected [Queued, Succeeded], got {other:?}"),
+    }
+
+    vfs.wait_for_writeback_idle().await;
+    assert_eq!(
+        env.uploaded_content("raced.txt"),
+        Some(local_bytes),
+        "the draft's real bytes must actually land on the server, adopted onto the \
+         destination's current identity"
+    );
+}
+
+/// R3's disclosed fallback: when the 40004 destination resolves to a
+/// DIRECTORY, adoption is unsound (this facade never deletes a directory
+/// to make room for a file), so the controller ruling's fallback applies —
+/// a single terminal `UploadFailed{will_retry:false}`, never a retry of the
+/// identical doomed request, and never adoption either (which would be
+/// nonsensical for a directory).
+#[tokio::test]
+async fn a_residual_40004_against_a_directory_settles_as_a_terminal_failure() {
+    let env = VfsTestEnv::new().await;
+    env.expect_uploads().await;
+    env.set_remote_files(vec![]).await;
+
+    let (vfs, mut rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+    vfs.set_debounce_for_tests(Duration::from_millis(20));
+    vfs.set_retry_backoff_for_tests([Duration::from_millis(5), Duration::from_millis(5)]);
+
+    let root = vfs.tree().root();
+    let (_node, h) = vfs.create(root, "raced-dir").await.unwrap();
+    vfs.write(h, 0, b"doesn't matter").await.unwrap();
+    vfs.close(h).await.unwrap();
+
+    // The residual race lands a DIRECTORY at the same name, not a file.
+    env.set_remote_files(vec![remote_dir("raced-dir")]).await;
+
+    let events = collect_events(&mut rx, 2).await;
+    match &events[..] {
+        [VfsEvent::UploadQueued { .. }, VfsEvent::UploadFailed { will_retry, remote_path, .. }] => {
+            assert!(remote_path.ends_with("raced-dir"));
+            assert!(
+                !will_retry,
+                "adoption is unsound against a directory — this must be the controller ruling's \
+                 disclosed terminal fallback, not an endless identical-request retry loop"
+            );
+        }
+        other => panic!("expected [Queued, Failed{{will_retry:false}}], got {other:?}"),
+    }
+
+    vfs.wait_for_writeback_idle().await;
+    assert_eq!(
+        env.uploaded_content("raced-dir"),
+        None,
+        "the directory's name must never actually receive an upload"
     );
 }
