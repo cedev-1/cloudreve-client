@@ -66,7 +66,8 @@
     "conflictKeepRemote": "Mantieni versione del server",
     "conflictKeepRemoteHint": "Sovrascrive il file locale",
     "conflictKeepBoth": "Mantieni entrambi",
-    "conflictKeepBothHint": "Rinomina la copia locale"
+    "conflictKeepBothHint": "Rinomina la copia locale",
+    "pendingUploads": "{{count}} caricamento/i in attesa"
   },
   "settings": {
     "title": "Impostazioni",

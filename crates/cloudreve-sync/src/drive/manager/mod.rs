@@ -195,7 +195,25 @@ impl DriveManager {
 
         let mode = config.mode;
 
-        let mut write_guard = self.drives.write().await;
+        // Review F3: build AND `start()` the mount BEFORE taking
+        // `drives.write()`. On-demand `start()` now runs the phase-4 mount
+        // lifecycle (pre-clean rungs, escalation, the mount call itself) —
+        // north of 30s in the worst case — and holding the write lock
+        // across that starved every `drives.read()` path (status polling,
+        // `get_drive`, …), making the whole app appear hung while one drive
+        // is merely slow to (re)mount. Mirrors the pattern `resume_drive`
+        // already uses: do the heavy lifting on a standalone `Mount` with
+        // no lock held, then take a lock only for the final map mutation.
+        //
+        // No uniqueness check is being relaxed by moving the lock this
+        // late: the old code never checked for a colliding id either — it
+        // went straight to `insert`, which silently overwrites on a
+        // collision regardless of when the lock is taken. In practice a
+        // collision can't happen: the Tauri `add_drive` command always
+        // mints a fresh `Uuid::new_v4` for a new drive, and
+        // `DriveManager::load()`'s startup replay calls `add_drive`
+        // sequentially (one `.await` at a time, never concurrently) over
+        // ids that were each minted uniquely when originally added.
         let mut mount = Mount::new(
             config.clone(),
             self.inventory.clone(),
@@ -227,6 +245,8 @@ impl DriveManager {
         }
         let id = mount_arc.id.clone();
         let command_tx = mount_arc.command_tx.clone();
+
+        let mut write_guard = self.drives.write().await;
         write_guard.insert(id.clone(), mount_arc);
         drop(write_guard);
 

@@ -66,7 +66,8 @@
     "conflictKeepRemote": "서버 버전 유지",
     "conflictKeepRemoteHint": "로컬 파일을 덮어씁니다",
     "conflictKeepBoth": "둘 다 유지",
-    "conflictKeepBothHint": "로컬 사본의 이름을 변경합니다"
+    "conflictKeepBothHint": "로컬 사본의 이름을 변경합니다",
+    "pendingUploads": "{{count}}개 업로드 대기 중"
   },
   "settings": {
     "title": "설정",

@@ -66,7 +66,8 @@
     "conflictKeepRemote": "Garder la version du serveur",
     "conflictKeepRemoteHint": "Écrase le fichier local",
     "conflictKeepBoth": "Garder les deux",
-    "conflictKeepBothHint": "Renomme la copie locale"
+    "conflictKeepBothHint": "Renomme la copie locale",
+    "pendingUploads": "{{count}} envoi(s) en attente"
   },
   "settings": {
     "title": "Paramètres",

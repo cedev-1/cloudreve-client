@@ -813,8 +813,12 @@ impl Mount {
                     self.vfs_failed_uploads.fetch_add(1, Ordering::Relaxed);
                     let display_path = self.remote_uri_to_display_path(&remote_path).await;
                     toast::send_warning_toast(
-                        "Upload failed",
-                        &format!("{}: {error}", display_path.display()),
+                        &t!("uploadFailedTitle"),
+                        &t!(
+                            "uploadFailedMessage",
+                            path = display_path.display().to_string(),
+                            error = error.as_str()
+                        ),
                     );
                 }
             }

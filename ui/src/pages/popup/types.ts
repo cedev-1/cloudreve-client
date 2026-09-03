@@ -60,6 +60,10 @@ export interface StatusSummary {
   has_ever_synced?: boolean;
   conflicts: ConflictInfo[];
   paused_drives: string[];
+  // D7: pending on-demand upload count per drive id. Only present for
+  // `DriveMode::OnDemand` drives (see `StatusSummary::pending_uploads` in
+  // crates/cloudreve-sync/src/drive/manager/types.rs).
+  pending_uploads?: Record<string, number>;
 }
 
 export interface FileIconResponse {

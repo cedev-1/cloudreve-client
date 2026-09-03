@@ -66,7 +66,8 @@
     "conflictKeepRemote": "サーバー版を保持",
     "conflictKeepRemoteHint": "ローカルファイルを上書きします",
     "conflictKeepBoth": "両方を保持",
-    "conflictKeepBothHint": "ローカルコピーの名前を変更します"
+    "conflictKeepBothHint": "ローカルコピーの名前を変更します",
+    "pendingUploads": "{{count}} 件のアップロードが保留中です"
   },
   "settings": {
     "title": "設定",

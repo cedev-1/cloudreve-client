@@ -66,7 +66,8 @@
     "conflictKeepRemote": "Keep server version",
     "conflictKeepRemoteHint": "Overwrites the local file",
     "conflictKeepBoth": "Keep both",
-    "conflictKeepBothHint": "Renames the local copy"
+    "conflictKeepBothHint": "Renames the local copy",
+    "pendingUploads": "{{count}} pending upload(s)"
   },
   "settings": {
     "title": "Settings",

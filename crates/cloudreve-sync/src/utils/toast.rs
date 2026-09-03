@@ -145,9 +145,10 @@ pub fn send_small_vfs_cache_toast(drive_id: &str, drive_name: &str, cap: u64) {
         return;
     }
     let clamp = |b: u64| b.min(i64::MAX as u64) as i64;
-    let message = format!(
-        "{drive_name}'s on-demand cache is limited to {} because of low disk space.",
-        format_bytes(clamp(cap)),
+    let message = t!(
+        "limitedOnDemandCacheMessage",
+        drive = drive_name,
+        cap = format_bytes(clamp(cap))
     );
     tracing::warn!(
         target: "toast",
@@ -155,7 +156,7 @@ pub fn send_small_vfs_cache_toast(drive_id: &str, drive_name: &str, cap: u64) {
         cap = cap,
         "Small on-demand cache cap notification"
     );
-    push_notification("Limited on-demand cache", message);
+    push_notification(t!("limitedOnDemandCacheTitle"), message);
 }
 
 #[cfg(test)]

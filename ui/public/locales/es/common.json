@@ -66,7 +66,8 @@
     "conflictKeepRemote": "Conservar versión del servidor",
     "conflictKeepRemoteHint": "Sobrescribe el archivo local",
     "conflictKeepBoth": "Conservar ambos",
-    "conflictKeepBothHint": "Renombra la copia local"
+    "conflictKeepBothHint": "Renombra la copia local",
+    "pendingUploads": "{{count}} carga(s) pendiente(s)"
   },
   "settings": {
     "title": "Configuración",

@@ -399,6 +399,75 @@ async fn a_conflict_saved_event_produces_a_conflict_toast() {
 }
 
 // ---------------------------------------------------------------------
+// Test (d): a succeeded upload decrements the pending count back to 0.
+// ---------------------------------------------------------------------
+
+/// M4: drives a real queued -> succeeded upload cycle through the pump and
+/// asserts `vfs_pending_uploads` returns to 0. `UploadQueued` increments
+/// the counter (already covered by the D7 status-summary test in
+/// `drive/manager/mod.rs`'s own test module) but nothing previously pinned
+/// the OTHER half of the contract: that a terminal `UploadSucceeded`
+/// actually decrements it back down rather than leaving it to drift
+/// upward forever. Deleting `dec_pending()` from the `UploadSucceeded` arm
+/// of `Mount::fold_vfs_event` must fail this test — see this task's report
+/// for the mutation-testing log proving it does.
+#[tokio::test]
+async fn a_succeeded_upload_returns_the_pending_count_to_zero() {
+    let env = TestEnv::with_mode(DriveMode::OnDemand).await;
+    let (files, _hits) = mount_listing_mock(&env.server).await;
+    set_files(&files, REMOTE_BASE, vec![]);
+    let session_count = mount_upload_mocks(&env.server).await;
+
+    let vfs = env.mount.vfs.lock().await.clone().expect("on-demand vfs");
+    // Short enough that the draft settles on its own during this test,
+    // without needing an SSE Subscribed event to force an early retry.
+    vfs.set_debounce_for_tests(Duration::from_millis(20));
+
+    let root = vfs.tree().root();
+    let (_node, h) = vfs.create(root, "new.txt").await.unwrap();
+    vfs.write(h, 0, b"hello").await.unwrap();
+    vfs.close(h).await.unwrap(); // Pending, UploadQueued sent, debounce armed.
+
+    env.mount.spawn_vfs_event_pump().await;
+
+    // First confirm the counter actually registers the queued draft, so a
+    // later "back to 0" read can't pass by having never left 0 at all.
+    let mut saw_pending = false;
+    for _ in 0..100 {
+        if env.mount.vfs_pending_uploads.load(Ordering::Relaxed) == 1 {
+            saw_pending = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(saw_pending, "UploadQueued must increment vfs_pending_uploads to 1");
+
+    let mut settled = false;
+    for _ in 0..100 {
+        if session_count.load(Ordering::SeqCst) >= 1 {
+            settled = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(settled, "the debounced draft must actually upload during this test");
+
+    let mut back_to_zero = false;
+    for _ in 0..100 {
+        if env.mount.vfs_pending_uploads.load(Ordering::Relaxed) == 0 {
+            back_to_zero = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        back_to_zero,
+        "UploadSucceeded must decrement vfs_pending_uploads back to 0 once the queued draft \
+         finishes uploading"
+    );
+}
+
+// ---------------------------------------------------------------------
 // Tracked obligation (Task-4 review): on-demand SSE file events must never
 // reach the full-mirror download/delete/task machinery.
 // ---------------------------------------------------------------------

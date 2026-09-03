@@ -66,7 +66,8 @@
     "conflictKeepRemote": "Zachowaj wersję z serwera",
     "conflictKeepRemoteHint": "Nadpisuje plik lokalny",
     "conflictKeepBoth": "Zachowaj oba",
-    "conflictKeepBothHint": "Zmienia nazwę lokalnej kopii"
+    "conflictKeepBothHint": "Zmienia nazwę lokalnej kopii",
+    "pendingUploads": "Przesyłania w kolejce: {{count}}"
   },
   "settings": {
     "title": "Ustawienia",

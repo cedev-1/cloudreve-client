@@ -66,7 +66,8 @@
     "conflictKeepRemote": "Server-Version behalten",
     "conflictKeepRemoteHint": "Überschreibt die lokale Datei",
     "conflictKeepBoth": "Beide behalten",
-    "conflictKeepBothHint": "Benennt die lokale Kopie um"
+    "conflictKeepBothHint": "Benennt die lokale Kopie um",
+    "pendingUploads": "{{count}} ausstehende(r) Upload(s)"
   },
   "settings": {
     "title": "Einstellungen",
