@@ -13,7 +13,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use cloudreve_sync::drive::commands::ManagerCommand;
-use cloudreve_sync::drive::mounts::{Credentials, DriveConfig, Mount};
+use cloudreve_sync::drive::mounts::{Credentials, DriveConfig, DriveMode, Mount};
+use cloudreve_sync::drive::vfs_mode::MountTestHook;
 use cloudreve_sync::inventory::{InventoryDb, MetadataEntry, TaskRecord};
 use cloudreve_sync::{EventBroadcaster, SummaryNotifier};
 use serde_json::{Value, json};
@@ -86,6 +87,11 @@ pub struct TestEnv {
     pub inventory: Arc<InventoryDb>,
     pub sync_dir: PathBuf,
     pub drive_id: String,
+    /// `Some` only for a `DriveMode::OnDemand` env (see `with_mode`): the
+    /// seam every OS mount/unmount request this env's `Mount` makes is
+    /// recorded on, instead of ever touching the OS. `None` for a
+    /// `FullMirror` env, which has no on-demand lifecycle to intercept.
+    pub vfs_mount_hook: Option<Arc<MountTestHook>>,
     _tmp: TempDir,
     _manager_rx: mpsc::UnboundedReceiver<ManagerCommand>,
 }
@@ -96,23 +102,34 @@ impl TestEnv {
     }
 
     pub async fn with_max_file_size(max_file_size_mb: u64) -> Self {
-        Self::build(max_file_size_mb, Vec::new(), None).await
+        Self::build(max_file_size_mb, Vec::new(), None, DriveMode::FullMirror).await
     }
 
     pub async fn with_ignore_patterns(patterns: Vec<String>) -> Self {
-        Self::build(1024, patterns, None).await
+        Self::build(1024, patterns, None, DriveMode::FullMirror).await
     }
 
     /// Put the sync folder on a caller-chosen volume, so tests can exercise the
     /// disk space guard against real free-space numbers.
     pub async fn with_sync_dir(sync_dir: PathBuf, max_file_size_mb: u64) -> Self {
-        Self::build(max_file_size_mb, Vec::new(), Some(sync_dir)).await
+        Self::build(max_file_size_mb, Vec::new(), Some(sync_dir), DriveMode::FullMirror).await
+    }
+
+    /// A `Mount` built in the given mode, real `Mount::start()` already
+    /// run. For `OnDemand`, a [`MountTestHook`] is installed BEFORE
+    /// `start()` runs (see `vfs_mount_hook`) so the on-demand lifecycle
+    /// never touches the OS — every real mount/unmount attempt this crate's
+    /// own suite makes is proven end-to-end by `cloudreve-vfs`'s own
+    /// `tests/mounted_{macos,linux}.rs` instead.
+    pub async fn with_mode(mode: DriveMode) -> Self {
+        Self::build(1024, Vec::new(), None, mode).await
     }
 
     async fn build(
         max_file_size_mb: u64,
         ignore_patterns: Vec<String>,
         sync_dir_override: Option<PathBuf>,
+        mode: DriveMode,
     ) -> Self {
         let tmp = TempDir::new().expect("create temp dir");
         // The inventory DB deliberately stays in the temp dir: on an overridden
@@ -144,12 +161,27 @@ impl TestEnv {
             ignore_patterns,
             max_file_size_mb,
             sse_client_id: Uuid::new_v4().to_string(),
+            mode,
             ..Default::default()
         };
 
         let (manager_tx, manager_rx) = mpsc::unbounded_channel();
         let notifier = Arc::new(SummaryNotifier::new(Arc::new(EventBroadcaster::new(16))));
-        let mount = Arc::new(Mount::new(config, inventory.clone(), manager_tx, notifier).await);
+        let mut mount = Mount::new(config, inventory.clone(), manager_tx, notifier).await;
+
+        let vfs_mount_hook = if mode == DriveMode::OnDemand {
+            let hook = MountTestHook::new();
+            mount.install_vfs_mount_hook_for_tests(hook.clone()).await;
+            Some(hook)
+        } else {
+            None
+        };
+
+        if mode == DriveMode::OnDemand {
+            mount.start().await.expect("start the on-demand mount");
+        }
+
+        let mount = Arc::new(mount);
 
         Self {
             server,
@@ -157,6 +189,7 @@ impl TestEnv {
             inventory,
             sync_dir,
             drive_id,
+            vfs_mount_hook,
             _tmp: tmp,
             _manager_rx: manager_rx,
         }
@@ -194,12 +227,32 @@ impl TestEnv {
     /// Simulate the app being relaunched: rebuild the Mount over the same
     /// inventory database and config, exactly like the next boot would.
     /// Whatever startup does with the tasks left in the database has happened
-    /// by the time this returns.
+    /// by the time this returns. For an on-demand env, a fresh
+    /// `MountTestHook` is installed and `start()` is run again, exactly
+    /// mirroring `with_mode`'s own on-demand setup — `vfs_mount_hook` is
+    /// replaced with the new hook, so any counts a test read off the OLD
+    /// one before restarting stay a frozen snapshot of the pre-restart
+    /// mount's activity.
     pub async fn restart_mount(&mut self) {
         let config = self.mount.get_config().await;
+        let mode = config.mode;
         let (manager_tx, manager_rx) = mpsc::unbounded_channel();
         let notifier = Arc::new(SummaryNotifier::new(Arc::new(EventBroadcaster::new(16))));
-        self.mount = Arc::new(Mount::new(config, self.inventory.clone(), manager_tx, notifier).await);
+        let mut mount = Mount::new(config, self.inventory.clone(), manager_tx, notifier).await;
+
+        self.vfs_mount_hook = if mode == DriveMode::OnDemand {
+            let hook = MountTestHook::new();
+            mount.install_vfs_mount_hook_for_tests(hook.clone()).await;
+            Some(hook)
+        } else {
+            None
+        };
+
+        if mode == DriveMode::OnDemand {
+            mount.start().await.expect("start the on-demand mount");
+        }
+
+        self.mount = Arc::new(mount);
         self._manager_rx = manager_rx;
     }
 
@@ -265,6 +318,23 @@ impl TestEnv {
         self.inventory
             .query_by_path(path.to_str().unwrap())
             .expect("query inventory")
+    }
+}
+
+/// An on-demand env's cache dir lives under the REAL `~/.cloudreve/
+/// vfs-cache/<drive_id>/` (D3 — this crate's own production layout, not a
+/// test fixture path), keyed by a fresh random `drive_id` per test. A test
+/// that doesn't itself call `Mount::delete()` (only `deleting_removes_the_
+/// cache_dir` does) would otherwise leak that directory on the machine
+/// actually running the suite; this cleans it up unconditionally so the
+/// rest of this file's tests don't accumulate garbage there run after run.
+impl Drop for TestEnv {
+    fn drop(&mut self) {
+        if self.vfs_mount_hook.is_some()
+            && let Ok(cache_dir) = cloudreve_sync::drive::vfs_mode::cache_dir_for(&self.drive_id)
+        {
+            let _ = std::fs::remove_dir_all(&cache_dir);
+        }
     }
 }
 

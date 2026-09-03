@@ -1,0 +1,37 @@
+[package]
+name = "cloudreve-vfs"
+version.workspace = true
+edition = "2021"
+
+[dependencies]
+cloudreve-api = { path = "../cloudreve-api" }
+tokio = { version = "1.35", features = ["full"] }
+anyhow = "1.0"
+tracing = "0.1"
+reqwest = { version = "0.12", features = ["stream"] }
+bytes = "1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = "0.4.42"
+sha2 = "0.10"
+cloudreve-uploader = { path = "../cloudreve-uploader" }
+nfs3_server = "0.11"
+libc = "0.2.189"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# `default-features = false` disables fuser's `libfuse` feature, which
+# otherwise links the system libfuse/libfuse3 via pkg-config AT BUILD TIME
+# (fuser's own build.rs) — requiring `libfuse3-dev` on the CI runner, not
+# just the `fuse3` runtime package the phase-3 plan's Task 5 already
+# installs. Without it, fuser falls back to its "pure-rust" mount
+# implementation (no C library link step at all); see mount.rs's
+# `linux_impl` module doc for the full reasoning and the runtime
+# requirements this still has (`/dev/fuse` + the `fusermount`/`fusermount3`
+# helper binary, both already covered by Task 5's plan). Resolved to
+# 0.15.1 — see this task's report.
+fuser = { version = "0.15", default-features = false }
+
+[dev-dependencies]
+wiremock = "0.6"
+tempfile = "3.8"
+uuid = { version = "1.6", features = ["v4"] }

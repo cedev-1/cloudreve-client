@@ -1,4 +1,4 @@
-use crate::drive::mounts::Mount;
+use crate::drive::mounts::{DriveMode, Mount};
 use crate::drive::utils::{is_partial_download, remote_path_to_local_relative_path};
 use crate::inventory::{MetadataEntry, FileMetadata};
 use crate::tasks::TaskPayload;
@@ -129,6 +129,21 @@ async fn warn_if_sync_will_not_fit(mount: &Mount, local_root: &PathBuf, needed: 
 }
 
 pub async fn full_sync(mount: &Mount, local_root: &PathBuf, remote_path: &str) -> Result<()> {
+    // Unreachable guard (D2): an on-demand drive never triggers a full sync
+    // — no fs watcher event enqueues `SyncMode::Full`, and `DriveManager`
+    // skips both the initial and periodic `FullSync` command for it. This
+    // is the single choke point every full-sync path (`perform_sync`'s
+    // `SyncMode::Full` branch and `perform_full_sync`) funnels through, so
+    // one guard here covers both call sites documented in the plan.
+    if mount.get_config().await.mode == DriveMode::OnDemand {
+        tracing::warn!(
+            target: "drive::sync",
+            id = %mount.id,
+            "full_sync called for an on-demand drive — this should be unreachable; on-demand \
+             drives never trigger a full sync"
+        );
+        return Ok(());
+    }
     if mount.is_paused() {
         tracing::info!(target: "drive::sync", id = %mount.id, "Sync skipped: drive is paused");
         return Ok(());

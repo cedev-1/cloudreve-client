@@ -41,10 +41,16 @@ jobs:
             libappindicator3-dev \
             librsvg2-dev \
             libssl-dev \
-            pkg-config
+            pkg-config \
+            fuse3
+
+      - name: Check FUSE is available
+        run: |
+          test -e /dev/fuse
+          fusermount3 --version
 
       - name: Run tests
-        run: cargo test -p cloudreve-sync -p cloudreve-api
+        run: cargo test -p cloudreve-sync -p cloudreve-api -p cloudreve-uploader -p cloudreve-vfs
 
       - name: Check desktop crate compiles
         # tauri-build requires the frontendDist directory to exist,
@@ -53,3 +59,24 @@ jobs:
         run: |
           mkdir -p ui/dist
           cargo check -p cloudreve-desktop
+
+  test-macos:
+    name: Rust tests (macOS)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2.9.1
+        with:
+          workspaces: '. -> target'
+
+      - name: Show macOS version
+        run: sw_vers
+
+      - name: Run tests
+        run: cargo test -p cloudreve-vfs

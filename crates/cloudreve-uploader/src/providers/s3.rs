@@ -2,8 +2,8 @@
 //!
 //! Supports: OSS, COS, S3, KS3, OBS
 
-use crate::uploader::chunk::{ChunkInfo, ChunkProgress};
-use crate::uploader::session::UploadSession;
+use crate::chunk::{ChunkInfo, ChunkProgress};
+use crate::session::UploadSession;
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use cloudreve_api::Client as CrClient;
@@ -162,7 +162,7 @@ pub async fn complete_upload_s3like(
         .body(body);
 
     // Add COS-specific header if needed
-    if session.policy_type() == crate::uploader::providers::PolicyType::Cos {
+    if session.policy_type() == crate::providers::PolicyType::Cos {
         request = request.header("x-cos-forbid-overwrite", "true");
     }
 

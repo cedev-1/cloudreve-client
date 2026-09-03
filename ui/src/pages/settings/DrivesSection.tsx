@@ -24,13 +24,15 @@ import {
   DeleteOutlineRounded,
   RefreshRounded,
   FilterListRounded,
+  SyncRounded,
+  CloudQueueRounded,
 } from "@mui/icons-material";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import type { DriveInfo } from "./types";
+import type { DriveInfo, DriveMode } from "./types";
 import {  SecondaryButton, SecondaryErrorButton } from "../../common/StyledComponent";
 import { ask } from '@tauri-apps/plugin-dialog';
 
@@ -50,6 +52,7 @@ interface DriveInfoResponse {
     used: number;
     label: string;
   };
+  mode: DriveMode;
 }
 
 export default function DrivesSection() {
@@ -212,6 +215,11 @@ export default function DrivesSection() {
     const parts = path.replace(/\\/g, "/").split("/");
     return parts[parts.length - 1] || path;
   };
+
+  const getModeLabel = (mode: DriveMode) =>
+    mode === "on_demand"
+      ? t("settings.driveMode.onDemand")
+      : t("settings.driveMode.mirror");
 
   const getStatusLabel = (status: DriveInfo["status"]) => {
     switch (status) {
@@ -379,6 +387,25 @@ export default function DrivesSection() {
                       </Box>
                     </Tooltip>
 
+                    {/* Sync Mode */}
+                    <Box
+                      sx={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 0.75,
+                        mb: 1.5,
+                      }}
+                    >
+                      {drive.mode === "on_demand" ? (
+                        <CloudQueueRounded sx={{ fontSize: 16, color: "text.secondary" }} />
+                      ) : (
+                        <SyncRounded sx={{ fontSize: 16, color: "text.secondary" }} />
+                      )}
+                      <Typography variant="caption" color="text.secondary">
+                        {getModeLabel(drive.mode)}
+                      </Typography>
+                    </Box>
+
                     {/* Storage Usage */}
                     {drive.capacity && (
                       <Box sx={{ mb: 1 }}>
@@ -430,13 +457,15 @@ export default function DrivesSection() {
                     </SecondaryButton>
                   )}
 
-                  <SecondaryButton
-                    size="small"
-                    startIcon={<FilterListRounded />}
-                    onClick={() => handleEditIgnorePatterns(drive.id)}
-                  >
-                    {t("settings.ignorePatterns")}
-                  </SecondaryButton>
+                  {drive.mode !== "on_demand" && (
+                    <SecondaryButton
+                      size="small"
+                      startIcon={<FilterListRounded />}
+                      onClick={() => handleEditIgnorePatterns(drive.id)}
+                    >
+                      {t("settings.ignorePatterns")}
+                    </SecondaryButton>
+                  )}
 
                   <Box sx={{ flex: 1 }} />
 

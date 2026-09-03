@@ -13,6 +13,13 @@
     "finalSetupDescription": "Wybierz folder lokalny, w którym zostanie zamontowany dysk chmurowy.",
     "localPath": "Ścieżka lokalna",
     "localDriveName": "Nazwa montowania",
+    "modeChoice": {
+      "title": "Tryb synchronizacji",
+      "mirror": "Pełne lustro",
+      "mirrorHint": "Każdy plik jest pobierany i synchronizowany lokalnie.",
+      "onDemand": "Na żądanie",
+      "onDemandHint": "Pliki są pobierane dopiero po ich otwarciu. Aby rozpocząć, folder lokalny musi być pusty."
+    },
     "localPathPlaceholder": "/Users/username/CloudDrive",
     "browse": "Przeglądaj",
     "selectFolder": "Wybierz folder",
@@ -59,7 +66,8 @@
     "conflictKeepRemote": "Zachowaj wersję z serwera",
     "conflictKeepRemoteHint": "Nadpisuje plik lokalny",
     "conflictKeepBoth": "Zachowaj oba",
-    "conflictKeepBothHint": "Zmienia nazwę lokalnej kopii"
+    "conflictKeepBothHint": "Zmienia nazwę lokalnej kopii",
+    "pendingUploads": "Przesyłania w kolejce: {{count}}"
   },
   "settings": {
     "title": "Ustawienia",
@@ -119,6 +127,10 @@
       "eventPushLost": "Utracono połączenie z powiadomieniami w czasie rzeczywistym",
       "offline": "Offline",
       "credentialExpired": "Dane uwierzytelniające wygasły"
+    },
+    "driveMode": {
+      "mirror": "Pełne lustro",
+      "onDemand": "Na żądanie"
     },
     "networkSettings": "Sieć",
     "heartbeatInterval": "Interwał heartbeat",

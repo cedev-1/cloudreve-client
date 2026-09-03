@@ -23,6 +23,12 @@ tauri = { version = "2.9.5", features = ["protocol-asset", "tray-icon"] }
 tauri-plugin-log = "2"
 tokio = { version = "1.35", features = ["full"] }
 tracing = "0.1"
+# Bridges the `log` facade (used by `fuser`, the on-demand vfs's FUSE/Linux
+# frontend — see `lib.rs`'s logging init) into `tracing`, so its output
+# reaches the same subscriber/log files as everything else instead of
+# going nowhere (no `log` backend is otherwise ever installed — the `log`/
+# `tauri-plugin-log` deps above are unused, see the init site's comment).
+tracing-log = "0.2"
 anyhow = "1.0"
 rust-i18n = "3"
 sys-locale = "0"

@@ -13,6 +13,13 @@
     "finalSetupDescription": "Wählen Sie einen lokalen Ordner aus, in dem Ihr Cloud-Laufwerk eingebunden wird.",
     "localPath": "Lokaler Pfad",
     "localDriveName": "Mount-Name",
+    "modeChoice": {
+      "title": "Synchronisierungsmodus",
+      "mirror": "Vollständige Spiegelung",
+      "mirrorHint": "Jede Datei wird heruntergeladen und lokal synchron gehalten.",
+      "onDemand": "Bei Bedarf",
+      "onDemandHint": "Dateien werden erst beim Öffnen heruntergeladen. Der lokale Ordner muss zu Beginn leer sein."
+    },
     "localPathPlaceholder": "/Users/username/CloudDrive",
     "browse": "Durchsuchen",
     "selectFolder": "Ordner auswählen",
@@ -59,7 +66,8 @@
     "conflictKeepRemote": "Server-Version behalten",
     "conflictKeepRemoteHint": "Überschreibt die lokale Datei",
     "conflictKeepBoth": "Beide behalten",
-    "conflictKeepBothHint": "Benennt die lokale Kopie um"
+    "conflictKeepBothHint": "Benennt die lokale Kopie um",
+    "pendingUploads": "{{count}} ausstehende(r) Upload(s)"
   },
   "settings": {
     "title": "Einstellungen",
@@ -119,6 +127,10 @@
       "eventPushLost": "Echtzeit-Event-Push unterbrochen",
       "offline": "Offline",
       "credentialExpired": "Anmeldedaten abgelaufen"
+    },
+    "driveMode": {
+      "mirror": "Vollständige Spiegelung",
+      "onDemand": "Bei Bedarf"
     },
     "networkSettings": "Netzwerk",
     "heartbeatInterval": "Heartbeat-Intervall",

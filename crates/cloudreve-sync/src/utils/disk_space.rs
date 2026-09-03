@@ -1,7 +1,18 @@
 //! Disk space guards.
 //!
-//! The client mirrors the whole remote drive locally, so a remote larger than
-//! the local volume would otherwise fill the disk until the machine breaks.
+//! A `FullMirror` drive mirrors the whole remote drive locally, so a remote
+//! larger than the local volume would otherwise fill the disk until the
+//! machine breaks — that is what [`fits_on_volume`]/[`available_space_for`]
+//! below guard against, via `drive::sync::full_sync`'s pre-flight check.
+//!
+//! An `OnDemand` drive (phase 4) never mirrors anything: its on-disk
+//! footprint is a bounded block cache instead, sized by
+//! `drive::vfs_mode::effective_cache_cap` (D3) using [`available_space_for`]
+//! and [`RESERVED_BYTES`] from this same module, but against a different
+//! formula (`min(default cap, max(floor, available − reserve))`) — a small
+//! cache is a degraded-but-safe outcome for that mode, not the
+//! disk-filling failure mode this module's `fits_on_volume` exists to
+//! prevent for a full mirror.
 
 use std::path::Path;
 
