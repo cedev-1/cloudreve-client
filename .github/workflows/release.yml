@@ -96,8 +96,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: macos-latest   # Apple Silicon (arm64)
-            args: '--target aarch64-apple-darwin'
+          - platform: macos-latest # Apple Silicon (arm64)
+            args: "--target aarch64-apple-darwin"
+          - platform: macos-15-intel
+            args: "--target x86_64-apple-darwin"
             target: aarch64-apple-darwin
           - platform: ubuntu-22.04   # Linux x86_64
             args: ''
