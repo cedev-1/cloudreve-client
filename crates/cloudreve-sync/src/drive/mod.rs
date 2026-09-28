@@ -7,3 +7,4 @@ pub mod mounts;
 pub mod remote_events;
 pub mod sync;
 pub mod utils;
+pub mod vfs_mode;

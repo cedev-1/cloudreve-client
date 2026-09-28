@@ -1,7 +1,7 @@
 //! Qiniu Cloud Storage upload implementation
 
-use crate::uploader::chunk::ChunkInfo;
-use crate::uploader::session::UploadSession;
+use crate::chunk::ChunkInfo;
+use crate::session::UploadSession;
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use futures::Stream;

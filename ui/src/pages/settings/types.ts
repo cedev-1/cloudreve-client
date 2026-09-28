@@ -11,9 +11,14 @@ export interface DriveInfo {
   status: DriveStatus;
   max_file_size_mb?: number;
   capacity?: CapacitySummary;
+  mode: DriveMode;
 }
 
 export type DriveStatus = "active" | "event_push_lost" | "offline" | "credential_expired";
+
+// Must match `DriveMode`'s serde snake_case wire format exactly
+// (crates/cloudreve-sync/src/drive/mounts.rs).
+export type DriveMode = "full_mirror" | "on_demand";
 
 export interface CapacitySummary {
   total: number;

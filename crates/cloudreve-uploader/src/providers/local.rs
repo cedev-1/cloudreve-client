@@ -3,8 +3,8 @@
 //! For Local policy: uploads chunks directly to Cloudreve server
 //! For Remote policy: uploads chunks to slave nodes
 
-use crate::uploader::chunk::ChunkInfo;
-use crate::uploader::session::UploadSession;
+use crate::chunk::ChunkInfo;
+use crate::session::UploadSession;
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use cloudreve_api::Client as CrClient;

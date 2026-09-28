@@ -2,6 +2,7 @@ use crate::drive::commands::{ManagerCommand, MountCommand};
 use crate::drive::event_blocker::EventBlocker;
 use crate::drive::ignore::IgnoreMatcher;
 use crate::drive::sync::group_fs_events;
+use crate::drive::vfs_mode::{self, MountTestHook};
 use crate::events::SummaryNotifier;
 use crate::inventory::{DrivePropsUpdate, InventoryDb};
 use crate::tasks::{TaskQueue, TaskQueueConfig};
@@ -10,17 +11,34 @@ use crate::utils::toast;
 use ::serde::{Deserialize, Serialize};
 use anyhow::{Context, Result};
 use cloudreve_api::{Client, ClientConfig, models::user::Token};
+use cloudreve_vfs::mount::MountedVfs;
+use cloudreve_vfs::vfs::{Vfs, VfsEvent};
 use notify_debouncer_full::notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer};
 use std::time::Duration;
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 use tokio::spawn;
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::task::JoinHandle;
+
+/// Per-drive sync strategy (D1). `FullMirror` is today's behavior — a real,
+/// byte-for-byte local mirror kept in sync by a fs watcher, the task queue,
+/// and periodic/initial full syncs. `OnDemand` instead mounts `sync_path`
+/// as a virtual volume backed by `cloudreve-vfs`: no fs watcher, no task
+/// queue replay, no full sync — reads/writes go straight through the
+/// mounted filesystem. See `Mount`'s lifecycle methods for exactly what
+/// each mode skips (D2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DriveMode {
+    #[default]
+    FullMirror,
+    OnDemand,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DriveConfig {
@@ -48,6 +66,14 @@ pub struct DriveConfig {
     /// Persisted so the server can resume event buffering across reconnects.
     #[serde(default)]
     pub sse_client_id: String,
+
+    /// Full mirror vs. on-demand (D1). Declared BEFORE `extra`: `extra`'s
+    /// `#[serde(flatten)]` would otherwise swallow an unrecognized `mode`
+    /// key instead of deserializing it. `#[serde(default)]` means an old
+    /// `drives.json` written before this field existed parses unchanged,
+    /// defaulting every existing drive to `FullMirror`.
+    #[serde(default)]
+    pub mode: DriveMode,
 
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
@@ -143,6 +169,57 @@ pub struct Mount {
     remote_event_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     manager_command_tx: mpsc::UnboundedSender<ManagerCommand>,
     fs_watcher: Mutex<Option<FsWatcher>>,
+    /// On-demand mode only (D2/D5): the OS-level mount handle. `None`
+    /// whenever unmounted — paused, never started, `start()` failed before
+    /// attaching, or (always, under test) intercepted by
+    /// `vfs_mount_test_hook`. Mirrors `fs_watcher`'s `Mutex<Option<...>>`
+    /// shape.
+    mounted_vfs: Mutex<Option<MountedVfs>>,
+    /// On-demand mode only: the `Vfs` facade built by `start_on_demand`,
+    /// kept alive across a pause/resume cycle (`remount_on_demand`
+    /// re-attaches the SAME instance rather than rebuilding it) — `None`
+    /// for a `FullMirror` drive or before `start()` has run. Task 5 reads
+    /// this for VFS-backed SSE invalidation and status.
+    pub vfs: Mutex<Option<Arc<Vfs>>>,
+    /// On-demand mode only: the receiving half of `vfs`'s `VfsEvent`
+    /// channel, `None` under the same conditions as `vfs`. Task 5 consumes
+    /// this.
+    pub vfs_events: Mutex<Option<mpsc::UnboundedReceiver<VfsEvent>>>,
+    /// D6: background worker draining `vfs_events` into
+    /// `vfs_pending_uploads`/`vfs_failed_uploads` and toasts — see
+    /// `spawn_vfs_event_pump`'s doc. Unlike every other `*_handle` slot
+    /// below, `pause()` deliberately never aborts this one: see
+    /// `spawn_vfs_event_pump`'s doc for why.
+    vfs_event_pump_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    /// On-demand mode only (D6): count of upload cycles currently between
+    /// their `VfsEvent::UploadQueued` and one of the five terminal events
+    /// documented on `VfsEvent` (`UploadSucceeded`/`UploadFailed`/
+    /// `UploadCancelled`/`UploadRenamed`/`ConflictSaved`). Folded by
+    /// `fold_vfs_event`; read by `DriveManager::get_status_summary` (D7).
+    /// Reconciles against on-disk `DraftStore` state for free on every
+    /// (re)start: `Vfs::new` itself re-arms every still-`Pending` draft for
+    /// immediate upload before returning
+    /// (`WriteBackQueue::enqueue_immediate`), synchronously sending a
+    /// fresh `UploadQueued` for each one into the very channel this pump
+    /// drains — see `spawn_vfs_event_pump`'s doc for why none of those
+    /// startup events are ever lost.
+    pub vfs_pending_uploads: std::sync::atomic::AtomicU64,
+    /// On-demand mode only (D6): count of `VfsEvent::UploadFailed
+    /// { will_retry: false }` events observed since this `Mount` was
+    /// constructed — a permanent give-up for that particular upload cycle
+    /// (the draft itself survives, parked back `Pending` for a future
+    /// manual/automatic retry, which starts a brand new `UploadQueued`/
+    /// terminal cycle of its own rather than clearing this count). Purely
+    /// an in-session counter: `DraftState` has no on-disk "failed" variant
+    /// to reconcile against (unlike `vfs_pending_uploads` above) — a give-
+    /// up is persisted identically to an ordinary still-pending draft, so
+    /// there is nothing on disk this could resync from even if it wanted
+    /// to. A coarse dashboard signal (D6: "no task-row parity with
+    /// full-mirror in 1.1"), not an exact per-file ledger.
+    pub vfs_failed_uploads: std::sync::atomic::AtomicU64,
+    /// Test-only: see `vfs_mode::MountTestHook`'s doc. `None` on every
+    /// production path.
+    vfs_mount_test_hook: Mutex<Option<Arc<MountTestHook>>>,
     pub(crate) sync_lock: Mutex<()>,
     pub cr_client: Arc<Client>,
     pub inventory: Arc<InventoryDb>,
@@ -208,6 +285,15 @@ impl Mount {
         let ignore_matcher = IgnoreMatcher::new(&config.ignore_patterns, config.sync_path.clone())
             .unwrap_or_else(|_| IgnoreMatcher::empty(config.sync_path.clone()));
         let event_blocker = EventBlocker::new();
+        // On-demand drives never replay parked/interrupted tasks at startup
+        // (D2): there is no local mirror for a stale upload/download task to
+        // apply to, and the queue itself stays inert (no fs watcher, no full
+        // sync ever enqueues anything into it either). `resume_on_start` is
+        // the least-invasive seam for this — `TaskQueue::new` has exactly
+        // one caller (here), so threading a bool straight through avoids a
+        // second constructor or a wrapper type just to skip one internal
+        // call. See `TaskQueue::new`'s own doc for the disclosure.
+        let resume_on_start = config.mode == DriveMode::FullMirror;
         let task_queue = TaskQueue::new(
             config.id.clone(),
             cr_client.clone(),
@@ -219,6 +305,7 @@ impl Mount {
             config.max_file_size_mb,
             summary_notifier,
             &ignore_matcher,
+            resume_on_start,
         ).await;
         let id = config.id.clone();
 
@@ -233,6 +320,13 @@ impl Mount {
             remote_event_handle: Arc::new(Mutex::new(None)),
             manager_command_tx,
             fs_watcher: Mutex::new(None),
+            mounted_vfs: Mutex::new(None),
+            vfs: Mutex::new(None),
+            vfs_events: Mutex::new(None),
+            vfs_event_pump_handle: Arc::new(Mutex::new(None)),
+            vfs_pending_uploads: std::sync::atomic::AtomicU64::new(0),
+            vfs_failed_uploads: std::sync::atomic::AtomicU64::new(0),
+            vfs_mount_test_hook: Mutex::new(None),
             sync_lock: Mutex::new(()),
             cr_client,
             inventory,
@@ -245,25 +339,121 @@ impl Mount {
         }
     }
 
-    /// Start the mount: create local sync directory and start the fs watcher.
+    /// Start the mount. `FullMirror`: create the local sync directory and
+    /// start the fs watcher (unchanged behavior). `OnDemand` (D2): mount
+    /// `sync_path` as a virtual volume instead — no fs watcher.
     pub async fn start(&mut self) -> Result<()> {
-        let sync_path = {
+        let (sync_path, mode) = {
             let config = self.config.read().await;
-            config.sync_path.clone()
+            (config.sync_path.clone(), config.mode)
         };
 
-        // Ensure the local sync directory exists
-        if !sync_path.exists() {
-            std::fs::create_dir_all(&sync_path)
-                .with_context(|| format!("Failed to create sync directory: {}", sync_path.display()))?;
-            tracing::info!(target: "drive::mounts", path = %sync_path.display(), "Created sync directory");
-        }
+        match mode {
+            DriveMode::FullMirror => {
+                // Ensure the local sync directory exists
+                if !sync_path.exists() {
+                    std::fs::create_dir_all(&sync_path).with_context(|| {
+                        format!("Failed to create sync directory: {}", sync_path.display())
+                    })?;
+                    tracing::info!(target: "drive::mounts", path = %sync_path.display(), "Created sync directory");
+                }
 
-        // Start filesystem watcher
-        self.start_fs_watcher(&sync_path).await?;
+                // Start filesystem watcher
+                self.start_fs_watcher(&sync_path).await?;
+            }
+            DriveMode::OnDemand => {
+                self.start_on_demand(&sync_path).await?;
+            }
+        }
 
         tracing::info!(target: "drive::mounts", id = %self.id, path = %sync_path.display(), "Mount started");
         Ok(())
+    }
+
+    /// D2/D5: mounts `mountpoint` as an on-demand virtual volume — computes
+    /// the effective cache cap (D3, warning once if it was clamped below
+    /// the default), builds the `Vfs` facade, and attaches it (which itself
+    /// pre-cleans a stale leftover mount, THEN ensures the target is an
+    /// empty directory — see `vfs_mode::attach`'s doc for why that order
+    /// matters). Stores the resulting `Vfs`, event receiver, and OS mount
+    /// handle on `self`.
+    async fn start_on_demand(&self, mountpoint: &Path) -> Result<()> {
+        let cache_dir = vfs_mode::cache_dir_for(&self.id)?;
+        let cap = vfs_mode::effective_cache_cap(&cache_dir);
+
+        let (remote_path, name) = {
+            let config = self.config.read().await;
+            (config.remote_path.clone(), config.name.clone())
+        };
+
+        if vfs_mode::is_clamped(cap) {
+            toast::send_small_vfs_cache_toast(&self.id, &name, cap);
+        }
+
+        let (vfs, events) =
+            vfs_mode::build_vfs(self.cr_client.clone(), remote_path, &cache_dir, cap)?;
+
+        let hook = self.vfs_mount_test_hook.lock().await.clone();
+        let mounted =
+            vfs_mode::attach(vfs.clone(), mountpoint, &name, &cache_dir, cap, hook.as_ref()).await?;
+
+        *self.vfs.lock().await = Some(vfs);
+        *self.vfs_events.lock().await = Some(events);
+        *self.mounted_vfs.lock().await = mounted;
+
+        Ok(())
+    }
+
+    /// D5: re-attaches the on-demand vfs after a pause, reusing the SAME
+    /// `Vfs` instance `start_on_demand` built — its block cache, draft
+    /// store, and write-back queue keep running across a pause; only the
+    /// OS-level attachment was ever torn down (`unmount_on_demand`), so
+    /// this never touches `Vfs::new`/`build_vfs` again.
+    pub async fn remount_on_demand(&self) -> Result<()> {
+        let vfs = self.vfs.lock().await.clone().context(
+            "on-demand remount requested but no vfs was ever built for this drive — was start() called?",
+        )?;
+
+        let (sync_path, name) = {
+            let config = self.config.read().await;
+            (config.sync_path.clone(), config.name.clone())
+        };
+
+        let cache_dir = vfs_mode::cache_dir_for(&self.id)?;
+        let cap = vfs_mode::effective_cache_cap(&cache_dir);
+
+        // `attach` itself pre-cleans a stale leftover mount before checking
+        // the mountpoint is empty — see its doc for why that order matters
+        // (review finding 4).
+        let hook = self.vfs_mount_test_hook.lock().await.clone();
+        let mounted =
+            vfs_mode::attach(vfs, &sync_path, &name, &cache_dir, cap, hook.as_ref()).await?;
+
+        *self.mounted_vfs.lock().await = mounted;
+        Ok(())
+    }
+
+    /// D5: unmounts the on-demand vfs (pause/shutdown/delete). The `Vfs`
+    /// facade and its event receiver are left in place — only the OS-level
+    /// attachment goes away — so `remount_on_demand` can re-attach the same
+    /// instance.
+    async fn unmount_on_demand(&self) {
+        let mountpoint = self.get_sync_path().await;
+        let hook = self.vfs_mount_test_hook.lock().await.clone();
+        let mounted = self.mounted_vfs.lock().await.take();
+        if let Err(err) = vfs_mode::detach(mounted, &mountpoint, hook.as_ref()).await {
+            tracing::warn!(target: "drive::mounts", id = %self.id, ?err, "failed to unmount the on-demand vfs");
+        }
+    }
+
+    /// Test-only: install a substitute for the real OS mount/unmount calls
+    /// this on-demand `Mount` would otherwise make — see
+    /// `vfs_mode::MountTestHook`'s doc for the seam's design. Must be
+    /// installed before `start()`/`pause()`/a resume for it to take effect
+    /// on that call.
+    #[doc(hidden)]
+    pub async fn install_vfs_mount_hook_for_tests(&self, hook: Arc<MountTestHook>) {
+        *self.vfs_mount_test_hook.lock().await = Some(hook);
     }
 
     /// Public wrapper for restarting the FS watcher (used by resume).
@@ -357,6 +547,28 @@ impl Mount {
                 MountCommand::FullSync => {
                     let mount_clone = mount.clone();
                     spawn(async move {
+                        // Review finding 2: `FullSync` is sent unconditionally
+                        // by several callers (SSE `Subscribed`, `DriveManager::
+                        // start_sync`, this mount's own periodic-sync worker —
+                        // though that one is never spawned for on-demand) —
+                        // guard the WHOLE handler here rather than letting an
+                        // on-demand drive reach `full_sync`'s own D2 guard two
+                        // calls deep, which would still no-op correctly but
+                        // only after firing a should-be-unreachable warning on
+                        // every routine SSE subscription and marking
+                        // `initial_sync_completed` true off a sync that never
+                        // ran. This makes the FullMirror-era machinery inert
+                        // for on-demand WITHOUT deleting the command variant or
+                        // the SSE worker that sends it — Task 5 repurposes that
+                        // branch for on-demand SSE handling.
+                        if mount_clone.config.read().await.mode == DriveMode::OnDemand {
+                            tracing::debug!(
+                                target: "drive::mounts",
+                                id = %mount_clone.id,
+                                "FullSync command ignored: drive is on-demand"
+                            );
+                            return;
+                        }
                         if let Err(e) = mount_clone.re_enqueue_offline_tasks().await {
                             tracing::warn!(target: "drive::mounts", error = %e, "Failed to re-enqueue offline tasks");
                         }
@@ -473,7 +685,20 @@ impl Mount {
     }
 
     /// Replay the tasks parked while offline, dropping the ones now ignored.
+    ///
+    /// D2 ("on-demand skips: TaskQueue replay") applies here too, not just
+    /// at launch (`resume_on_start` in `TaskQueue::new`) — this is the ONE
+    /// choke point every reconnect/SSE path shares (`heartbeat.rs`'s
+    /// offline→online transition, `remote_events.rs`'s `Resumed`/
+    /// `Subscribed` handlers, and the `MountCommand::FullSync` handler
+    /// below), so guarding here fixes all three at once rather than
+    /// needing a mode check duplicated at every call site (review finding
+    /// 1). There is no local mirror for a stale on-demand task to apply
+    /// to, same reasoning as the launch-time guard.
     pub async fn re_enqueue_offline_tasks(&self) -> Result<usize> {
+        if self.config.read().await.mode == DriveMode::OnDemand {
+            return Ok(0);
+        }
         let matcher = self.ignore_matcher.read().await.clone();
         self.task_queue.re_enqueue_offline_tasks(&matcher)
     }
@@ -507,6 +732,147 @@ impl Mount {
             s.process_remote_events(mount).await;
         });
         Self::replace_worker(&self.remote_event_handle, handle).await;
+    }
+
+    /// D6: spawn the `VfsEvent` pump — takes ownership of `vfs_events` (the
+    /// receiver `start_on_demand` populated) and folds every event it sees
+    /// into `vfs_pending_uploads`/`vfs_failed_uploads` plus a toast for the
+    /// two user-facing terminals (`ConflictSaved`, `UploadFailed` with
+    /// `will_retry: false`). A no-op for a `FullMirror` drive, or if this
+    /// is called a second time for the same on-demand drive: `vfs_events`
+    /// is `Mutex<Option<...>>` and `.take()`n exactly once, mirroring
+    /// `mounted_vfs`/`vfs`'s own "only ever set once per lifetime" shape —
+    /// see the field's own doc.
+    ///
+    /// DELIBERATELY never re-spawned or torn down by `pause()`/
+    /// `resume_drive` (unlike `remote_event_handle`/`periodic_sync_handle`/
+    /// `props_refresh_handle`, all stopped while paused and respawned on
+    /// resume): `remount_on_demand` (D5) reuses the SAME `Vfs` instance —
+    /// and therefore the SAME `VfsEvent` channel — across a pause/resume
+    /// cycle rather than rebuilding it, so the receiver this pump owns is
+    /// the only one that will ever exist for this `Mount`'s whole
+    /// lifetime. Aborting the task that owns it (as `pause()` does to the
+    /// other workers) would drop that receiver for good — `vfs_events`
+    /// only ever gets set once, by `start_on_demand` — permanently
+    /// freezing the counters with no way to recover on resume. There is
+    /// also nothing network-related here to stop: unlike the SSE
+    /// worker/periodic sync/props refresh, this pump makes no requests of
+    /// its own — it only observes activity the `Vfs`'s own write-back queue
+    /// keeps running regardless of pause (only the OS-level mount attachment
+    /// goes away on pause, per `unmount_on_demand`'s doc). `shutdown()`
+    /// aborts it like every other worker, since that IS real teardown with
+    /// no resume to come back from.
+    pub async fn spawn_vfs_event_pump(self: &Arc<Self>) {
+        let Some(mut events) = self.vfs_events.lock().await.take() else {
+            return;
+        };
+        let mount = self.clone();
+        let handle = tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                mount.fold_vfs_event(event).await;
+            }
+        });
+        Self::replace_worker(&self.vfs_event_pump_handle, handle).await;
+    }
+
+    /// D6: folds one `VfsEvent` into the counters/toasts — see
+    /// `spawn_vfs_event_pump`'s doc and `vfs_pending_uploads`/
+    /// `vfs_failed_uploads`'s field docs for the accounting rules. Every
+    /// terminal variant (all but `UploadQueued`) decrements
+    /// `vfs_pending_uploads` exactly once, matching the "one `UploadQueued`,
+    /// exactly one terminal" contract documented on `VfsEvent` itself —
+    /// including `UploadRenamed`, whose immediately-following fresh
+    /// `UploadQueued` (per that same contract) re-increments it right back,
+    /// net zero, correctly reflecting that the cycle merely continued under
+    /// a new name rather than actually finishing.
+    async fn fold_vfs_event(&self, event: VfsEvent) {
+        use std::sync::atomic::Ordering;
+
+        let dec_pending = || {
+            let _ = self.vfs_pending_uploads.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_sub(1))
+            });
+        };
+
+        match event {
+            VfsEvent::UploadQueued { .. } => {
+                self.vfs_pending_uploads.fetch_add(1, Ordering::Relaxed);
+            }
+            VfsEvent::UploadSucceeded { .. } => {
+                dec_pending();
+            }
+            VfsEvent::UploadCancelled { .. } => {
+                dec_pending();
+            }
+            VfsEvent::UploadRenamed { .. } => {
+                dec_pending();
+            }
+            VfsEvent::UploadFailed { remote_path, error, will_retry } => {
+                dec_pending();
+                if !will_retry {
+                    self.vfs_failed_uploads.fetch_add(1, Ordering::Relaxed);
+                    let display_path = self.remote_uri_to_display_path(&remote_path).await;
+                    toast::send_warning_toast(
+                        &t!("uploadFailedTitle"),
+                        &t!(
+                            "uploadFailedMessage",
+                            path = display_path.display().to_string(),
+                            error = error.as_str()
+                        ),
+                    );
+                }
+            }
+            VfsEvent::ConflictSaved { original, conflict_copy: _ } => {
+                dec_pending();
+                // Reviewer fix (Task 5): `original` is a facade-internal
+                // `cloudreve://…` remote uri (`VfsEvent`'s own doc; traced
+                // to `ConflictSaved`'s emission site in `writeback.rs`,
+                // which passes `remote_path.to_string()` straight through —
+                // `NodeAttr::remote_path` for a child is built as
+                // `format!("{parent_path}/{name}")` off the tree's
+                // `remote_base`, so it is NEVER a local path). Every OTHER
+                // `send_conflict_toast` call site (`tasks/upload.rs`,
+                // `tasks/download.rs`, `drive/sync.rs`) passes a genuine
+                // local filesystem path — `toast.rs` renders it with
+                // `path.display()` on that assumption. Passing the raw uri
+                // straight through leaked "cloudreve://my/sync/…" to the
+                // user instead of a path they'd recognize; map it onto the
+                // drive's local mounted path first, the exact inverse of
+                // D8's `handle_view_online` mapping.
+                let display_path = self.remote_uri_to_display_path(&original).await;
+                toast::send_conflict_toast(&self.id, &display_path, 0);
+            }
+        }
+    }
+
+    /// Maps a facade-internal `cloudreve://…` remote uri (as carried by
+    /// `VfsEvent::ConflictSaved`/`UploadFailed`) onto the local path a user
+    /// would recognize under this drive's mounted `sync_path` — the exact
+    /// inverse of `local_path_to_cr_uri` (D8's `handle_view_online`
+    /// mapping), reusing the existing `remote_path_to_local_relative_path`
+    /// helper rather than duplicating its uri-relativization logic.
+    ///
+    /// Falls back to just the uri's last path segment (its file/dir name)
+    /// if the inversion is ever unsound — `remote_path` failing to parse as
+    /// a `CrUri`, or not actually living under this drive's `remote_path`
+    /// (shouldn't happen: every uri this is called with was built from THIS
+    /// drive's own tree) — an honest best-effort display, never the raw uri.
+    async fn remote_uri_to_display_path(&self, remote_path: &str) -> PathBuf {
+        let (remote_base, sync_path) = {
+            let config = self.config.read().await;
+            (config.remote_path.clone(), config.sync_path.clone())
+        };
+        let mapped = (|| -> Result<PathBuf> {
+            use cloudreve_api::models::uri::CrUri;
+            let remote = CrUri::new(remote_path)?;
+            let base = CrUri::new(&remote_base)?;
+            let relative = crate::drive::utils::remote_path_to_local_relative_path(&remote, &base)?;
+            Ok(sync_path.join(relative))
+        })();
+        mapped.unwrap_or_else(|_| {
+            let name = remote_path.rsplit('/').next().unwrap_or(remote_path);
+            sync_path.join(name)
+        })
     }
 
     /// Spawn a task to periodically refresh drive properties (quota, etc.)
@@ -621,8 +987,16 @@ impl Mount {
         self.paused.store(true, std::sync::atomic::Ordering::Relaxed);
         tracing::info!(target: "drive::mounts", id = %self.id, "Drive paused");
 
-        // Stop FS watcher
-        *self.fs_watcher.lock().await = None;
+        // D5: unmount an on-demand drive (the volume disappears — no
+        // half-alive mount) rather than stop a fs watcher it never had.
+        match self.config.read().await.mode {
+            DriveMode::FullMirror => {
+                *self.fs_watcher.lock().await = None;
+            }
+            DriveMode::OnDemand => {
+                self.unmount_on_demand().await;
+            }
+        }
 
         // Abort background handles (but NOT the command processor)
         if let Some(h) = self.remote_event_handle.lock().await.take() {
@@ -649,8 +1023,16 @@ impl Mount {
     pub async fn shutdown(&self) {
         tracing::info!(target: "drive::mounts", id = %self.id, "Shutting down mount");
 
-        // Stop fs watcher
-        *self.fs_watcher.lock().await = None;
+        // D5: shutdown unmounts an on-demand drive the same way pause does
+        // (Drop is only the crash net, not the primary teardown path).
+        match self.config.read().await.mode {
+            DriveMode::FullMirror => {
+                *self.fs_watcher.lock().await = None;
+            }
+            DriveMode::OnDemand => {
+                self.unmount_on_demand().await;
+            }
+        }
 
         // Abort background tasks
         if let Some(h) = self.processor_handle.lock().await.take() {
@@ -662,6 +1044,12 @@ impl Mount {
         if let Some(h) = self.props_refresh_handle.lock().await.take() {
             h.abort();
         }
+        // Unlike pause() (see `vfs_event_pump_handle`'s field doc), real
+        // teardown DOES abort the vfs event pump — there is no resume to
+        // come back from here.
+        if let Some(h) = self.vfs_event_pump_handle.lock().await.take() {
+            h.abort();
+        }
 
         // Shutdown task queue
         self.task_queue.shutdown().await;
@@ -669,6 +1057,34 @@ impl Mount {
 
     pub async fn delete(&self) -> Result<()> {
         self.shutdown().await;
+
+        // D5: an on-demand drive's cache dir is this crate's own, not
+        // anything the user put there — remove it on delete the same way a
+        // FullMirror drive's inventory rows are wiped below. Best-effort:
+        // `inventory.nuke_drive` below is a harmless no-op for a drive that
+        // never wrote any rows, but a leftover cache dir would otherwise
+        // accumulate forever across add/remove cycles.
+        if self.config.read().await.mode == DriveMode::OnDemand {
+            match vfs_mode::cache_dir_for(&self.id) {
+                Ok(cache_dir) => {
+                    if let Err(err) = std::fs::remove_dir_all(&cache_dir)
+                        && err.kind() != std::io::ErrorKind::NotFound
+                    {
+                        tracing::warn!(
+                            target: "drive::mounts",
+                            id = %self.id,
+                            path = %cache_dir.display(),
+                            ?err,
+                            "failed to remove the on-demand vfs cache directory"
+                        );
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(target: "drive::mounts", id = %self.id, ?err, "failed to resolve the on-demand vfs cache directory for cleanup");
+                }
+            }
+        }
+
         self.inventory.nuke_drive(&self.id)?;
         self.inventory.delete_drive_props(&self.id)?;
         Ok(())

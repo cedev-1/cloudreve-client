@@ -1,6 +1,6 @@
 //! AES-256-CTR encryption support for uploads
 
-use crate::uploader::error::{UploadError, UploadResult};
+use crate::error::{UploadError, UploadResult};
 use aes::Aes256;
 use aes::cipher::{KeyIvInit, StreamCipher};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};

@@ -16,7 +16,6 @@ pub use error::{UploadError, UploadResult};
 pub use progress::{ProgressCallback, ProgressUpdate};
 pub use session::UploadSession;
 
-use crate::inventory::InventoryDb;
 use cloudreve_api::{Client as CrClient, api::ExplorerApi};
 use reqwest::Client as HttpClient;
 use std::path::PathBuf;
@@ -24,6 +23,38 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+
+/// The persistence hooks the uploader needs for resumable sessions.
+/// `cloudreve-sync` backs this with `InventoryDb`; `cloudreve-vfs` uses
+/// `NoSessionStore` (drafts are the persistence there).
+///
+/// Note: all three methods are required to keep the uploader's resume/cleanup
+/// behavior unchanged — `get_upload_session_by_path` (session resume) and
+/// `insert_upload_session` (session creation) are called on the same store as
+/// `delete_upload_session` (session cleanup).
+pub trait SessionStore: Send + Sync {
+    fn get_upload_session_by_path(&self, path: &str) -> Result<Option<UploadSession>>;
+    fn insert_upload_session(&self, session: &UploadSession) -> Result<()>;
+    fn delete_upload_session(&self, id: &str) -> Result<()>;
+}
+
+/// A no-op `SessionStore` for callers that do not persist upload sessions
+/// (e.g. `cloudreve-vfs`, where drafts are the persistence layer).
+pub struct NoSessionStore;
+
+impl SessionStore for NoSessionStore {
+    fn get_upload_session_by_path(&self, _path: &str) -> Result<Option<UploadSession>> {
+        Ok(None)
+    }
+
+    fn insert_upload_session(&self, _session: &UploadSession) -> Result<()> {
+        Ok(())
+    }
+
+    fn delete_upload_session(&self, _id: &str) -> Result<()> {
+        Ok(())
+    }
+}
 
 /// Configuration for the uploader
 #[derive(Debug, Clone)]
@@ -78,8 +109,8 @@ pub struct Uploader {
     cr_client: Arc<CrClient>,
     /// HTTP client for direct uploads to storage providers
     http_client: HttpClient,
-    /// Inventory database for persisting session state
-    inventory: Arc<InventoryDb>,
+    /// Persistence hook for upload session state
+    session_store: Arc<dyn SessionStore>,
     /// Uploader configuration
     config: UploaderConfig,
     /// Cancellation token for stopping uploads
@@ -90,7 +121,7 @@ impl Uploader {
     /// Create a new uploader instance
     pub fn new(
         cr_client: Arc<CrClient>,
-        inventory: Arc<InventoryDb>,
+        session_store: Arc<dyn SessionStore>,
         config: UploaderConfig,
     ) -> Self {
         let http_client = HttpClient::builder()
@@ -101,7 +132,7 @@ impl Uploader {
         Self {
             cr_client,
             http_client,
-            inventory,
+            session_store,
             config,
             cancel_token: CancellationToken::new(),
         }
@@ -231,7 +262,7 @@ impl Uploader {
     ) -> UploadResult<Option<UploadSession>> {
         // Try to load existing session from database
         match self
-            .inventory
+            .session_store
             .get_upload_session_by_path(&params.local_path.to_string_lossy().to_string())
         {
             Ok(Some(session)) => {
@@ -244,7 +275,7 @@ impl Uploader {
                     );
                     // Delete expired session (best-effort; a stale row is harmless
                     // but should not go unnoticed)
-                    if let Err(e) = self.inventory.delete_upload_session(&session.id) {
+                    if let Err(e) = self.session_store.delete_upload_session(&session.id) {
                         warn!(
                             target: "uploader",
                             task_id = %params.task_id,
@@ -321,7 +352,7 @@ impl Uploader {
         );
 
         // Persist session to database
-        self.inventory
+        self.session_store
             .insert_upload_session(&session)
             .map_err(|e| UploadError::DatabaseError(e.to_string()))?;
 
@@ -359,7 +390,7 @@ impl Uploader {
 
     /// Clean up session from database
     async fn cleanup_session(&self, session: &UploadSession) -> UploadResult<()> {
-        self.inventory
+        self.session_store
             .delete_upload_session(&session.id)
             .map_err(|e| UploadError::DatabaseError(e.to_string()))?;
         Ok(())
@@ -380,5 +411,60 @@ impl Uploader {
             .map_err(|e| UploadError::SessionDeletionFailed(e.to_string()))?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cloudreve_api::models::explorer::UploadCredential;
+
+    fn dummy_session() -> UploadSession {
+        let credential = UploadCredential {
+            session_id: "session-1".to_string(),
+            expires: 0,
+            chunk_size: 4096,
+            upload_urls: None,
+            credential: String::new(),
+            upload_id: String::new(),
+            callback_secret: String::new(),
+            ak: None,
+            key_time: None,
+            complete_url: None,
+            storage_policy: None,
+            uri: "cloudreve://my/file.txt".to_string(),
+            mime_type: None,
+            upload_policy: None,
+            encrypt_metadata: None,
+        };
+        UploadSession::new(
+            "task-1".to_string(),
+            "drive-1".to_string(),
+            "/local/file.txt".to_string(),
+            "cloudreve://my/file.txt".to_string(),
+            4096,
+            credential,
+        )
+    }
+
+    #[test]
+    fn the_null_session_store_is_a_no_op() {
+        let store = NoSessionStore;
+        let session = dummy_session();
+
+        // Insert is a no-op: it never errors and never actually persists anything.
+        assert!(store.insert_upload_session(&session).is_ok());
+
+        // Lookup always reports "nothing found", regardless of what was "inserted".
+        assert!(
+            store
+                .get_upload_session_by_path("/local/file.txt")
+                .unwrap()
+                .is_none()
+        );
+
+        // Delete is a no-op too: it never errors, even for a session that was
+        // never stored.
+        assert!(store.delete_upload_session(&session.id).is_ok());
     }
 }

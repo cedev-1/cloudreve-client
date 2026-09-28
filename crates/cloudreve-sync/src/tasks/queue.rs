@@ -73,6 +73,15 @@ pub struct TaskQueue {
 }
 
 impl TaskQueue {
+    /// `resume_on_start`: whether to replay Pending/Running tasks left in
+    /// the inventory from a previous run (`resume_incomplete_tasks`).
+    /// `false` for an on-demand drive (phase 4, D2) — the least-invasive
+    /// seam for that: this is the queue's only constructor and its only
+    /// caller (`Mount::new`), so a plain bool threaded straight through
+    /// avoids a second constructor or a wrapper type just to skip one
+    /// internal call. There is no local mirror for a stale on-demand task
+    /// to apply to, and the queue otherwise stays inert for that mode (no
+    /// fs watcher, no full sync ever enqueues into it either).
     pub async fn new(
         drive_id: impl Into<String>,
         cr_client: Arc<Client>,
@@ -84,6 +93,7 @@ impl TaskQueue {
         max_file_size_mb: u64,
         notifier: Arc<SummaryNotifier>,
         ignore: &IgnoreMatcher,
+        resume_on_start: bool,
     ) -> Arc<Self> {
         let drive_id = drive_id.into();
         let max_concurrent = config.max_concurrent.max(1);
@@ -113,7 +123,9 @@ impl TaskQueue {
         });
 
         queue.spawn_dispatcher(command_rx).await;
-        if let Err(err) = queue.resume_incomplete_tasks(ignore).await {
+        if resume_on_start
+            && let Err(err) = queue.resume_incomplete_tasks(ignore).await
+        {
             warn!(
                 target: "tasks::queue",
                 drive = %queue.drive_id,

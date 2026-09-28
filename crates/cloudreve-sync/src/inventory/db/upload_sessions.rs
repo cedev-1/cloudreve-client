@@ -88,6 +88,25 @@ impl InventoryDb {
     }
 }
 
+// The uploader crate persists resumable session state through this trait so it
+// does not need to depend on cloudreve-sync's inventory/database layer directly.
+impl cloudreve_uploader::SessionStore for InventoryDb {
+    fn get_upload_session_by_path(
+        &self,
+        path: &str,
+    ) -> Result<Option<crate::uploader::UploadSession>> {
+        InventoryDb::get_upload_session_by_path(self, path)
+    }
+
+    fn insert_upload_session(&self, session: &crate::uploader::UploadSession) -> Result<()> {
+        InventoryDb::insert_upload_session(self, session)
+    }
+
+    fn delete_upload_session(&self, id: &str) -> Result<()> {
+        InventoryDb::delete_upload_session(self, id)
+    }
+}
+
 // =========================================================================
 // Row Types
 // =========================================================================
@@ -198,5 +217,72 @@ impl TryFrom<UploadSessionQueryRow> for crate::uploader::UploadSession {
         session.updated_at = row.updated_at;
 
         Ok(session)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::InventoryDb;
+    use cloudreve_api::models::explorer::UploadCredential;
+    use cloudreve_uploader::{SessionStore, UploadSession};
+
+    fn test_db() -> (tempfile::TempDir, InventoryDb) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = InventoryDb::with_path(dir.path().join("test.db")).unwrap();
+        (dir, db)
+    }
+
+    fn dummy_session() -> UploadSession {
+        let credential = UploadCredential {
+            session_id: "session-1".to_string(),
+            expires: 0,
+            chunk_size: 4096,
+            upload_urls: None,
+            credential: String::new(),
+            upload_id: String::new(),
+            callback_secret: String::new(),
+            ak: None,
+            key_time: None,
+            complete_url: None,
+            storage_policy: None,
+            uri: "cloudreve://my/file.txt".to_string(),
+            mime_type: None,
+            upload_policy: None,
+            encrypt_metadata: None,
+        };
+        UploadSession::new(
+            "task-1".to_string(),
+            "drive-1".to_string(),
+            "/local/file.txt".to_string(),
+            "cloudreve://my/file.txt".to_string(),
+            4096,
+            credential,
+        )
+    }
+
+    /// Seam test for the `SessionStore` trait impl: a session inserted through
+    /// `InventoryDb` is gone from the database after `delete_upload_session` is
+    /// called through the trait object, not just the inherent method.
+    #[test]
+    fn deleting_through_the_session_store_trait_removes_the_row() {
+        let (_dir, db) = test_db();
+        let session = dummy_session();
+
+        db.insert_upload_session(&session).unwrap();
+        assert!(
+            db.get_upload_session_by_path("/local/file.txt")
+                .unwrap()
+                .is_some()
+        );
+
+        // Go through the trait object, exactly like the uploader crate does.
+        let store: &dyn SessionStore = &db;
+        store.delete_upload_session(&session.id).unwrap();
+
+        assert!(
+            db.get_upload_session_by_path("/local/file.txt")
+                .unwrap()
+                .is_none()
+        );
     }
 }

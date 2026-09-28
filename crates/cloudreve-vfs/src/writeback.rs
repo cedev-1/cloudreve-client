@@ -1,0 +1,1704 @@
+//! Whole-file local drafts for the vfs write path.
+//!
+//! Pure disk logic: no HTTP, no async, no knowledge of `cache.rs`/`tree.rs`/
+//! `vfs.rs`. Task 7's facade wraps a single instance in a `Mutex`, so every
+//! method here takes `&mut self` even where a shared reference would
+//! technically do — same rationale as `BlockCache` in `cache.rs`.
+//!
+//! Layout on disk, under `<cache_root>/drafts`: one subdirectory per remote
+//! file being edited, named with the first 16 hex chars of
+//! `sha256(remote_path)` (same sharding idiom as `cache.rs`), containing:
+//! - `data`: the full local file content.
+//! - `draft.json`: `{remote_path, base_etag, size, state, last_write_unix}`.
+//!
+//! Drafts are deliberately NOT part of `BlockCache`: keeping them in a
+//! separate root means a draft pending upload can never be evicted by the
+//! block cache's LRU (spec §5, "pending drafts exempt from LRU" holds by
+//! construction — see D1 in the phase-2 write-path plan).
+
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use anyhow::{Context, Result};
+use bytes::Bytes;
+use cloudreve_uploader::{NoSessionStore, UploadParams, Uploader, UploaderConfig};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use tokio::sync::{mpsc, Mutex as TokioMutex};
+
+/// Idle time after the last write before the (Task 8) background flusher
+/// moves a draft still in `Editing` to `Pending` and queues it for upload.
+/// Lives here, not in the flusher, because the draft lifecycle it gates is
+/// owned by this module.
+pub const WRITEBACK_DEBOUNCE: Duration = Duration::from_secs(2);
+
+/// Where a draft is in its life. `Editing`: locally modified, not yet
+/// queued. `Pending`: queued for upload, not yet in flight. `Uploading`: an
+/// upload attempt is currently in progress. See `DraftStore::open` for why
+/// `Uploading` never survives a restart.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum DraftState {
+    Editing,
+    Pending,
+    Uploading,
+}
+
+/// How `begin` seeds a new draft's content.
+pub enum DraftInit {
+    /// A brand new (or O_TRUNC-truncated) file: no content to fetch.
+    Empty,
+    /// A pre-downloaded copy of the remote file's current content, already
+    /// sitting somewhere on disk (materialization happens in the Task 7
+    /// facade, via the phase-1 read path). `begin` MOVES it into the draft
+    /// directory rather than copying: the caller's temp file is consumed.
+    Materialized(PathBuf),
+}
+
+/// What `draft.json` holds, verbatim.
+#[derive(Debug, Serialize, Deserialize)]
+struct DraftMeta {
+    remote_path: String,
+    base_etag: String,
+    size: u64,
+    state: DraftState,
+    last_write_unix: i64,
+}
+
+/// In-memory state for one draft. Mirrors `DraftMeta` plus `write_seq` —
+/// unlike `BlockCache`'s `Entry`, a draft has no derived/recency state, so
+/// this struct exists only to avoid re-parsing JSON on every accessor call.
+struct Entry {
+    remote_path: String,
+    base_etag: String,
+    size: u64,
+    state: DraftState,
+    last_write_unix: i64,
+    /// Monotonic count of content mutations (`write`/`truncate`), bumped on
+    /// every one. The write-back queue snapshots it when it flips a draft to
+    /// `Uploading` and compares on success: a changed count means bytes were
+    /// acknowledged AFTER the upload's snapshot, so the draft must survive
+    /// and re-upload rather than be removed (spec §5, "never lose a byte").
+    /// A counter, not `last_write_unix`: wall-clock seconds cannot tell a
+    /// write landing in the same second as the snapshot apart from none at
+    /// all. Deliberately in-memory only (never part of `DraftMeta`): the
+    /// comparison never spans processes — after a crash, `open()` demotes
+    /// every `Uploading` draft back to `Pending` unconditionally, which
+    /// already forces a re-upload of whatever bytes are on disk.
+    write_seq: u64,
+}
+
+pub struct DraftStore {
+    root: PathBuf,
+    /// Keyed by the same hex hash used for the on-disk directory name (see
+    /// module docs), not by `remote_path` directly — recomputing the hash
+    /// from a path is cheap and keeps this in lockstep with `BlockCache`'s
+    /// equivalent map in `cache.rs`.
+    entries: HashMap<String, Entry>,
+    /// Test-only fault injection: when `true`, the NEXT `set_state` call
+    /// fails (consuming this flag) instead of persisting, without touching
+    /// disk. Not `#[cfg(test)]` — see `WriteBackQueue::debounce`'s field doc
+    /// for why (integration tests under `tests/` link this crate without
+    /// `cfg(test)`). Exists to pin a real reviewer-caught ordering bug: a
+    /// caller sending a terminal `VfsEvent` only after a fallible
+    /// `set_state` call must not let that event get silently swallowed by
+    /// this kind of disk fault — see `set_state`'s own doc and
+    /// `fail_next_set_state_for_tests`.
+    fail_next_set_state: bool,
+}
+
+impl DraftStore {
+    /// Rebuilds draft state by scanning every `draft.json` under `root`, so
+    /// drafts survive an app restart. A directory whose `draft.json` is
+    /// missing or unreadable is dropped entirely (its `data` file, if any,
+    /// is unusable without the metadata describing it) rather than failing
+    /// `open()` — same policy as `BlockCache::open`.
+    ///
+    /// A draft found in `Uploading` is demoted to `Pending` here, in memory
+    /// AND on disk. `Uploading` only ever means "an upload attempt is in
+    /// flight in this process"; if the process died mid-upload, nothing
+    /// confirms whether the server actually received the bytes, so the
+    /// draft must never be treated as "already handled" on the next
+    /// launch — it must be retried, not silently lost. Demoting back to
+    /// `Pending` puts it back in the queue Task 8's flusher drains.
+    pub fn open(root: &Path) -> Result<Self> {
+        fs::create_dir_all(root)
+            .with_context(|| format!("failed to create drafts root {}", root.display()))?;
+
+        let mut entries = HashMap::new();
+        for dir_entry in fs::read_dir(root)
+            .with_context(|| format!("failed to read drafts root {}", root.display()))?
+        {
+            let dir_entry = dir_entry?;
+            if !dir_entry.file_type()?.is_dir() {
+                continue;
+            }
+            let hash = dir_entry.file_name().to_string_lossy().into_owned();
+            let meta_path = dir_entry.path().join("draft.json");
+            let Ok(raw) = fs::read(&meta_path) else {
+                tracing::warn!(hash = %hash, "drafts: dropping entry with no draft.json");
+                delete_orphaned_dir(&hash, &dir_entry.path());
+                continue;
+            };
+            let mut meta: DraftMeta = match serde_json::from_slice(&raw) {
+                Ok(meta) => meta,
+                Err(err) => {
+                    tracing::warn!(hash = %hash, %err, "drafts: dropping unreadable draft.json");
+                    delete_orphaned_dir(&hash, &dir_entry.path());
+                    continue;
+                }
+            };
+
+            let demoted = meta.state == DraftState::Uploading;
+            if demoted {
+                meta.state = DraftState::Pending;
+            }
+
+            let entry = Entry {
+                remote_path: meta.remote_path.clone(),
+                base_etag: meta.base_etag.clone(),
+                size: meta.size,
+                state: meta.state,
+                last_write_unix: meta.last_write_unix,
+                write_seq: 0,
+            };
+
+            if demoted {
+                // Persist the demotion immediately: every mutation of a
+                // draft's state is written atomically, and being found
+                // mid-upload after a crash is itself a state change.
+                write_meta(root, &hash, &entry)?;
+            }
+
+            entries.insert(hash, entry);
+        }
+
+        Ok(Self { root: root.to_path_buf(), entries, fail_next_set_state: false })
+    }
+
+    /// Starts (or restarts) a draft for `remote_path`. Overwrites any
+    /// existing draft at the same path, since the caller (the facade)
+    /// only calls `begin` for a fresh create/open-for-write.
+    pub fn begin(&mut self, remote_path: &str, base_etag: &str, initial: DraftInit) -> Result<()> {
+        let hash = hash16(remote_path);
+        let dir = self.entry_dir(&hash);
+        fs::create_dir_all(&dir)
+            .with_context(|| format!("failed to create draft dir {}", dir.display()))?;
+        let data_path = self.data_path_for_hash(&hash);
+
+        let size = match initial {
+            DraftInit::Empty => {
+                // create+truncate: a re-`begin` on a path that already had
+                // a draft must discard whatever content was there before.
+                OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&data_path)
+                    .with_context(|| format!("failed to create {}", data_path.display()))?;
+                0
+            }
+            DraftInit::Materialized(src) => {
+                move_into(&src, &data_path)?;
+                fs::metadata(&data_path)
+                    .with_context(|| format!("failed to stat {}", data_path.display()))?
+                    .len()
+            }
+        };
+
+        let entry = Entry {
+            remote_path: remote_path.to_string(),
+            base_etag: base_etag.to_string(),
+            size,
+            state: DraftState::Editing,
+            last_write_unix: now_unix(),
+            write_seq: 0,
+        };
+        write_meta(&self.root, &hash, &entry)?;
+        self.entries.insert(hash, entry);
+        Ok(())
+    }
+
+    /// Writes `data` at `offset`, extending the draft's logical size if the
+    /// write reaches past its current end. Extension relies on ordinary
+    /// sparse-file semantics: seeking past the current end of a regular
+    /// file and writing there reads back as zeros in the gap, on every
+    /// platform this crate targets — the same assumption `BlockCache`
+    /// makes for its `data` file.
+    pub fn write(&mut self, remote_path: &str, offset: u64, data: &[u8]) -> Result<()> {
+        let hash = hash16(remote_path);
+        anyhow::ensure!(self.entries.contains_key(&hash), "no draft open for {remote_path}");
+
+        let data_path = self.data_path_for_hash(&hash);
+        let mut file = OpenOptions::new()
+            .write(true)
+            .open(&data_path)
+            .with_context(|| format!("failed to open {}", data_path.display()))?;
+        file.seek(SeekFrom::Start(offset))?;
+        file.write_all(data)?;
+        drop(file);
+
+        let entry = self.entries.get_mut(&hash).expect("checked above");
+        entry.size = entry.size.max(offset + data.len() as u64);
+        entry.last_write_unix = now_unix();
+        entry.write_seq += 1;
+        write_meta(&self.root, &hash, entry)?;
+        Ok(())
+    }
+
+    /// Reads up to `len` bytes starting at `offset`. Like the vfs read
+    /// path (and POSIX `read(2)`), a request that reaches past the
+    /// current end of the file is silently truncated to whatever remains
+    /// rather than erroring or zero-padding — a read entirely at or past
+    /// EOF returns an empty result.
+    pub fn read(&mut self, remote_path: &str, offset: u64, len: u32) -> Result<Bytes> {
+        let hash = hash16(remote_path);
+        let Some(entry) = self.entries.get(&hash) else {
+            anyhow::bail!("no draft open for {remote_path}");
+        };
+        if offset >= entry.size {
+            return Ok(Bytes::new());
+        }
+        let want = (len as u64).min(entry.size - offset);
+
+        let data_path = self.data_path_for_hash(&hash);
+        let mut file = fs::File::open(&data_path)
+            .with_context(|| format!("failed to open {}", data_path.display()))?;
+        file.seek(SeekFrom::Start(offset))?;
+        let mut buf = vec![0u8; want as usize];
+        file.read_exact(&mut buf)
+            .with_context(|| format!("failed to read {}", data_path.display()))?;
+        Ok(Bytes::from(buf))
+    }
+
+    /// Resizes the draft to exactly `size`: extends with zero bytes (a
+    /// bigger file) or discards the tail (a smaller one) — `File::set_len`
+    /// gives both for free on a regular file.
+    pub fn truncate(&mut self, remote_path: &str, size: u64) -> Result<()> {
+        let hash = hash16(remote_path);
+        anyhow::ensure!(self.entries.contains_key(&hash), "no draft open for {remote_path}");
+
+        let data_path = self.data_path_for_hash(&hash);
+        let file = OpenOptions::new()
+            .write(true)
+            .open(&data_path)
+            .with_context(|| format!("failed to open {}", data_path.display()))?;
+        file.set_len(size)
+            .with_context(|| format!("failed to set length of {}", data_path.display()))?;
+        drop(file);
+
+        let entry = self.entries.get_mut(&hash).expect("checked above");
+        entry.size = size;
+        entry.last_write_unix = now_unix();
+        entry.write_seq += 1;
+        write_meta(&self.root, &hash, entry)?;
+        Ok(())
+    }
+
+    pub fn size(&self, remote_path: &str) -> Option<u64> {
+        self.entries.get(&hash16(remote_path)).map(|e| e.size)
+    }
+
+    pub fn state(&self, remote_path: &str) -> Option<DraftState> {
+        self.entries.get(&hash16(remote_path)).map(|e| e.state.clone())
+    }
+
+    /// The draft's last local write time, unix seconds. Used by the facade's
+    /// `getattr`/`readdir`/`lookup` overlay (D3): a drafted file's mtime
+    /// must reflect the local edit, not the server's last-known timestamp.
+    pub fn mtime_unix(&self, remote_path: &str) -> Option<i64> {
+        self.entries.get(&hash16(remote_path)).map(|e| e.last_write_unix)
+    }
+
+    /// Overwrites the draft's state, unconditionally — this method itself
+    /// enforces no transition rules; the write-back queue is what owns the
+    /// state machine's discipline:
+    /// - `Editing -> Pending`: only `Vfs::close`, when the closing handle
+    ///   leaves a dirty draft behind (arms the debounce timer).
+    /// - `Pending -> Editing`: only `Vfs::open`, and only after
+    ///   `WriteBackQueue::cancel` reports it actually stopped the armed
+    ///   timer — never on a draft already `Uploading` or one that already
+    ///   exhausted its retries (see `open`'s doc for why).
+    /// - `Pending -> Uploading`: only `WriteBackQueue::process`, right
+    ///   before it hands the draft's bytes to the uploader.
+    /// - `Uploading -> Pending`: `WriteBackQueue::process` on a failed
+    ///   attempt (after exhausting `UPLOAD_RETRIES`), or `DraftStore::open`
+    ///   demoting a draft found `Uploading` after a crash (Task 6).
+    /// - `Uploading -> `(removed)`: `WriteBackQueue::process` on success —
+    ///   the draft is deleted outright, not moved to a fourth state.
+    pub fn set_state(&mut self, remote_path: &str, s: DraftState) -> Result<()> {
+        let hash = hash16(remote_path);
+        let entry = self
+            .entries
+            .get_mut(&hash)
+            .ok_or_else(|| anyhow::anyhow!("no draft open for {remote_path}"))?;
+        // Mutated in memory BEFORE the fallible persist below, deliberately:
+        // a caller relying on this method to reflect a state change it has
+        // already otherwise committed to (e.g. `Vfs::open`'s reopen-cancel,
+        // which only calls this after `WriteBackQueue::cancel` has
+        // irreversibly `abort()`ed the debounce timer) sees that commitment
+        // survive in memory even if the disk write below fails — only the
+        // persisted copy is at risk, never the running process's own view.
+        entry.state = s;
+        if self.fail_next_set_state {
+            self.fail_next_set_state = false;
+            anyhow::bail!(
+                "test hook: injected set_state persistence failure for {remote_path} \
+                 (see fail_next_set_state_for_tests)"
+            );
+        }
+        write_meta(&self.root, &hash, entry)?;
+        Ok(())
+    }
+
+    /// Test-only: makes the very next `set_state` call fail as if its disk
+    /// persist step failed, without touching disk at all. See
+    /// `fail_next_set_state`'s field doc for why this exists and what it
+    /// pins — a caller must never let a terminal event it owes (because it
+    /// already made some OTHER commitment irreversible, like aborting a
+    /// timer) sit downstream of this fallible call.
+    pub fn fail_next_set_state_for_tests(&mut self) {
+        self.fail_next_set_state = true;
+    }
+
+    pub fn base_etag(&self, remote_path: &str) -> Option<String> {
+        self.entries.get(&hash16(remote_path)).map(|e| e.base_etag.clone())
+    }
+
+    /// Whether any draft's path is STRICTLY nested under `prefix`
+    /// (`prefix` + "/" + anything) — deliberately excludes an exact match
+    /// on `prefix` itself. A plain file with its own draft (not open) may
+    /// still be renamed: `Vfs::rename` migrates that draft in place via
+    /// `rename` above, and this method must stay a no-op for that case
+    /// (a file has no descendants, so the exact-match exclusion never even
+    /// applies to it in practice — it only matters for a DIRECTORY's own
+    /// path, which never has a draft of its own).
+    ///
+    /// Used by `Vfs::rename`'s subtree EBUSY guard: renaming a directory
+    /// must be refused while any descendant file has unsaved/unsettled
+    /// content, because `rename` above only ever migrates the ONE exact
+    /// path handed to it — a descendant's draft left un-migrated would
+    /// keep targeting the OLD (renamed-away) path, and its eventual upload
+    /// would resurrect the just-renamed directory there with the user's
+    /// edit inside, while the new location keeps stale content. Denying
+    /// the whole rename is deliberately simpler than teaching `rename`
+    /// (the method) to migrate a whole subtree of drafts at once.
+    pub fn has_draft_strictly_under(&self, prefix: &str) -> bool {
+        let nested = format!("{prefix}/");
+        self.entries.values().any(|e| e.remote_path.starts_with(&nested))
+    }
+
+    /// The draft's content-mutation counter — see `Entry::write_seq`'s doc.
+    pub fn write_seq(&self, remote_path: &str) -> Option<u64> {
+        self.entries.get(&hash16(remote_path)).map(|e| e.write_seq)
+    }
+
+    /// Rebases the draft onto a new remote etag. Only the write-back queue
+    /// calls this, and only after an in-place upload landed a snapshot of a
+    /// draft that was written again mid-flight: the server now holds the
+    /// snapshot under `etag`, so the surviving draft's next conflict check
+    /// (D5) must compare against THAT, or it would flag the draft's own
+    /// landed upload as someone else's conflicting edit.
+    pub fn set_base_etag(&mut self, remote_path: &str, etag: &str) -> Result<()> {
+        let hash = hash16(remote_path);
+        let entry = self
+            .entries
+            .get_mut(&hash)
+            .ok_or_else(|| anyhow::anyhow!("no draft open for {remote_path}"))?;
+        entry.base_etag = etag.to_string();
+        write_meta(&self.root, &hash, entry)?;
+        Ok(())
+    }
+
+    /// The path the Uploader reads the draft's bytes from directly.
+    pub fn data_path(&self, remote_path: &str) -> Option<PathBuf> {
+        let hash = hash16(remote_path);
+        self.entries.contains_key(&hash).then(|| self.data_path_for_hash(&hash))
+    }
+
+    /// Deletes the draft's whole directory. Idempotent: removing a path
+    /// with no draft is a no-op rather than an error, matching
+    /// `BlockCache::remove_entry`'s style.
+    pub fn remove(&mut self, remote_path: &str) -> Result<()> {
+        let hash = hash16(remote_path);
+        self.entries.remove(&hash);
+        let dir = self.entry_dir(&hash);
+        if dir.exists() {
+            fs::remove_dir_all(&dir)
+                .with_context(|| format!("failed to remove draft dir {}", dir.display()))?;
+        }
+        Ok(())
+    }
+
+    /// Moves a draft to a new remote path (Task 10: the file being edited
+    /// gets renamed remotely while a draft is open on it). `new_base_etag`
+    /// (phase 4 task 3, R2): when `Some`, rebases the draft onto that etag
+    /// in the SAME persisted `write_meta` call this method already makes —
+    /// folded in here rather than left to a separate `set_base_etag` call
+    /// afterward, specifically so a crash (or a cancelled future) between
+    /// the two can never leave the migrated draft on disk with its path
+    /// moved but its base etag NOT yet adopted (an empty base etag replayed
+    /// on restart is exactly the doomed-40004-retry-loop shape `Vfs::
+    /// rename`'s drafted-source bridge exists to avoid — see its call site
+    /// for the full story). `None` is the ordinary Task 10 rename with no
+    /// identity adoption involved.
+    pub fn rename(&mut self, from: &str, to: &str, new_base_etag: Option<&str>) -> Result<()> {
+        let from_hash = hash16(from);
+        let mut entry = self
+            .entries
+            .remove(&from_hash)
+            .ok_or_else(|| anyhow::anyhow!("no draft open for {from}"))?;
+        entry.remote_path = to.to_string();
+        if let Some(etag) = new_base_etag {
+            entry.base_etag = etag.to_string();
+        }
+
+        let to_hash = hash16(to);
+        if to_hash == from_hash {
+            // Same shard (only possible if `from == to`): nothing to move
+            // on disk, just persist the updated `remote_path`.
+            write_meta(&self.root, &to_hash, &entry)?;
+            self.entries.insert(to_hash, entry);
+            return Ok(());
+        }
+
+        let from_dir = self.entry_dir(&from_hash);
+        let to_dir = self.entry_dir(&to_hash);
+        if to_dir.exists() {
+            // Renaming onto a path that already has its own draft: the
+            // destination's old draft is being overwritten by this one,
+            // same as `begin` overwriting an existing draft.
+            fs::remove_dir_all(&to_dir)
+                .with_context(|| format!("failed to clear {}", to_dir.display()))?;
+        }
+        fs::rename(&from_dir, &to_dir).with_context(|| {
+            format!("failed to rename {} to {}", from_dir.display(), to_dir.display())
+        })?;
+
+        write_meta(&self.root, &to_hash, &entry)?;
+        self.entries.insert(to_hash, entry);
+        Ok(())
+    }
+
+    /// Remote paths of every draft waiting to be uploaded or currently
+    /// being uploaded — what Task 8's flusher and startup resume loop
+    /// iterate over.
+    ///
+    /// Ordering is UNSPECIFIED and MUST NOT be relied on: this iterates
+    /// `entries`, a `HashMap`, so the order is arbitrary and can change
+    /// between calls even with no mutation in between. That's safe here
+    /// because the write-back queue treats its pending drafts as an
+    /// unordered set, not a FIFO — `WriteBackQueue::retry_pending` fires
+    /// one independent upload attempt per path (each drains through the
+    /// same serializing `upload_gate`, but which one goes first has no
+    /// observable effect: every draft's own `base_etag`/conflict check/
+    /// retry outcome is computed purely from that draft's own state, never
+    /// from another draft's). If a future caller ever needs a stable or
+    /// prioritized drain order, that ordering has to be added explicitly
+    /// here (e.g. sorting by `last_write_unix`) — do not assume `pending()`
+    /// already provides one.
+    ///
+    /// Includes `Uploading` entries deliberately: at startup they've always
+    /// already been demoted to `Pending` by `DraftStore::open` before this
+    /// is ever called, but `WriteBackQueue::retry_pending` also calls this
+    /// mid-process, where a `Uploading` entry can be a cycle stranded by a
+    /// rename (see `migrate_armed_timer`'s doc) rather than one truly still
+    /// in flight — `retry_pending` is what tells the two apart and recovers
+    /// the former.
+    pub fn pending(&self) -> Vec<String> {
+        self.entries
+            .values()
+            .filter(|e| matches!(e.state, DraftState::Pending | DraftState::Uploading))
+            .map(|e| e.remote_path.clone())
+            .collect()
+    }
+
+    fn entry_dir(&self, hash: &str) -> PathBuf {
+        self.root.join(hash)
+    }
+
+    fn data_path_for_hash(&self, hash: &str) -> PathBuf {
+        self.entry_dir(hash).join("data")
+    }
+}
+
+// ---------------------------------------------------------------------
+// The queue half (Task 8): debounced write-back, real uploads, conflict
+// copies, retry. Everything above this point is pure disk logic; from here
+// on this module does HTTP (through `cloudreve_uploader::Uploader`) and
+// owns background tokio tasks.
+// ---------------------------------------------------------------------
+
+/// Total attempts made for one draft's upload before parking it back
+/// `Pending` and giving up until the next `retry_pending_uploads` (or app
+/// restart). Pinned for the whole phase-2 write path.
+pub const UPLOAD_RETRIES: u32 = 3;
+
+/// Backoff slept between upload attempts, indexed by attempt number (after
+/// the first failure sleeps `UPLOAD_RETRY_BACKOFF[0]`, after the second
+/// `UPLOAD_RETRY_BACKOFF[1]`, then the third and final attempt runs with no
+/// further wait).
+pub const UPLOAD_RETRY_BACKOFF: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(5)];
+
+/// A no-op progress sink: the write-back queue doesn't report per-chunk
+/// progress anywhere (unlike `cloudreve-sync`'s foreground upload task,
+/// nothing in this crate is watching it yet).
+struct NoOpProgress;
+
+impl cloudreve_uploader::ProgressCallback for NoOpProgress {
+    fn on_progress(&self, _update: cloudreve_uploader::ProgressUpdate) {}
+}
+
+/// The write-back queue: debounces a closed draft, then drains it through
+/// the real chunked uploader. All fields are cheaply `Clone`-able (every one
+/// is an `Arc` or a plain sender) so a background task can own a copy that
+/// outlives the `&Vfs` call that spawned it — required since `tokio::spawn`
+/// demands `'static`.
+///
+/// Cheaply `Clone` on purpose: `arm`/`retry_pending` each hand a clone to a
+/// spawned task rather than threading `Arc<Self>` through, which would force
+/// every call site to already hold one.
+#[derive(Clone)]
+pub struct WriteBackQueue {
+    client: Arc<cloudreve_api::Client>,
+    tree: Arc<crate::tree::VfsTree>,
+    drafts: Arc<TokioMutex<DraftStore>>,
+    /// The facade's block cache — the queue's only use of it is the purge on
+    /// upload success: the moment an upload replaces the file's remote
+    /// content, every block cached for that path (materialization-era bytes
+    /// under the pre-upload etag) is stale, and the etag-mismatch check in
+    /// `BlockCache::read_block` alone can't retire them — a fresh open can
+    /// still key the OLD etag while the server's listing lags behind the
+    /// upload (the same lag that makes D6's etag refresh best-effort).
+    cache: Arc<TokioMutex<crate::cache::BlockCache>>,
+    events: mpsc::UnboundedSender<crate::vfs::VfsEvent>,
+    /// Serializes actual upload attempts: the plan is explicit that the
+    /// queue drains sequentially, one upload at a time (YAGNI on
+    /// parallelism) — held for a whole draft's processing (conflict check
+    /// through final state), not just the upload call itself.
+    upload_gate: Arc<TokioMutex<()>>,
+    /// Debounce timers currently armed, keyed by remote path, so a reopen
+    /// within the window can cancel exactly the right one. A timer removes
+    /// its own entry the instant it fires (before doing any real work), so
+    /// a `cancel` racing in after that point correctly finds nothing and
+    /// reports it did not stop anything — see `cancel`'s doc.
+    timers: Arc<StdMutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    /// Outstanding work items: an armed-but-not-yet-fired timer, a
+    /// just-fired timer waiting for the `upload_gate`, and an upload
+    /// actually in flight all count as exactly one unit each, decremented
+    /// only when that item's whole cycle concludes (success, conflict, or
+    /// retries exhausted) or when a still-armed timer is cancelled by a
+    /// reopen. `wait_for_writeback_idle` polls this to zero.
+    busy: Arc<AtomicUsize>,
+    /// Test-overridable so the suite doesn't have to sit through the real
+    /// 2s debounce (or the 1s/5s retry backoff) on every run. Not
+    /// `#[cfg(test)]`: integration tests under `tests/` link this crate
+    /// compiled *without* `cfg(test)`, so a cfg-gated method would be
+    /// invisible to them. Kept honest instead by naming and by living only
+    /// here, never read by any non-test-only call site.
+    debounce: Arc<StdMutex<Duration>>,
+    retry_backoff: Arc<StdMutex<[Duration; 2]>>,
+    /// Remote paths for which `run`/`process` is CURRENTLY executing — the
+    /// queue's own ground truth for "is anything genuinely in flight for
+    /// this path right now". Since draining is sequential (`upload_gate`)
+    /// this holds at most one path in practice today, but is a set (not a
+    /// single slot) so it stays correct if that ever changes.
+    ///
+    /// Exists to tell a draft that merely LOOKS `Uploading` in `DraftStore`
+    /// (state left behind by a cycle that got cut short — see
+    /// `migrate_armed_timer`'s doc for how a rename can cause exactly that)
+    /// apart from one an active `run` call still genuinely owns — see
+    /// `retry_pending`.
+    ///
+    /// Phase 4 (this task), two fixes:
+    ///
+    /// - **Panic safety.** Membership here is now maintained by a small
+    ///   RAII guard (see `run`'s body) constructed right after insertion
+    ///   and held for the rest of `run`'s call to `process` — so a PANIC
+    ///   unwinding through it (a bug, a dependency panicking, anything)
+    ///   still removes the path on the way out, exactly like a normal
+    ///   return. Before this fix, cleanup was a plain statement AFTER
+    ///   `process().await` returned: a panic there skipped it entirely,
+    ///   and since `arm`/`enqueue_immediate` never `.await` the
+    ///   `JoinHandle` they spawn `run` on, the panic is caught (and only
+    ///   logged) by tokio's own per-task `catch_unwind`, never observed by
+    ///   anything that could clean up after it — the path stayed in this
+    ///   set forever, in this process.
+    /// - **Single-flight `retry_pending`.** Broadened from "genuinely
+    ///   executing right now" to "claimed" — `retry_pending` itself now
+    ///   inserts a selected `Pending` candidate here WHILE STILL holding
+    ///   the `drafts` lock, before ever releasing it (see that method's
+    ///   doc) — so two callers racing the same reconnect moment, which can
+    ///   only ever interleave around that SAME lock (a real
+    ///   `tokio::sync::Mutex`, exclusive across threads, not just
+    ///   cooperative yielding), can never both see the same candidate as
+    ///   unclaimed. `run`'s own insert at the top of its body (unchanged)
+    ///   is then a harmless no-op for a path `retry_pending` already
+    ///   claimed — `HashSet::insert` on an existing member is idempotent.
+    in_flight: Arc<StdMutex<HashSet<String>>>,
+    /// Test-only fault injection: when `true`, the NEXT `process` call
+    /// panics right before handing the draft's bytes to the uploader
+    /// (after the `Uploading` state transition has already landed, exactly
+    /// like a real panic partway through an upload attempt would). Not
+    /// `#[cfg(test)]` — same reasoning as `debounce`'s field doc. Exists to
+    /// pin the `in_flight` scope-guard fix above: `Vfs::
+    /// panic_next_upload_for_tests`/`tests/write_back.rs`'s panic test.
+    panic_next_upload: Arc<StdMutex<bool>>,
+}
+
+/// Scope guard for `WriteBackQueue::run` (phase 4, this task): removes
+/// `remote_path` from `in_flight` and decrements `busy` on drop —
+/// unconditionally, whether `run` returns normally or a panic unwinds
+/// through the `process` call it brackets. See `in_flight`'s field doc for
+/// the leak this closes and why a plain post-`.await` statement (the
+/// pre-this-task shape) cannot: a panic skips straight past it.
+struct RunGuard<'a> {
+    queue: &'a WriteBackQueue,
+    remote_path: &'a str,
+}
+
+impl Drop for RunGuard<'_> {
+    fn drop(&mut self) {
+        self.queue.in_flight.lock().unwrap().remove(self.remote_path);
+        self.queue.busy.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl WriteBackQueue {
+    pub fn new(
+        client: Arc<cloudreve_api::Client>,
+        tree: Arc<crate::tree::VfsTree>,
+        drafts: Arc<TokioMutex<DraftStore>>,
+        cache: Arc<TokioMutex<crate::cache::BlockCache>>,
+        events: mpsc::UnboundedSender<crate::vfs::VfsEvent>,
+    ) -> Self {
+        Self {
+            client,
+            tree,
+            drafts,
+            cache,
+            events,
+            upload_gate: Arc::new(TokioMutex::new(())),
+            timers: Arc::new(StdMutex::new(HashMap::new())),
+            busy: Arc::new(AtomicUsize::new(0)),
+            debounce: Arc::new(StdMutex::new(WRITEBACK_DEBOUNCE)),
+            retry_backoff: Arc::new(StdMutex::new(UPLOAD_RETRY_BACKOFF)),
+            in_flight: Arc::new(StdMutex::new(HashSet::new())),
+            panic_next_upload: Arc::new(StdMutex::new(false)),
+        }
+    }
+
+    /// Test-only: makes the very next `process` call panic right before it
+    /// would hand the draft's bytes to the uploader — see the
+    /// `panic_next_upload` field's doc.
+    pub fn panic_next_upload_for_tests(&self) {
+        *self.panic_next_upload.lock().unwrap() = true;
+    }
+
+    /// Test-only override for the debounce delay. See the `debounce`
+    /// field's doc for why this isn't `#[cfg(test)]`.
+    pub fn set_debounce_for_tests(&self, d: Duration) {
+        *self.debounce.lock().unwrap() = d;
+    }
+
+    /// Test-only override for the retry backoff. See the `debounce` field's
+    /// doc — same reasoning applies here.
+    pub fn set_retry_backoff_for_tests(&self, backoff: [Duration; 2]) {
+        *self.retry_backoff.lock().unwrap() = backoff;
+    }
+
+    /// Arms the debounce timer for a draft just parked `Pending` by
+    /// `Vfs::close`. Emits `UploadQueued` immediately — the draft IS queued
+    /// from this point on, even though the actual upload attempt waits out
+    /// the debounce first.
+    pub fn arm(&self, remote_path: String) {
+        self.busy.fetch_add(1, Ordering::SeqCst);
+        let _ = self
+            .events
+            .send(crate::vfs::VfsEvent::UploadQueued { remote_path: remote_path.clone() });
+
+        let debounce = *self.debounce.lock().unwrap();
+        let timers = self.timers.clone();
+        let this = self.clone();
+        let path_for_timer = remote_path.clone();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(debounce).await;
+            // Remove ourselves before doing any real work: once this has
+            // run, a racing `cancel` for the same path must find nothing
+            // and correctly report that it stopped nothing (see `cancel`).
+            timers.lock().unwrap().remove(&path_for_timer);
+            this.run(path_for_timer).await;
+        });
+        self.timers.lock().unwrap().insert(remote_path, handle);
+    }
+
+    /// Cancels a still-armed debounce timer for `remote_path` (a reopen
+    /// within the window). Returns whether a timer was actually stopped:
+    /// `false` means it had already fired (or was never armed) — the
+    /// caller (`Vfs::open`) must only flip the draft back to `Editing` when
+    /// this returns `true`, or it would silently un-park a draft whose
+    /// upload is already underway (or already exhausted its retries and is
+    /// legitimately parked `Pending` awaiting a manual retry).
+    pub fn cancel(&self, remote_path: &str) -> bool {
+        let handle = self.timers.lock().unwrap().remove(remote_path);
+        match handle {
+            Some(handle) => {
+                handle.abort();
+                self.busy.fetch_sub(1, Ordering::SeqCst);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Task 10: moves a still-armed debounce timer from `old_path` to
+    /// `new_path` (the draft itself was already relocated in `DraftStore` by
+    /// the caller — see `Vfs::rename`). Without this, a rename of a `Pending`
+    /// draft would leave its timer armed under the OLD path; once it fired,
+    /// `process` would find nothing at that path any more (the draft
+    /// genuinely lives elsewhere now) and silently give up — the queued
+    /// upload would vanish under EITHER name, not just move to the new one.
+    ///
+    /// A fresh debounce window starting over is an acceptable, harmless
+    /// side effect (the same "just keep editing" coalescing `arm`/`cancel`
+    /// already provide for a reopen) — restarting the clock never loses
+    /// data, it only delays the eventual upload a little. A no-op if
+    /// nothing was actually armed (draft still `Editing`, or already
+    /// `Uploading`): there is nothing to migrate in either case.
+    ///
+    /// This only ever handles a timer caught BEFORE it fires — `cancel`
+    /// (which this is built on) is exactly as honest about a timer that
+    /// already fired as it always has been, and that honesty is exactly
+    /// what leaves two known gaps here, both a genuine TOCTOU between
+    /// `Vfs::rename` and a timer firing at the same moment, not merely a
+    /// theoretical concern:
+    ///
+    /// (a) The timer fires and `run`/`process` reads `base_etag(old_path)`
+    ///     BEFORE `DraftStore::rename` lands: `cancel` above already found
+    ///     nothing (the timer removed itself from `timers` the instant it
+    ///     fired, before doing any work — see `cancel`'s doc), so this is a
+    ///     no-op and no new timer is armed for `new_path`. `process` itself
+    ///     then finds the draft gone from `old_path` and gives up
+    ///     ("draft vanished — nothing to do"). The entry re-appears at
+    ///     `new_path` still `Pending` (rename never touches the state
+    ///     field) with no timer watching it — recoverable through
+    ///     `retry_pending` exactly like any other `Pending` draft, since
+    ///     that path never depends on a timer at all.
+    /// (b) The timer fires and `process` gets far enough to flip the draft
+    ///     to `Uploading` (still under `old_path`) before `DraftStore::rename`
+    ///     runs: the rename then relocates the (now `Uploading`) entry to
+    ///     `new_path` out from under `process`, whose own `data_path`
+    ///     lookup at `old_path` fails ("draft vanished mid-flight") and
+    ///     returns WITHOUT ever resetting the state — the entry is left
+    ///     sitting at `new_path` marked `Uploading` forever, in this
+    ///     process, with nothing left running for it. `retry_pending`'s
+    ///     stranded-`Uploading` recovery (see its own doc) is exactly the
+    ///     fix for this case: it is what makes (b) recoverable without a
+    ///     full app restart.
+    pub fn migrate_armed_timer(&self, old_path: &str, new_path: String) {
+        if self.cancel(old_path) {
+            // Closes out the OLD path's cycle (see `VfsEvent`'s
+            // state-machine doc): the timer really was still armed, so it
+            // migrates rather than vanishing — `arm` below immediately opens
+            // a fresh cycle under `new_path` with its own `UploadQueued`.
+            let _ = self.events.send(crate::vfs::VfsEvent::UploadRenamed {
+                from: old_path.to_string(),
+                to: new_path.clone(),
+            });
+            self.arm(new_path);
+        }
+    }
+
+    /// Re-arms every draft still `Pending` for immediate upload, bypassing
+    /// the debounce entirely. Returns how many were queued.
+    ///
+    /// Also recovers a draft found `Uploading` that `in_flight` proves
+    /// nothing is genuinely processing any more — a STRANDED cycle, not one
+    /// actually in progress (see `migrate_armed_timer`'s doc, case (b), for
+    /// how a rename racing a firing debounce timer produces exactly this).
+    /// Before this recovery existed, a stranded `Uploading` draft was
+    /// invisible to this method (it only ever looked at `Pending`) and sat
+    /// stuck until the next full app restart, since only `DraftStore::open`
+    /// demotes `Uploading` back to `Pending`. Demoting it here first makes
+    /// the SAME hook phase 4 wires to reconnect (this method) able to
+    /// recover it too, without waiting for a restart. A draft genuinely
+    /// still being processed by THIS queue (present in `in_flight`) is left
+    /// alone — re-enqueueing it would race the upload already in flight for
+    /// it.
+    ///
+    /// Phase 4 (this task): single-flight against ITSELF. Two callers
+    /// racing the same reconnect moment (e.g. overlapping "back online"
+    /// notifications) used to both read the SAME `Pending` draft as a
+    /// fresh, unclaimed candidate — nothing marked it as spoken for until
+    /// its eventual `run()` call reached `process`'s `Uploading` state
+    /// transition, well after both callers had already returned — so both
+    /// enqueued it, producing two independent, overlapping upload attempts
+    /// for the same draft (serialized by `upload_gate`, not deduplicated by
+    /// it). The fix: a selected `Pending` candidate is inserted into
+    /// `in_flight` HERE, still holding the `drafts` lock — see that
+    /// field's doc for why two callers can never both observe the same
+    /// candidate as unclaimed once this holds, whether they overlap via
+    /// true multi-thread parallelism or single-task cooperative
+    /// interleaving (`tokio::join!` on this exact method is both, depending
+    /// on the runtime — the `drafts` lock is what makes either case safe).
+    pub async fn retry_pending(&self) -> usize {
+        let candidates: Vec<String> = {
+            let mut drafts = self.drafts.lock().await;
+            let mut in_flight = self.in_flight.lock().unwrap();
+            let mut candidates = Vec::new();
+            for path in drafts.pending() {
+                if in_flight.contains(&path) {
+                    // Already genuinely running, OR already claimed by
+                    // this exact loop for a concurrent caller that got
+                    // here first — either way, not ours to re-enqueue.
+                    continue;
+                }
+                match drafts.state(&path) {
+                    Some(DraftState::Pending) => {
+                        in_flight.insert(path.clone());
+                        candidates.push(path);
+                    }
+                    Some(DraftState::Uploading) => {
+                        match drafts.set_state(&path, DraftState::Pending) {
+                            Ok(()) => {
+                                in_flight.insert(path.clone());
+                                candidates.push(path);
+                            }
+                            Err(err) => tracing::warn!(
+                                remote_path = %path,
+                                %err,
+                                "writeback: failed to demote a stranded Uploading draft"
+                            ),
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            candidates
+        };
+        self.enqueue_immediate(candidates)
+    }
+
+    /// Queues each of `paths` for immediate upload, bypassing the debounce
+    /// entirely — the shared tail of `retry_pending` (phase 4's reconnect
+    /// hook) and `Vfs::new`'s startup re-enqueue (Task 9: a draft still
+    /// `Pending` when the app last quit must not wait for anyone to notice
+    /// and call `retry_pending_uploads` by hand). Takes plain paths, not a
+    /// `DraftStore` lock, so `Vfs::new` can call it with paths read off the
+    /// just-opened store BEFORE that store is even wrapped in its `Arc<Mutex>`
+    /// — no lock, no await, needed at that call site.
+    pub(crate) fn enqueue_immediate(&self, paths: Vec<String>) -> usize {
+        for path in &paths {
+            self.busy.fetch_add(1, Ordering::SeqCst);
+            let _ = self
+                .events
+                .send(crate::vfs::VfsEvent::UploadQueued { remote_path: path.clone() });
+            let this = self.clone();
+            let path = path.clone();
+            tokio::spawn(async move { this.run(path).await });
+        }
+        paths.len()
+    }
+
+    /// Resolves once nothing is armed, queued, or uploading. Polling rather
+    /// than a `Notify` on purpose: the busy count changes from several
+    /// independent places (arm, cancel, run's completion), and a short poll
+    /// is far simpler to get race-free than threading a condvar-style wake
+    /// through all of them for a method only tests and shutdown call.
+    pub async fn wait_idle(&self) {
+        while self.busy.load(Ordering::SeqCst) > 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Runs one draft's whole processing cycle behind `upload_gate`
+    /// (sequential draining) and accounts for it in `busy` regardless of
+    /// outcome — including a PANIC unwinding through `process` (phase 4,
+    /// this task): `RunGuard` below is constructed right after `in_flight`
+    /// registration and dropped either at the end of this function's normal
+    /// return OR while unwinding, so both cleanup steps it performs
+    /// (removing `remote_path` from `in_flight`, decrementing `busy`)
+    /// happen exactly once either way. Before this fix both were plain
+    /// statements AFTER `process().await`, skipped entirely by a panic —
+    /// see `in_flight`'s field doc for the full consequence.
+    async fn run(&self, remote_path: String) {
+        let _gate = self.upload_gate.lock().await;
+        self.in_flight.lock().unwrap().insert(remote_path.clone());
+        let _guard = RunGuard { queue: self, remote_path: &remote_path };
+        self.process(&remote_path).await;
+    }
+
+    /// D5 (conflict check) + upload + D6 (success promotion) / retry, for
+    /// one draft. Never propagates an error: every failure mode here ends
+    /// in a well-defined draft state and an event, not a panic or a
+    /// silently dropped future.
+    async fn process(&self, remote_path: &str) {
+        let Some(base_etag) = self.drafts.lock().await.base_etag(remote_path) else {
+            return; // draft vanished (e.g. removed concurrently) — nothing to do.
+        };
+
+        // D5: only a draft with a remote counterpart can conflict with
+        // anything. A brand-new file's `base_etag` is empty by construction
+        // (see `Vfs::create`) and must never run this check.
+        let mut conflict_copy: Option<String> = None;
+        if !base_etag.is_empty() {
+            match self.tree.refresh_etag(remote_path).await {
+                Ok(Some(current)) if current != base_etag => {
+                    conflict_copy = Some(conflict_copy_path(remote_path));
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        remote_path,
+                        %err,
+                        "writeback: conflict check failed, uploading in place anyway"
+                    );
+                }
+            }
+        }
+
+        let (upload_uri, overwrite, previous_version) = match &conflict_copy {
+            Some(conflict_path) => (conflict_path.clone(), false, String::new()),
+            None => (remote_path.to_string(), !base_etag.is_empty(), base_etag.clone()),
+        };
+
+        if let Err(err) =
+            self.drafts.lock().await.set_state(remote_path, DraftState::Uploading)
+        {
+            tracing::warn!(remote_path, %err, "writeback: failed to mark draft Uploading");
+        }
+
+        // `snapshot_seq` is captured in the same lock hold as the size the
+        // uploader will declare: any write acknowledged after this point may
+        // or may not make it into the bytes the uploader reads off disk, so
+        // the success handler below treats "seq changed since the snapshot"
+        // as "the draft must survive and re-upload" — conservatively
+        // re-uploading a write that happened to land in time, never losing
+        // one that didn't.
+        let (data_path, size, mtime, snapshot_seq) = {
+            let drafts = self.drafts.lock().await;
+            let Some(data_path) = drafts.data_path(remote_path) else {
+                return; // draft vanished mid-flight.
+            };
+            (
+                data_path,
+                drafts.size(remote_path).unwrap_or(0),
+                drafts.mtime_unix(remote_path),
+                drafts.write_seq(remote_path).unwrap_or(0),
+            )
+        };
+
+        let params = UploadParams {
+            local_path: data_path,
+            remote_uri: upload_uri.clone(),
+            file_size: size,
+            mime_type: None,
+            last_modified: mtime.map(|secs| secs.saturating_mul(1000)),
+            overwrite,
+            previous_version,
+            task_id: format!("vfs-writeback-{remote_path}"),
+            drive_id: "vfs".to_string(),
+        };
+
+        // Test-only fault injection (phase 4, this task) — see
+        // `panic_next_upload`'s field doc. Deliberately placed here: the
+        // `Uploading` state transition above has already landed, exactly
+        // like a real panic mid-upload would leave the draft.
+        {
+            let mut panic_flag = self.panic_next_upload.lock().unwrap();
+            if *panic_flag {
+                *panic_flag = false;
+                drop(panic_flag);
+                panic!(
+                    "writeback: test-injected panic during upload for {remote_path} \
+                     (see panic_next_upload_for_tests)"
+                );
+            }
+        }
+
+        let backoff = *self.retry_backoff.lock().unwrap();
+        let uploader =
+            Uploader::new(self.client.clone(), Arc::new(NoSessionStore), UploaderConfig::default());
+
+        // Cycle B (phase-2 debt burn-down): a conflict copy always uploads
+        // with `overwrite=false` (it's assumed to be brand new), so if a
+        // SECOND conflicting edit lands on the SAME file on the SAME day,
+        // its deterministic name collides with the first copy's — the
+        // server refuses with `ObjectExisted`. Only a conflict-copy upload
+        // gets the uniqueness search below; a plain (non-conflict) upload's
+        // `ObjectExisted` goes through R3's adaptive-adoption path instead
+        // (phase 4 task 3, routed from the task 2 re-review) — see
+        // `upload_plain_with_adoption`'s doc.
+        let (last_err, final_uri, terminal) = if conflict_copy.is_some() {
+            let (uri, err) =
+                upload_conflict_copy(&uploader, params, upload_uri.clone(), backoff).await;
+            (err, uri, false)
+        } else {
+            let (err, terminal) =
+                upload_plain_with_adoption(self, remote_path, params, backoff, &uploader).await;
+            (err, upload_uri.clone(), terminal)
+        };
+        // The conflict copy may have been retargeted to a uniqueness-
+        // suffixed name above — the rest of this function (events, tree
+        // invalidation) must refer to wherever it actually landed, not the
+        // deterministic name first guessed.
+        let conflict_copy = conflict_copy.map(|_| final_uri);
+
+        match last_err {
+            None => match conflict_copy {
+                Some(conflict_path) => {
+                    // The original is untouched by design (D5): only
+                    // invalidate both paths so a subsequent lookup sees the
+                    // new copy and refetches the original's now-known-
+                    // divergent state, and drop the draft — its content is
+                    // safe under the copy. UNLESS the draft was written
+                    // again while this upload was in flight: then only the
+                    // snapshot is safe under the copy, and the draft (with
+                    // its acknowledged newer bytes) must survive and re-arm
+                    // — see `settle_uploaded_draft`.
+                    self.tree.invalidate_path(&conflict_path).await;
+                    self.tree.invalidate_path(remote_path).await;
+                    let rearm = self.settle_uploaded_draft(remote_path, snapshot_seq, None).await;
+                    let _ = self.events.send(crate::vfs::VfsEvent::ConflictSaved {
+                        original: remote_path.to_string(),
+                        conflict_copy: conflict_path,
+                    });
+                    if rearm {
+                        self.arm(remote_path.to_string());
+                    }
+                }
+                None => {
+                    // D6: record the new etag (best-effort — a listing that
+                    // doesn't yet reflect the upload just yields an empty
+                    // string), purge the file's now-stale block-cache entry
+                    // so every future read refetches rather than serving
+                    // pre-upload content (the etag-mismatch check alone
+                    // can't retire blocks while the listing still reports
+                    // the old etag), and settle the draft: removed if
+                    // untouched since the upload's snapshot, kept and
+                    // re-armed if written again mid-flight.
+                    let new_etag =
+                        self.tree.refresh_etag(remote_path).await.ok().flatten().unwrap_or_default();
+                    if let Err(err) = self.cache.lock().await.purge(remote_path) {
+                        tracing::warn!(
+                            remote_path,
+                            %err,
+                            "writeback: failed to purge stale blocks after upload"
+                        );
+                    }
+                    let rearm = self
+                        .settle_uploaded_draft(remote_path, snapshot_seq, Some(&new_etag))
+                        .await;
+                    let _ = self.events.send(crate::vfs::VfsEvent::UploadSucceeded {
+                        remote_path: remote_path.to_string(),
+                        new_etag,
+                    });
+                    if rearm {
+                        self.arm(remote_path.to_string());
+                    }
+                }
+            },
+            Some(err) => {
+                if let Err(e) =
+                    self.drafts.lock().await.set_state(remote_path, DraftState::Pending)
+                {
+                    tracing::warn!(remote_path, %e, "writeback: failed to park draft back to Pending");
+                }
+                // `terminal` (phase 4 task 3, R3): `true` only for the ONE
+                // fallback case `upload_plain_with_adoption` itself
+                // documents — adoption was unsound because the uri
+                // colliding with a 40004 is a directory. The draft is
+                // STILL parked `Pending` either way (see `VfsEvent`'s own
+                // doc: `will_retry` describes the DRAFT's outlook, never
+                // whether this terminal event itself has a successor) —
+                // only the informational flag differs, so a caller
+                // surfacing this to a human knows not to expect an
+                // automatic retry to ever succeed here without
+                // intervention (e.g. the directory being renamed away).
+                let _ = self.events.send(crate::vfs::VfsEvent::UploadFailed {
+                    remote_path: remote_path.to_string(),
+                    error: err.to_string(),
+                    will_retry: !terminal,
+                });
+            }
+        }
+    }
+
+    /// Decides what happens to a draft whose upload just SUCCEEDED, by
+    /// comparing its current `write_seq` against the one captured when the
+    /// upload snapshotted the file:
+    ///
+    /// - Unchanged (or the draft is gone — removed concurrently by e.g.
+    ///   `unlink`/`rename`): the upload carried everything ever
+    ///   acknowledged, so the draft is removed outright — the pre-fix
+    ///   behavior, now conditional. Returns `false`.
+    /// - Changed: bytes were acknowledged AFTER the snapshot, and removing
+    ///   the draft would delete them unrecoverably (spec §5, "never lose a
+    ///   byte"). The draft survives, parked `Pending`, and the caller must
+    ///   re-`arm` it (return `true`) so the newer bytes upload through the
+    ///   normal machinery. `Pending` (not `Editing`) regardless of whether
+    ///   a handle is still open: `arm`'s debounce timer is what re-uploads
+    ///   it, and the existing open/close discipline composes — a still-open
+    ///   handle's eventual `close` finds `Pending` and correctly does not
+    ///   double-arm, while a reopen inside the window cancels the timer and
+    ///   flips it back to `Editing` exactly like any other pending draft.
+    ///
+    /// For an in-place upload (`landed_etag` is `Some`), a surviving draft
+    /// is also rebased onto the new etag when one is known — the server now
+    /// holds this draft's own snapshot, so the next conflict check must
+    /// compare against it, not the pre-upload etag. An empty/unknown etag
+    /// (best-effort refresh came back blank) keeps the old base: the next
+    /// cycle then at worst degrades to a conflict copy — conservative,
+    /// never lossy. A conflict-copy upload (`landed_etag` is `None`) never
+    /// rebases: the original's remote etag genuinely still differs, and the
+    /// next cycle detecting the same conflict again (another copy) is the
+    /// honest outcome.
+    async fn settle_uploaded_draft(
+        &self,
+        remote_path: &str,
+        snapshot_seq: u64,
+        landed_etag: Option<&str>,
+    ) -> bool {
+        let mut drafts = self.drafts.lock().await;
+        match drafts.write_seq(remote_path) {
+            Some(current_seq) if current_seq != snapshot_seq => {
+                if let Some(etag) = landed_etag {
+                    if !etag.is_empty() {
+                        if let Err(err) = drafts.set_base_etag(remote_path, etag) {
+                            tracing::warn!(
+                                remote_path,
+                                %err,
+                                "writeback: failed to rebase a mid-flight-written draft"
+                            );
+                        }
+                    }
+                }
+                if let Err(err) = drafts.set_state(remote_path, DraftState::Pending) {
+                    tracing::warn!(
+                        remote_path,
+                        %err,
+                        "writeback: failed to park a mid-flight-written draft"
+                    );
+                }
+                true
+            }
+            _ => {
+                let _ = drafts.remove(remote_path);
+                false
+            }
+        }
+    }
+}
+
+/// Splits a leaf filename into `(stem, ".ext")` — `ext` includes the leading
+/// dot and is empty for an extension-less name (or one that's ALL
+/// extension, e.g. `.gitignore`, treated as having no stem-visible
+/// extension). Shared by `conflict_copy_path` and `append_uniqueness_suffix`
+/// so both insert their text in front of the extension the same way.
+fn split_stem_ext(filename: &str) -> (&str, String) {
+    match filename.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s, format!(".{e}")),
+        _ => (filename, String::new()),
+    }
+}
+
+/// D5/D-const conflict-copy name: `"{stem} (conflict {YYYY-MM-DD}){.ext}"`,
+/// applied to the leaf of `remote_path` only — the directory is unchanged.
+fn conflict_copy_path(remote_path: &str) -> String {
+    let (dir, filename) = remote_path.rsplit_once('/').unwrap_or(("", remote_path));
+    let date = chrono::Utc::now().format("%Y-%m-%d");
+    let (stem, ext) = split_stem_ext(filename);
+    let conflict_name = format!("{stem} (conflict {date}){ext}");
+    if dir.is_empty() {
+        conflict_name
+    } else {
+        format!("{dir}/{conflict_name}")
+    }
+}
+
+/// Appends a uniqueness suffix (` 2`, ` 3`, …) before `path`'s extension —
+/// cycle B's answer to a SECOND same-day conflict colliding with the first
+/// one's deterministic `conflict_copy_path` name. `n` is the 1-based
+/// occurrence number (`n == 2` produces the first disambiguated name, since
+/// the bare `conflict_copy_path` result is implicitly occurrence 1).
+fn append_uniqueness_suffix(path: &str, n: u32) -> String {
+    let (dir, filename) = path.rsplit_once('/').unwrap_or(("", path));
+    let (stem, ext) = split_stem_ext(filename);
+    let named = format!("{stem} {n}{ext}");
+    if dir.is_empty() {
+        named
+    } else {
+        format!("{dir}/{named}")
+    }
+}
+
+/// Total candidate names tried (the deterministic one plus this many
+/// suffixed alternates) before `upload_conflict_copy` gives up. Past this,
+/// something is very wrong — a bug causing the search to never converge, or
+/// genuinely 100+ conflicting edits landing on the same file in one day —
+/// and refusing outright beats looping forever or (worse) falling back to
+/// silently overwriting a name this draft never actually touched.
+const MAX_CONFLICT_NAME_ATTEMPTS: u32 = 100;
+
+/// Whether `err`'s cause chain is Cloudreve's `ObjectExisted` (40004) API
+/// error — the server's answer to an `overwrite=false` upload targeting a
+/// uri that already exists. Same detection idiom as
+/// `cloudreve-sync`'s upload task for the identical code.
+fn is_object_existed_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<cloudreve_api::error::ApiError>(),
+            Some(cloudreve_api::error::ApiError::ApiError { code, .. })
+                if *code == cloudreve_api::error::ErrorCode::ObjectExisted as i32
+        )
+    })
+}
+
+/// R3 (phase 4 task 3, routed from the task 2 re-review): uploads a PLAIN
+/// (non-conflict-copy) draft with the ordinary transient-retry loop, plus
+/// ONE adaptive escalation if the final attempt is refused with
+/// Cloudreve's `ObjectExisted` (40004). Before this existed, ANY path that
+/// reached "a plain upload runs `overwrite=false` (or a stale
+/// `overwrite=true, previous_version=<etag>`) against a uri that already
+/// exists" retried the IDENTICAL request forever, `UploadFailed{will_retry:
+/// true}`-parking without end — R1 and R2 closed the two doors into that
+/// shape their own bridges cover (a drafted rename onto an existing name),
+/// but a THIRD, residual door stays open regardless: the destination gets
+/// created remotely by someone else inside the listing-TTL window between
+/// `Vfs::create`'s own EEXIST check and this draft's eventual, decoupled
+/// upload. This closes the whole CLASS, not just the two known doors into
+/// it.
+///
+/// Controller ruling (routed from the task 2 review): prefer landing the
+/// user's bytes over a bare terminal failure. On a 40004, this resolves
+/// what is ACTUALLY at `remote_path` right now
+/// (`VfsTree::refresh_attrs`) and:
+/// - if it's an ordinary FILE, adopts its current etag (persisted via
+///   `queue`'s own `DraftStore` — a caller-visible rebase, not just a
+///   local retry parameter) and retries ONCE more as an ordinary
+///   overwrite-in-place (`overwrite=true, previous_version=<adopted
+///   etag>`) — the SAME D5 conflict machinery an edit of an
+///   already-existing file always goes through from here on (a remote
+///   change since adoption correctly becomes a conflict copy on the NEXT
+///   cycle, not another 40004 loop).
+/// - if it's a DIRECTORY, adoption is unsound (this facade never deletes a
+///   directory to make room for a file — same reasoning `Vfs::rename`'s
+///   own directory-destination guards give): returns `terminal = true`,
+///   the ONE case the controller ruling accepts a bare terminal failure
+///   for.
+/// - if the destination has already vanished again by the time this
+///   resolves, or the resolve itself fails: falls through to an ORDINARY
+///   (non-terminal) failure — the draft stays `Pending`, retried honestly
+///   on the next cycle rather than this call guessing further.
+///
+/// Adoption is attempted AT MOST ONCE per call: if the adopted retry
+/// itself ALSO fails (even with another 40004), that failure is returned
+/// as an ordinary non-terminal one rather than adopting again — this
+/// closes the loop instead of chasing a moving target indefinitely within
+/// one call. A genuinely still-racing destination is still recoverable: it
+/// just takes the ordinary next debounce/retry cycle, which re-resolves
+/// fresh rather than reusing a stale guess.
+///
+/// Returns `(error, terminal)` — `None` error means success.
+async fn upload_plain_with_adoption(
+    queue: &WriteBackQueue,
+    remote_path: &str,
+    mut params: UploadParams,
+    backoff: [Duration; 2],
+    uploader: &Uploader,
+) -> (Option<anyhow::Error>, bool) {
+    let err = match retry_plain_upload(uploader, &params, backoff).await {
+        Ok(()) => return (None, false),
+        Err(err) => err,
+    };
+
+    if !is_object_existed_error(&err) {
+        return (Some(err), false);
+    }
+
+    match queue.tree.refresh_attrs(remote_path).await {
+        Ok(Some(dest_attr)) if dest_attr.is_dir => {
+            tracing::warn!(
+                remote_path,
+                "writeback: 40004 destination is a directory — adoption is unsound, \
+                 terminal failure"
+            );
+            (Some(err), true)
+        }
+        Ok(Some(dest_attr)) => {
+            if let Err(e) = queue.drafts.lock().await.set_base_etag(remote_path, &dest_attr.etag) {
+                tracing::warn!(remote_path, %e, "writeback: failed to persist the adopted etag");
+            }
+            params.overwrite = true;
+            params.previous_version = dest_attr.etag;
+            match retry_plain_upload(uploader, &params, backoff).await {
+                Ok(()) => (None, false),
+                Err(second_err) => (Some(second_err), false),
+            }
+        }
+        Ok(None) => (Some(err), false), // vanished remotely again — ordinary retry next cycle
+        Err(resolve_err) => {
+            tracing::warn!(
+                remote_path,
+                %resolve_err,
+                "writeback: failed to resolve the 40004 destination for adoption"
+            );
+            (Some(err), false)
+        }
+    }
+}
+
+/// Shared plain (no uniqueness search) transient-retry loop: up to
+/// `UPLOAD_RETRIES` attempts of the exact same request, sleeping `backoff`
+/// between failures. Used both by `upload_plain_with_adoption`'s original
+/// attempt and its one adopted retry.
+async fn retry_plain_upload(
+    uploader: &Uploader,
+    params: &UploadParams,
+    backoff: [Duration; 2],
+) -> Result<()> {
+    let mut last_err = None;
+    for attempt in 0..UPLOAD_RETRIES {
+        match uploader.upload(params.clone(), NoOpProgress).await {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                last_err = Some(err);
+                if attempt + 1 < UPLOAD_RETRIES {
+                    tokio::time::sleep(backoff[attempt as usize]).await;
+                }
+            }
+        }
+    }
+    Err(last_err.expect("the loop always records an error before falling through"))
+}
+
+/// Uploads a conflict copy, searching for a free name if the deterministic
+/// same-day name (`base_uri`, already reflected in `params.remote_uri`) is
+/// already taken by an EARLIER conflict copy uploaded today. Returns the uri
+/// the upload actually landed under (== `base_uri` unless a retarget
+/// happened) and, on failure, the last error encountered.
+///
+/// REACTIVE (retry-on-`ObjectExisted`) rather than a proactive listing probe
+/// on purpose: a probe-then-upload has its own TOCTOU window — another
+/// writer (or another device syncing the same drive) could still land the
+/// same name in the gap between the probe and this upload — while reacting
+/// to the server's own authoritative "no, that name is taken" is atomic by
+/// construction. It also reuses the exact error classification
+/// `cloudreve-sync`'s upload task already relies on for the same code,
+/// rather than inventing a second, listing-based signal for what is really
+/// the same condition. A collision is NOT treated as a transient failure:
+/// retrying the same name would only reproduce it, so the transient-retry
+/// budget (`UPLOAD_RETRIES`/`backoff`) is spent per CANDIDATE NAME, not
+/// shared across the whole search.
+async fn upload_conflict_copy(
+    uploader: &Uploader,
+    mut params: UploadParams,
+    base_uri: String,
+    backoff: [Duration; 2],
+) -> (String, Option<anyhow::Error>) {
+    for n in 1..=MAX_CONFLICT_NAME_ATTEMPTS {
+        let candidate = if n == 1 { base_uri.clone() } else { append_uniqueness_suffix(&base_uri, n) };
+        params.remote_uri = candidate.clone();
+
+        let mut last_err = None;
+        for attempt in 0..UPLOAD_RETRIES {
+            match uploader.upload(params.clone(), NoOpProgress).await {
+                Ok(()) => return (candidate, None),
+                Err(err) => {
+                    let collided = is_object_existed_error(&err);
+                    last_err = Some(err);
+                    if collided {
+                        break; // not transient — try the next candidate name instead
+                    }
+                    if attempt + 1 < UPLOAD_RETRIES {
+                        tokio::time::sleep(backoff[attempt as usize]).await;
+                    }
+                }
+            }
+        }
+        let err = last_err.expect("the inner loop always records an error before falling through");
+        if !is_object_existed_error(&err) {
+            return (candidate, Some(err));
+        }
+        // else: this name is taken — loop around to the next suffix.
+    }
+    (
+        base_uri.clone(),
+        Some(anyhow::anyhow!(
+            "writeback: exhausted {MAX_CONFLICT_NAME_ATTEMPTS} conflict-name candidates for \
+             {base_uri} — refusing to keep searching indefinitely or silently overwrite an \
+             unrelated file"
+        )),
+    )
+}
+
+/// Directory name for a remote path: first 16 hex chars (8 bytes) of
+/// `sha256(remote_path)`. A filesystem shard key, not a security boundary —
+/// same rationale, and same truncation, as `cache.rs`'s `hash_key`.
+fn hash16(remote_path: &str) -> String {
+    let digest = Sha256::digest(remote_path.as_bytes());
+    digest[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn write_meta(root: &Path, hash: &str, entry: &Entry) -> Result<()> {
+    let meta = DraftMeta {
+        remote_path: entry.remote_path.clone(),
+        base_etag: entry.base_etag.clone(),
+        size: entry.size,
+        state: entry.state.clone(),
+        last_write_unix: entry.last_write_unix,
+    };
+    let json = serde_json::to_vec(&meta)?;
+    let dir = root.join(hash);
+    let path = dir.join("draft.json");
+    // Write-temp-then-rename: same atomicity idiom as cache.rs's
+    // `write_meta` — a crash between the write and the rename leaves
+    // either the previous draft.json or a stray `.tmp` file, never a torn
+    // one.
+    let tmp_path = dir.join("draft.json.tmp");
+    fs::write(&tmp_path, json)
+        .with_context(|| format!("failed to write {}", tmp_path.display()))?;
+    fs::rename(&tmp_path, &path).with_context(|| {
+        format!("failed to rename {} to {}", tmp_path.display(), path.display())
+    })
+}
+
+/// Moves `from` into `to` by renaming; if that fails (e.g. `from` sits on a
+/// different volume than `to` — not expected in practice, since the cache
+/// root and drafts root share a volume, but this must not crash if it ever
+/// happens), falls back to copy-then-delete.
+fn move_into(from: &Path, to: &Path) -> Result<()> {
+    if fs::rename(from, to).is_ok() {
+        return Ok(());
+    }
+    fs::copy(from, to)
+        .with_context(|| format!("failed to copy {} to {}", from.display(), to.display()))?;
+    fs::remove_file(from)
+        .with_context(|| format!("failed to remove {} after copying", from.display()))?;
+    Ok(())
+}
+
+/// Deletes a draft directory found unusable during `open()`'s scan.
+/// Best-effort: a failure to delete only logs, matching
+/// `cache.rs`'s `delete_orphaned_entry_dir`.
+fn delete_orphaned_dir(hash: &str, dir: &Path) {
+    if let Err(err) = fs::remove_dir_all(dir) {
+        tracing::warn!(hash = %hash, %err, "drafts: failed to delete an orphaned draft directory");
+    }
+}
+
+fn now_unix() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn a_write_reads_back_identically_at_its_offset() {
+        let dir = TempDir::new().unwrap();
+        let mut s = DraftStore::open(dir.path()).unwrap();
+        s.begin("docs/report.txt", "etag-1", DraftInit::Empty).unwrap();
+
+        let payload = b"hello draft world";
+        s.write("docs/report.txt", 100, payload).unwrap();
+
+        assert_eq!(s.size("docs/report.txt"), Some(100 + payload.len() as u64));
+        let back = s.read("docs/report.txt", 100, payload.len() as u32).unwrap();
+        assert_eq!(back.as_ref(), &payload[..]);
+
+        // The gap before the write must read back as zeros, not garbage.
+        let gap = s.read("docs/report.txt", 0, 100).unwrap();
+        assert_eq!(gap.as_ref(), &vec![0u8; 100][..]);
+
+        // A read reaching past the end is truncated to what's actually
+        // there, not padded or errored.
+        let tail = s.read("docs/report.txt", 100 + payload.len() as u64 - 3, 50).unwrap();
+        assert_eq!(tail.as_ref(), &payload[payload.len() - 3..]);
+    }
+
+    #[test]
+    fn truncate_extends_with_zeros_and_shrinks() {
+        let dir = TempDir::new().unwrap();
+        let mut s = DraftStore::open(dir.path()).unwrap();
+        s.begin("notes.md", "etag-1", DraftInit::Empty).unwrap();
+        s.write("notes.md", 0, b"abcdef").unwrap();
+        assert_eq!(s.size("notes.md"), Some(6));
+
+        s.truncate("notes.md", 20).unwrap();
+        assert_eq!(s.size("notes.md"), Some(20));
+        let extended = s.read("notes.md", 6, 14).unwrap();
+        assert_eq!(extended.as_ref(), &vec![0u8; 14][..], "extension must be zero-filled");
+        let head = s.read("notes.md", 0, 6).unwrap();
+        assert_eq!(head.as_ref(), b"abcdef", "original bytes must survive the extension");
+
+        s.truncate("notes.md", 3).unwrap();
+        assert_eq!(s.size("notes.md"), Some(3));
+        let shrunk = s.read("notes.md", 0, 100).unwrap();
+        assert_eq!(shrunk.as_ref(), b"abc", "shrink must discard the tail, keep the head");
+    }
+
+    #[test]
+    fn reopening_restores_sizes_and_states() {
+        let dir = TempDir::new().unwrap();
+        {
+            let mut s = DraftStore::open(dir.path()).unwrap();
+            s.begin("a.txt", "etag-a", DraftInit::Empty).unwrap();
+            s.write("a.txt", 0, b"twelve bytes").unwrap();
+
+            s.begin("b.txt", "etag-b", DraftInit::Empty).unwrap();
+            s.write("b.txt", 0, b"seven!!").unwrap();
+            s.set_state("b.txt", DraftState::Pending).unwrap();
+        }
+
+        // Simulates a process restart: a fresh `DraftStore` scanning the
+        // same root must see exactly what was persisted, nothing rebuilt
+        // from in-memory state.
+        let s = DraftStore::open(dir.path()).unwrap();
+        assert_eq!(s.size("a.txt"), Some(12));
+        assert_eq!(s.state("a.txt"), Some(DraftState::Editing));
+        assert_eq!(s.base_etag("a.txt"), Some("etag-a".to_string()));
+
+        assert_eq!(s.size("b.txt"), Some(7));
+        assert_eq!(s.state("b.txt"), Some(DraftState::Pending));
+    }
+
+    #[test]
+    fn remove_deletes_the_draft_directory() {
+        let dir = TempDir::new().unwrap();
+        let mut s = DraftStore::open(dir.path()).unwrap();
+        s.begin("gone.bin", "etag-1", DraftInit::Empty).unwrap();
+        let data_path = s.data_path("gone.bin").unwrap();
+        assert!(data_path.exists());
+        let entry_dir = data_path.parent().unwrap().to_path_buf();
+
+        s.remove("gone.bin").unwrap();
+
+        assert!(!entry_dir.exists(), "the whole draft directory must be gone");
+        assert_eq!(s.size("gone.bin"), None);
+        assert_eq!(s.state("gone.bin"), None);
+        assert_eq!(s.data_path("gone.bin"), None);
+    }
+
+    /// Task 10 carried obligation: `rename` is a destructive directory move
+    /// (the shard directory name is `sha256(remote_path)`, so a path change
+    /// always means a different shard) — data, metadata, and every accessor
+    /// must all agree on the NEW path afterwards, and the OLD directory must
+    /// be entirely gone, not just unreferenced.
+    #[test]
+    fn rename_moves_data_and_meta_to_the_new_shard_dir() {
+        let dir = TempDir::new().unwrap();
+        let mut s = DraftStore::open(dir.path()).unwrap();
+        s.begin("old/report.txt", "etag-1", DraftInit::Empty).unwrap();
+        s.write("old/report.txt", 0, b"payload bytes").unwrap();
+
+        let old_dir = s.data_path("old/report.txt").unwrap().parent().unwrap().to_path_buf();
+        assert!(old_dir.exists());
+
+        s.rename("old/report.txt", "new/renamed.txt", None).unwrap();
+
+        // This is a MOVE, not a copy: the old shard directory must not
+        // survive it at all.
+        assert!(!old_dir.exists(), "the old draft directory must not survive a rename");
+
+        // The store's own accessors must agree the old path resolves to
+        // nothing and the new one has everything.
+        assert_eq!(s.state("old/report.txt"), None, "the old path must no longer resolve");
+        assert_eq!(s.size("new/renamed.txt"), Some(b"payload bytes".len() as u64));
+        assert_eq!(s.base_etag("new/renamed.txt"), Some("etag-1".to_string()));
+        let back = s.read("new/renamed.txt", 0, 100).unwrap();
+        assert_eq!(back.as_ref(), b"payload bytes", "content must survive the rename intact");
+
+        // Different remote_path must land in a genuinely different shard —
+        // the whole reason this is a directory move rather than an in-place
+        // metadata edit.
+        let new_dir = s.data_path("new/renamed.txt").unwrap().parent().unwrap().to_path_buf();
+        assert_ne!(old_dir, new_dir, "renaming to a different path must move to a different shard");
+
+        // The persisted draft.json itself (not just the in-memory
+        // accessors) must carry the NEW remote_path — this is exactly what
+        // a mutation skipping the meta rewrite gets wrong: the directory
+        // moves, but the JSON payload inside it still says the OLD path.
+        let raw = std::fs::read(new_dir.join("draft.json")).unwrap();
+        let meta: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(
+            meta["remote_path"], "new/renamed.txt",
+            "draft.json on disk must be rewritten with the new remote_path, not just moved verbatim"
+        );
+    }
+
+    /// R2 (phase 4 task 3, routed from the task 2 re-review): the
+    /// drafted-source rename-onto-existing-destination bridge used to call
+    /// `DraftStore::rename` and THEN a separate `DraftStore::set_base_etag`
+    /// to adopt the destination's etag — two independent persisted
+    /// `write_meta`s with an `.await` between them at the `Vfs::rename`
+    /// call site, so a crash (or a cancelled RPC future) in that
+    /// micro-window could leave the migrated draft at `new_path` with an
+    /// EMPTY base etag on disk, which a restart would replay straight into
+    /// the doomed 40004 retry loop this whole bridge exists to avoid. The
+    /// fix folds the rebase into `rename` itself: a single `write_meta`
+    /// call persists BOTH the new path and the adopted etag together, so
+    /// there is no intermediate on-disk state where one landed without the
+    /// other. This test never reads back through the in-memory `DraftStore`
+    /// accessors (which would trivially reflect the fix even with two calls
+    /// racing) — it reads `draft.json` OFF DISK straight after the single
+    /// `rename` call, so it can only pass if that one call's own persist
+    /// already carries the adopted etag.
+    #[test]
+    fn rename_with_an_adopted_etag_persists_both_in_the_one_call() {
+        let dir = TempDir::new().unwrap();
+        let mut s = DraftStore::open(dir.path()).unwrap();
+        s.begin("new/never-uploaded.txt", "", DraftInit::Empty).unwrap();
+        s.write("new/never-uploaded.txt", 0, b"local only content").unwrap();
+
+        s.rename("new/never-uploaded.txt", "existing/target.txt", Some("dest-etag-7")).unwrap();
+
+        let new_dir = s.data_path("existing/target.txt").unwrap().parent().unwrap().to_path_buf();
+        let raw = std::fs::read(new_dir.join("draft.json")).unwrap();
+        let meta: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(
+            meta["remote_path"], "existing/target.txt",
+            "the single persisted draft.json must carry the new path"
+        );
+        assert_eq!(
+            meta["base_etag"], "dest-etag-7",
+            "the SAME persisted draft.json must ALSO carry the adopted etag — from the one \
+             rename call, not a later separate write this test never makes"
+        );
+
+        // The in-memory accessor must agree too — the fix is not just about
+        // what's on disk.
+        assert_eq!(s.base_etag("existing/target.txt"), Some("dest-etag-7".to_string()));
+    }
+
+    #[test]
+    fn an_uploading_draft_found_on_open_is_demoted_to_pending() {
+        let dir = TempDir::new().unwrap();
+        {
+            let mut s = DraftStore::open(dir.path()).unwrap();
+            s.begin("crash-me.txt", "etag-1", DraftInit::Empty).unwrap();
+            s.write("crash-me.txt", 0, b"in flight").unwrap();
+            s.set_state("crash-me.txt", DraftState::Uploading).unwrap();
+            // No `remove` / success path reached: simulates the process
+            // dying mid-upload, with `draft.json` still saying `Uploading`.
+        }
+
+        // A crash mid-upload never confirms whether the server actually
+        // received the bytes, so the draft must be retried rather than
+        // trusted as already handled: `open()` must demote it back to
+        // `Pending`, putting it back in the upload queue.
+        let s = DraftStore::open(dir.path()).unwrap();
+        assert_eq!(
+            s.state("crash-me.txt"),
+            Some(DraftState::Pending),
+            "a draft found Uploading after a restart must be demoted, never left/lost"
+        );
+        assert_eq!(s.pending(), vec!["crash-me.txt".to_string()]);
+    }
+}

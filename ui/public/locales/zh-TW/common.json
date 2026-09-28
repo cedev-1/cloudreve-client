@@ -13,6 +13,13 @@
     "finalSetupDescription": "選擇一個本機資料夾作為雲端硬碟的掛載位置。",
     "localPath": "本機路徑",
     "localDriveName": "掛載名稱",
+    "modeChoice": {
+      "title": "同步模式",
+      "mirror": "完整鏡像",
+      "mirrorHint": "所有檔案都會下載並保持本機同步。",
+      "onDemand": "按需同步",
+      "onDemandHint": "檔案僅在開啟時才會下載。開始前本機資料夾必須為空。"
+    },
     "localPathPlaceholder": "/Users/username/CloudDrive",
     "browse": "瀏覽",
     "selectFolder": "選擇資料夾",
@@ -59,7 +66,8 @@
     "conflictKeepRemote": "保留伺服器版本",
     "conflictKeepRemoteHint": "將覆寫本機檔案",
     "conflictKeepBoth": "兩者都保留",
-    "conflictKeepBothHint": "將重新命名本機副本"
+    "conflictKeepBothHint": "將重新命名本機副本",
+    "pendingUploads": "{{count}} 個待上傳檔案"
   },
   "settings": {
     "title": "設定",
@@ -119,6 +127,10 @@
       "eventPushLost": "即時事件推送中斷",
       "offline": "離線",
       "credentialExpired": "憑證已過期"
+    },
+    "driveMode": {
+      "mirror": "完整鏡像",
+      "onDemand": "按需同步"
     },
     "networkSettings": "網路",
     "heartbeatInterval": "心跳間隔",

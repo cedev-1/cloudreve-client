@@ -13,6 +13,13 @@
     "finalSetupDescription": "クラウドドライブをマウントするローカルフォルダを選択してください。",
     "localPath": "ローカルパス",
     "localDriveName": "マウント名",
+    "modeChoice": {
+      "title": "同期モード",
+      "mirror": "完全ミラー",
+      "mirrorHint": "すべてのファイルがダウンロードされ、ローカルで同期された状態が保たれます。",
+      "onDemand": "オンデマンド",
+      "onDemandHint": "ファイルは開いたときにのみダウンロードされます。開始するにはローカルフォルダが空である必要があります。"
+    },
     "localPathPlaceholder": "/Users/username/CloudDrive",
     "browse": "参照",
     "selectFolder": "フォルダを選択",
@@ -59,7 +66,8 @@
     "conflictKeepRemote": "サーバー版を保持",
     "conflictKeepRemoteHint": "ローカルファイルを上書きします",
     "conflictKeepBoth": "両方を保持",
-    "conflictKeepBothHint": "ローカルコピーの名前を変更します"
+    "conflictKeepBothHint": "ローカルコピーの名前を変更します",
+    "pendingUploads": "{{count}} 件のアップロードが保留中です"
   },
   "settings": {
     "title": "設定",
@@ -119,6 +127,10 @@
       "eventPushLost": "リアルタイムイベントプッシュが切断",
       "offline": "オフライン",
       "credentialExpired": "認証期限切れ"
+    },
+    "driveMode": {
+      "mirror": "完全ミラー",
+      "onDemand": "オンデマンド"
     },
     "networkSettings": "ネットワーク",
     "heartbeatInterval": "ハートビート間隔",

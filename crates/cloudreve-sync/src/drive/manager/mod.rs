@@ -6,7 +6,7 @@ pub use types::*;
 
 use crate::drive::commands::{ManagerCommand, MountCommand};
 use crate::drive::heartbeat::HeartbeatManager;
-use crate::drive::mounts::{Credentials, DriveConfig, Mount};
+use crate::drive::mounts::{Credentials, DriveConfig, DriveMode, Mount};
 use crate::{EventBroadcaster, SummaryNotifier};
 use crate::inventory::InventoryDb;
 use crate::tasks::TaskProgress;
@@ -193,7 +193,27 @@ impl DriveManager {
             config.sse_client_id = uuid::Uuid::new_v4().to_string();
         }
 
-        let mut write_guard = self.drives.write().await;
+        let mode = config.mode;
+
+        // Review F3: build AND `start()` the mount BEFORE taking
+        // `drives.write()`. On-demand `start()` now runs the phase-4 mount
+        // lifecycle (pre-clean rungs, escalation, the mount call itself) —
+        // north of 30s in the worst case — and holding the write lock
+        // across that starved every `drives.read()` path (status polling,
+        // `get_drive`, …), making the whole app appear hung while one drive
+        // is merely slow to (re)mount. Mirrors the pattern `resume_drive`
+        // already uses: do the heavy lifting on a standalone `Mount` with
+        // no lock held, then take a lock only for the final map mutation.
+        //
+        // No uniqueness check is being relaxed by moving the lock this
+        // late: the old code never checked for a colliding id either — it
+        // went straight to `insert`, which silently overwrites on a
+        // collision regardless of when the lock is taken. In practice a
+        // collision can't happen: the Tauri `add_drive` command always
+        // mints a fresh `Uuid::new_v4` for a new drive, and
+        // `DriveManager::load()`'s startup replay calls `add_drive`
+        // sequentially (one `.await` at a time, never concurrently) over
+        // ids that were each minted uniquely when originally added.
         let mut mount = Mount::new(
             config.clone(),
             self.inventory.clone(),
@@ -212,20 +232,37 @@ impl DriveManager {
             .spawn_remote_event_processor(mount_arc.clone())
             .await;
         mount_arc.spawn_props_refresh_task().await;
-        mount_arc.spawn_periodic_sync().await;
+        // D2: an on-demand drive has no fs watcher and no periodic full sync
+        // to catch up on — the periodic worker exists purely to paper over
+        // what those two would otherwise miss for a `FullMirror` drive.
+        if mode == DriveMode::FullMirror {
+            mount_arc.spawn_periodic_sync().await;
+        } else {
+            // D6: start folding this on-demand drive's VfsEvents into its
+            // counters/toasts right away — see `spawn_vfs_event_pump`'s doc
+            // for why this is the only worker never re-spawned on resume.
+            mount_arc.spawn_vfs_event_pump().await;
+        }
         let id = mount_arc.id.clone();
         let command_tx = mount_arc.command_tx.clone();
+
+        let mut write_guard = self.drives.write().await;
         write_guard.insert(id.clone(), mount_arc);
         drop(write_guard);
 
         // Start heartbeat monitoring if this is the first drive
         self.heartbeat_manager.start().await;
 
-        // Trigger an initial full sync so existing remote/local files are reconciled
-        if let Err(e) = command_tx.send(MountCommand::FullSync) {
-            tracing::warn!(target: "drive::manager", drive_id = %id, error = %e, "Failed to send initial FullSync command");
-        } else {
-            tracing::info!(target: "drive::manager", drive_id = %id, "Initial FullSync scheduled");
+        // Trigger an initial full sync so existing remote/local files are
+        // reconciled — skipped for on-demand (D2): there is no local mirror
+        // to reconcile, and `full_sync` itself refuses to run for this mode
+        // anyway (see its own unreachable guard).
+        if mode == DriveMode::FullMirror {
+            if let Err(e) = command_tx.send(MountCommand::FullSync) {
+                tracing::warn!(target: "drive::manager", drive_id = %id, error = %e, "Failed to send initial FullSync command");
+            } else {
+                tracing::info!(target: "drive::manager", drive_id = %id, "Initial FullSync scheduled");
+            }
         }
 
         Ok(id)
@@ -528,15 +565,31 @@ impl DriveManager {
 
         mount.resume().await;
 
-        // Restart background workers
-        let sync_path = mount.get_sync_path().await;
-        mount.start_fs_watcher_public(&sync_path).await?;
-        mount.spawn_remote_event_processor(mount.clone()).await;
-        mount.spawn_periodic_sync().await;
-        mount.spawn_props_refresh_task().await;
+        let mode = mount.get_config().await.mode;
+        match mode {
+            DriveMode::FullMirror => {
+                // Restart background workers
+                let sync_path = mount.get_sync_path().await;
+                mount.start_fs_watcher_public(&sync_path).await?;
+                mount.spawn_remote_event_processor(mount.clone()).await;
+                mount.spawn_periodic_sync().await;
+                mount.spawn_props_refresh_task().await;
 
-        // Trigger a full sync to catch up on missed changes
-        let _ = mount.command_tx.send(MountCommand::FullSync);
+                // Trigger a full sync to catch up on missed changes
+                let _ = mount.command_tx.send(MountCommand::FullSync);
+            }
+            DriveMode::OnDemand => {
+                // D5: remount instead of restarting a fs watcher; no
+                // periodic sync worker and no FullSync — same reasons as
+                // `add_drive`'s on-demand branch. The vfs event pump is
+                // NOT re-spawned here on purpose — see
+                // `spawn_vfs_event_pump`'s doc: `pause()` never stopped it,
+                // so it is still draining the same `Vfs`'s events right now.
+                mount.remount_on_demand().await?;
+                mount.spawn_remote_event_processor(mount.clone()).await;
+                mount.spawn_props_refresh_task().await;
+            }
+        }
 
         tracing::info!(target: "drive::manager", drive_id = %id, "Drive resumed");
         Ok(())
@@ -582,14 +635,35 @@ impl DriveManager {
         let mut drives = Vec::with_capacity(read_guard.len());
         let mut has_ever_synced = false;
         let mut paused_drives = Vec::new();
+        let mut pending_uploads = HashMap::new();
         for mount in read_guard.values() {
-            drives.push(mount.get_config().await);
-            if mount.get_status_flags().await.is_initial_sync_completed() {
+            let config = mount.get_config().await;
+            // D7: an on-demand drive never runs `FullSync`
+            // (`is_initial_sync_completed` can never flip true for it — see
+            // the guard in `mounts.rs`'s command processor), so gating on
+            // that flag would leave a drive that has been mounted and
+            // working the whole time misreported as "never synced" forever.
+            // Being mounted (`vfs` populated) IS this mode's "synced/idle":
+            // reads/writes go straight through the live volume, there is no
+            // separate reconciliation pass to have "completed".
+            let synced = if config.mode == DriveMode::OnDemand {
+                mount.vfs.lock().await.is_some()
+            } else {
+                mount.get_status_flags().await.is_initial_sync_completed()
+            };
+            if synced {
                 has_ever_synced = true;
+            }
+            if config.mode == DriveMode::OnDemand {
+                pending_uploads.insert(
+                    config.id.clone(),
+                    mount.vfs_pending_uploads.load(std::sync::atomic::Ordering::Relaxed),
+                );
             }
             if mount.is_paused() {
                 paused_drives.push(mount.id.clone());
             }
+            drives.push(config);
         }
 
         // Query recent tasks from inventory (filtered by drive_id if provided)
@@ -671,6 +745,7 @@ impl DriveManager {
             has_ever_synced,
             conflicts,
             paused_drives,
+            pending_uploads,
         })
     }
 
@@ -790,6 +865,7 @@ impl DriveManager {
                 user_id: config.user_id.clone(),
                 status,
                 capacity,
+                mode: config.mode,
             });
         }
 
@@ -885,7 +961,18 @@ impl DriveManager {
 #[cfg(test)]
 mod tests {
     use super::conflicted_copy_path;
+    use super::DriveManager;
+    use crate::drive::heartbeat::HeartbeatManager;
+    use crate::drive::mounts::{Credentials, DriveConfig, DriveMode, Mount};
+    use crate::drive::vfs_mode::MountTestHook;
+    use crate::inventory::InventoryDb;
+    use crate::{EventBroadcaster, SummaryNotifier};
+    use std::collections::HashMap;
     use std::path::Path;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::{mpsc, Mutex, RwLock};
 
     /// "Keep both" must produce a sibling file that keeps the original
     /// extension so the OS still opens it with the right application.
@@ -908,5 +995,196 @@ mod tests {
 
         assert!(name.starts_with("Makefile (conflicted copy "));
         assert!(!name.ends_with('.'), "no dangling dot");
+    }
+
+    // -----------------------------------------------------------------
+    // Review finding 3: pin `resume_drive`'s `OnDemand` arm against the
+    // REAL public entry point, not `Mount::remount_on_demand` called
+    // directly — the exact "a test reaching into an internal while prod
+    // goes through a wrapper" hazard this repo has been burned by before.
+    //
+    // `DriveManager::new` is unsafe to call from a test as-is: it opens
+    // the REAL `~/.cloudreve` config dir and a REAL, shared inventory DB
+    // on the machine running the suite. There is no injectable
+    // constructor, and adding a public one for this alone felt like more
+    // production surface than the fix warranted. Because every field
+    // here is private or `pub(super)` to `crate::drive::manager`, and
+    // this `tests` module is a DESCENDANT of that module, a direct
+    // struct literal — using the same test-isolated `InventoryDb::
+    // with_path` and `MountTestHook` seam every other test in this task
+    // already relies on — reaches the real `resume_drive` method without
+    // ever touching the real filesystem outside a tempdir. This is the
+    // least invasive option found; a `DriveManager::new_for_tests`
+    // constructor was considered and rejected as unnecessary production
+    // surface once this was confirmed to work.
+    // -----------------------------------------------------------------
+
+    /// Builds a `DriveManager` with one on-demand drive already inserted
+    /// and started (mount hook installed first, so nothing here ever
+    /// touches the OS — see `vfs_mode`'s module doc). Every piece of
+    /// storage is test-isolated: `config_dir`/`inventory` live under a
+    /// fresh tempdir, never the real `~/.cloudreve`.
+    ///
+    /// `instance_url` is a parameter (not always the closed port below)
+    /// because Task 5's `get_status_summary` test drives a real `Vfs`
+    /// (`create`/`write`/`close`) through this same drive, which — unlike
+    /// `resume_drive`'s on-demand arm — DOES make synchronous HTTP calls
+    /// (`ensure_listed`'s EEXIST check), so it needs a real (wiremock)
+    /// server behind the config rather than a connection that always
+    /// refuses.
+    async fn manager_with_one_on_demand_drive_at(instance_url: &str)
+    -> (DriveManager, String, Arc<MountTestHook>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let inventory =
+            Arc::new(InventoryDb::with_path(tmp.path().join("meta.db")).unwrap());
+        let drive_id = uuid::Uuid::new_v4().to_string();
+        let sync_path = tmp.path().join("sync");
+        std::fs::create_dir_all(&sync_path).unwrap();
+
+        let config = DriveConfig {
+            id: drive_id.clone(),
+            name: "Test Drive".to_string(),
+            instance_url: instance_url.to_string(),
+            remote_path: "cloudreve://my/sync".to_string(),
+            credentials: Credentials {
+                access_token: Some("test-access-token".to_string()),
+                refresh_token: "test-refresh-token".to_string(),
+                refresh_expires: "2099-01-01T00:00:00Z".to_string(),
+                access_expires: Some("2099-01-01T00:00:00Z".to_string()),
+            },
+            sync_path,
+            enabled: true,
+            user_id: "test-user".to_string(),
+            sse_client_id: uuid::Uuid::new_v4().to_string(),
+            mode: DriveMode::OnDemand,
+            ..Default::default()
+        };
+
+        let event_broadcaster = Arc::new(EventBroadcaster::new(16));
+        let summary_notifier = Arc::new(SummaryNotifier::new(event_broadcaster.clone()));
+        let (manager_tx, _manager_rx) = mpsc::unbounded_channel();
+
+        let mut mount =
+            Mount::new(config, inventory.clone(), manager_tx, summary_notifier.clone()).await;
+        let hook = MountTestHook::new();
+        mount.install_vfs_mount_hook_for_tests(hook.clone()).await;
+        mount.start().await.expect("start the on-demand mount");
+        let mount = Arc::new(mount);
+
+        let drives: Arc<RwLock<HashMap<String, Arc<Mount>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        drives.write().await.insert(drive_id.clone(), mount);
+
+        let heartbeat_manager = HeartbeatManager::new(drives.clone(), event_broadcaster.clone());
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
+
+        let manager = DriveManager {
+            drives,
+            config_dir: tmp.path().join("config"),
+            inventory,
+            command_tx,
+            command_rx: Arc::new(Mutex::new(Some(command_rx))),
+            processor_handle: Arc::new(Mutex::new(None)),
+            event_broadcaster,
+            summary_notifier,
+            heartbeat_manager,
+        };
+
+        (manager, drive_id, hook, tmp)
+    }
+
+    /// Deleting `mount.remount_on_demand().await?` from `resume_drive`'s
+    /// `OnDemand` arm must fail this test — see this task's report for the
+    /// mutation-testing log proving it does.
+    #[tokio::test]
+    async fn resume_drive_remounts_an_on_demand_drive_through_the_manager() {
+        // Never actually dialed: `resume_drive`'s on-demand arm makes no
+        // synchronous HTTP call, and the background SSE/props workers it
+        // spawns fail harmlessly against a closed port.
+        let (manager, drive_id, hook, _tmp) =
+            manager_with_one_on_demand_drive_at("http://127.0.0.1:1").await;
+        assert_eq!(hook.mount_count(), 1, "starting the mount already requested one mount");
+
+        manager.pause_drive(&drive_id).await.expect("pause");
+        assert_eq!(hook.unmount_count(), 1, "pausing must unmount");
+
+        manager.resume_drive(&drive_id).await.expect("resume");
+
+        assert_eq!(
+            hook.mount_count(),
+            2,
+            "DriveManager::resume_drive must remount a paused on-demand drive"
+        );
+    }
+
+    /// D7: a mounted on-demand drive must report itself as synced/idle
+    /// (never "never synced" — `is_initial_sync_completed` can never flip
+    /// true for this mode, see the `MountCommand::FullSync` guard) the
+    /// moment it is mounted, with no upload queued yet; and once a draft
+    /// IS queued (armed by `Vfs::close`, `VfsEvent::UploadQueued` already
+    /// sent — see `WriteBackQueue::arm`'s doc), the pending-upload count
+    /// reflects it. Goes through the REAL `DriveManager::get_status_summary`
+    /// entry point, not a `Mount`-level proxy for it.
+    #[tokio::test]
+    async fn on_demand_status_summary_reports_synced_and_pending_count() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v4/file"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "msg": "",
+                "data": {
+                    "files": [],
+                    "pagination": { "page": 1, "page_size": 500, "total_items": 0 },
+                    "props": {
+                        "max_page_size": 10000,
+                        "order_by_options": ["name"],
+                        "order_direction_options": ["asc"],
+                    },
+                },
+            })))
+            .mount(&server)
+            .await;
+
+        let (manager, drive_id, _hook, _tmp) =
+            manager_with_one_on_demand_drive_at(&server.uri()).await;
+
+        let summary = manager.get_status_summary(None).await.expect("status summary");
+        assert!(
+            summary.has_ever_synced,
+            "a mounted on-demand drive must report synced/idle immediately, without ever \
+             running FullSync"
+        );
+        assert_eq!(
+            summary.pending_uploads.get(&drive_id).copied(),
+            Some(0),
+            "no draft queued yet"
+        );
+
+        let mount = manager.drives.read().await.get(&drive_id).unwrap().clone();
+        let vfs = mount.vfs.lock().await.clone().expect("on-demand vfs");
+        // Long enough that the debounce timer never fires during this test:
+        // this pins the counter reflecting a QUEUED-but-not-yet-uploading
+        // draft, not one that happened to already finish.
+        vfs.set_debounce_for_tests(Duration::from_secs(600));
+        let root = vfs.tree().root();
+        let (_node, h) = vfs.create(root, "queued.txt").await.expect("create");
+        vfs.write(h, 0, b"hello").await.expect("write");
+        vfs.close(h).await.expect("close"); // Pending, UploadQueued sent, debounce armed
+
+        mount.spawn_vfs_event_pump().await;
+        for _ in 0..100 {
+            if mount.vfs_pending_uploads.load(Ordering::Relaxed) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let summary = manager.get_status_summary(None).await.expect("status summary");
+        assert_eq!(
+            summary.pending_uploads.get(&drive_id).copied(),
+            Some(1),
+            "a queued-but-not-yet-uploaded draft must count as one pending upload"
+        );
     }
 }
