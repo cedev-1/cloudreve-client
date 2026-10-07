@@ -15,6 +15,41 @@ use tauri::{
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_frame::WebviewWindowExt;
 use tauri_plugin_positioner::{Position, WindowExt};
+
+/// Safely move a window, catching panics from tauri-plugin-positioner on Wayland
+/// where `current_monitor()` returns None and the plugin's internal unwrap() panics.
+/// Falls back to just showing the window at its current position if positioning fails.
+fn safe_move_window(window: &impl Manager<tauri::Wry>, label: &str, position: Position) {
+    if let Some(w) = window.get_webview_window(label) {
+        let pos_str = format!("{:?}", position);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = w.move_window(position);
+        }));
+        if result.is_err() {
+            tracing::warn!(
+                target: "window",
+                "move_window({pos_str}) failed on this platform (likely Wayland), skipping positioning"
+            );
+        }
+    }
+}
+
+/// Same as safe_move_window but operates on an already-obtained Window reference.
+fn safe_move_window_direct(
+    window: &tauri::WebviewWindow<tauri::Wry>,
+    position: Position,
+) {
+    let pos_str = format!("{:?}", position);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = window.move_window(position);
+    }));
+    if result.is_err() {
+        tracing::warn!(
+            target: "window",
+            "move_window({pos_str}) failed on this platform (likely Wayland), skipping positioning"
+        );
+    }
+}
 use uuid::Uuid;
 
 type CommandResult<T> = Result<T, String>;
@@ -250,7 +285,7 @@ fn show_main_window_at_position(app: &AppHandle, position: Position) {
             let _ = window.hide();
             return;
         }
-        let _ = window.move_window(position);
+        safe_move_window(app, "main_popup", position);
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
@@ -277,7 +312,7 @@ fn show_main_window_at_position(app: &AppHandle, position: Position) {
                     }
                 }
             });
-            let _ = window.move_window(position);
+            safe_move_window(app, "main_popup", position);
             let _ = window.show();
             let _ = window.set_focus();
         }
@@ -352,7 +387,7 @@ fn show_drive_window_internal(app: &AppHandle, title: &str, url_path: &str) {
 
     match builder.build() {
         Ok(window) => {
-            let _ = window.move_window(Position::Center);
+            safe_move_window_direct(&window, Position::Center);
             let _ = window.create_overlay_titlebar();
             let _ = window.show();
             let _ = window.set_focus();
@@ -393,7 +428,7 @@ pub fn show_settings_window_impl(app: &AppHandle) {
 
     match builder.build() {
         Ok(window) => {
-            let _ = window.move_window(Position::Center);
+            safe_move_window_direct(&window, Position::Center);
             let _ = window.create_overlay_titlebar();
             let _ = window.show();
             let _ = window.set_focus();
