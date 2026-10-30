@@ -1,7 +1,9 @@
 use super::DriveManager;
 use crate::drive::commands::{ManagerCommand, MountCommand};
+use crate::drive::mounts::DriveMode;
 use crate::drive::utils::{local_path_to_cr_uri, view_online_url};
 use anyhow::{Context, Result};
+use cloudreve_api::models::uri::CrUri;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::spawn;
@@ -76,23 +78,36 @@ impl DriveManager {
             .await
             .ok_or_else(|| anyhow::anyhow!("No drive found for path: {:?}", path))?;
 
-        let file_meta = self
-            .inventory
-            .query_by_path(path.to_str().unwrap_or(""))
-            .context("Failed to query file metadata")?;
-
         let config = mount.get_config().await;
         let uri = local_path_to_cr_uri(path.clone(), config.sync_path.clone(), config.remote_path.clone())
             .context("failed to convert local path to uri")?
             .to_string();
 
-        let url = match file_meta {
-            None => view_online_url(&config.remote_path, None, &config)?,
-            Some(ref meta) if meta.is_folder => view_online_url(&uri, None, &config)?,
-            Some(_) => {
-                use cloudreve_api::models::uri::CrUri;
+        // D8: an on-demand drive never has an inventory row for `path` (the
+        // vfs writes none — there is no local mirror for the inventory to
+        // describe), so `is_folder` can't come from a DB lookup here. It
+        // doesn't need to: the mounted path IS the real filesystem (a real
+        // OS-level mount, backed by NFS/FUSE), so the OS itself already
+        // knows whether `path` names a file or a directory.
+        let url = if config.mode == DriveMode::OnDemand {
+            if path.is_dir() {
+                view_online_url(&uri, None, &config)?
+            } else {
                 let parent_path = CrUri::new(&uri)?.parent()?.to_string();
                 view_online_url(&parent_path, Some(&uri), &config)?
+            }
+        } else {
+            let file_meta = self
+                .inventory
+                .query_by_path(path.to_str().unwrap_or(""))
+                .context("Failed to query file metadata")?;
+            match file_meta {
+                None => view_online_url(&config.remote_path, None, &config)?,
+                Some(ref meta) if meta.is_folder => view_online_url(&uri, None, &config)?,
+                Some(_) => {
+                    let parent_path = CrUri::new(&uri)?.parent()?.to_string();
+                    view_online_url(&parent_path, Some(&uri), &config)?
+                }
             }
         };
 

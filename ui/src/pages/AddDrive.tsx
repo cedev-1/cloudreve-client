@@ -1,4 +1,4 @@
-import { Alert, Box, Button, CircularProgress, Container, IconButton, InputAdornment, Snackbar, Typography } from "@mui/material";
+import { Alert, Box, Button, CircularProgress, Container, IconButton, InputAdornment, Snackbar, ToggleButton, ToggleButtonGroup, Typography } from "@mui/material";
 import CloseIcon from "@mui/icons-material/Close";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -21,6 +21,10 @@ import { listen } from '@tauri-apps/api/event';
 import { CALLBACK_PATH, CLIENT_ID, SCOPES } from "../utils/constants";
 
 type PageState = "url_input" | "waiting" | "final_setup" | "setting_up" | "success";
+
+// Must match `DriveMode`'s serde snake_case wire format exactly
+// (crates/cloudreve-sync/src/drive/mounts.rs).
+type DriveModeChoice = "full_mirror" | "on_demand";
 
 interface OAuthCallbackData {
   code: string;
@@ -96,6 +100,7 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
   const [pageState, setPageState] = useState<PageState>(isReauthorize ? "url_input" : "url_input");
   const [localPath, setLocalPath] = useState("");
   const [folderNotEmpty, setFolderNotEmpty] = useState(false);
+  const [driveMode, setDriveMode] = useState<DriveModeChoice>("full_mirror");
   const [driveName, setDriveName] = useState(driveNameQuery ? decodeURIComponent(driveNameQuery) : "");
   const lastFetchedUrl = useRef<string>("");
   const currentIconUrl = useRef<string | undefined>(undefined);
@@ -276,6 +281,7 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
     setPageState("url_input");
     setLocalPath("");
     setFolderNotEmpty(false);
+    setDriveMode("full_mirror");
     pkceSessionRef.current = null;
   };
 
@@ -343,6 +349,7 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
           remote_path: pkceSessionRef.current!.callbackData!.path,
           user_id: pkceSessionRef.current!.callbackData!.user_id || "",
           drive_id: isReauthorize ? driveId : undefined,
+          mode: driveMode,
         }
       });
       // Success - switch to success state
@@ -514,6 +521,35 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
 
                 {!isReauthorize && (
                   <>
+                    <Box sx={{ width: "100%" }}>
+                      <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+                        {t("addDrive.modeChoice.title")}
+                      </Typography>
+                      <ToggleButtonGroup
+                        value={driveMode}
+                        exclusive
+                        fullWidth
+                        size="small"
+                        onChange={(_, value: DriveModeChoice | null) => value && setDriveMode(value)}
+                      >
+                        <ToggleButton value="full_mirror">
+                          {t("addDrive.modeChoice.mirror")}
+                        </ToggleButton>
+                        <ToggleButton value="on_demand">
+                          {t("addDrive.modeChoice.onDemand")}
+                        </ToggleButton>
+                      </ToggleButtonGroup>
+                      <Typography
+                        variant="caption"
+                        color="text.secondary"
+                        sx={{ mt: 0.75, display: "block" }}
+                      >
+                        {driveMode === "on_demand"
+                          ? t("addDrive.modeChoice.onDemandHint")
+                          : t("addDrive.modeChoice.mirrorHint")}
+                      </Typography>
+                    </Box>
+
                     <FilledTextField
                       fullWidth
                       autoComplete="off"

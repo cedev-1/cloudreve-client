@@ -1,11 +1,11 @@
 //! Chunk-based upload logic with streaming support and progress tracking
 
-use crate::uploader::UploaderConfig;
-use crate::uploader::encrypt::EncryptionConfig;
-use crate::uploader::error::UploadError;
-use crate::uploader::progress::{ProgressCallback, ProgressTracker};
-use crate::uploader::providers::{self, PolicyType};
-use crate::uploader::session::UploadSession;
+use crate::UploaderConfig;
+use crate::encrypt::EncryptionConfig;
+use crate::error::UploadError;
+use crate::progress::{ProgressCallback, ProgressTracker};
+use crate::providers::{self, PolicyType};
+use crate::session::UploadSession;
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use cloudreve_api::Client as CrClient;

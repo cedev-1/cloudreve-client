@@ -14,11 +14,13 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 tracing-appender = "0.2"
 futures = "0.3"
-reqwest = { version = "0.12", features = ["json", "stream", "multipart"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
 sha2 = "0.10"
 image = "0.24"
 url = "2.5"
 cloudreve-api = { path = "../cloudreve-api" }
+cloudreve-uploader = { path = "../cloudreve-uploader" }
+cloudreve-vfs = { path = "../cloudreve-vfs" }
 chrono = "0.4.42"
 diesel = { version = "2.1", features = ["sqlite", "r2d2"] }
 diesel_migrations = { version = "2.1", features = ["sqlite"] }
@@ -30,10 +32,7 @@ bytes = "1"
 notify-debouncer-full = "0.6.0"
 dashmap = "5"
 thiserror = "2.0"
-base64 = "0.22"
-aes = "0.8"
-ctr = "0.9"
-tokio-util = { version = "0.7", features = ["io"] }
+tokio-util = { version = "0.7" }
 globset = "0.4"
 fs4 = { version = "1", default-features = false }
 

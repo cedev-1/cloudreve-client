@@ -51,6 +51,21 @@ async fn init_sync_service(app: AppHandle) -> anyhow::Result<()> {
     let log_guard = cloudreve_sync::logging::init_logging(LogConfig::from_config_manager())
         .context("Failed to initialize logging system")?;
 
+    // Phase 4 (on-demand vfs): `fuser`, the Linux FUSE frontend
+    // `cloudreve-vfs` mounts an on-demand drive through, logs via the
+    // plain `log` facade rather than `tracing` — without this bridge, every
+    // one of its warn!/error! calls (mount failures, request errors) is
+    // silently dropped instead of reaching the log file/stdout `init_logging`
+    // just set up. Installs `log`'s global logger to forward every record
+    // into `tracing`'s dispatcher, where the subscriber above picks it up
+    // like any other event. Best-effort: the only way this errs is a `log`
+    // backend already being installed, which nothing else in this app ever
+    // does (the `log`/`tauri-plugin-log` deps are pulled in but never
+    // initialized) — never worth aborting startup over.
+    if let Err(err) = tracing_log::LogTracer::init() {
+        tracing::warn!(target: "main", %err, "failed to bridge the log crate into tracing");
+    }
+
     tracing::info!(target: "main", "Starting Cloudreve Sync Service...");
 
     let event_broadcaster = Arc::new(EventBroadcaster::new(100));

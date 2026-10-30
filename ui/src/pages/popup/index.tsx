@@ -224,6 +224,7 @@ export default function Popup() {
           selectedDrive={selectedDrive}
           onDriveSelect={handleDriveSelect}
           onAddDrive={handleAddDrive}
+          pendingUploads={summary?.pending_uploads}
         />
       </Box>
 
