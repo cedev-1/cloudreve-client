@@ -61,8 +61,9 @@ jobs:
 
           ---
 
-          ### Installation (macOS, Apple Silicon)
-          1. Download the `.dmg` and drag Cloudreve to Applications
+          ### Installation (macOS)
+          1. Download the `.dmg` for your Mac (`aarch64` = Apple Silicon, `x64` = Intel)
+             and drag Cloudreve to Applications
           2. **First launch**: right-click -> Open -> Run `xattr -cr /Applications/Cloudreve.app`
 
           ### Installation (Linux, x86_64)
@@ -98,9 +99,10 @@ jobs:
         include:
           - platform: macos-latest # Apple Silicon (arm64)
             args: "--target aarch64-apple-darwin"
-          - platform: macos-15-intel
-            args: "--target x86_64-apple-darwin"
             target: aarch64-apple-darwin
+          - platform: macos-15-intel # Intel (x86_64)
+            args: "--target x86_64-apple-darwin"
+            target: x86_64-apple-darwin
           - platform: ubuntu-22.04   # Linux x86_64
             args: ''
             target: ''
