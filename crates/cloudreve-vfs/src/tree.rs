@@ -203,6 +203,12 @@ impl VfsTree {
             }
         }
 
+        // macOS metadata junk the server holds (another client uploaded a
+        // `.DS_Store`, say) never enters the tree: it is not listed, not
+        // resolvable by name, and never shadows the local-only overlay of
+        // the same name (see `crate::junk`).
+        files.retain(|f| crate::junk::classify(&f.name).is_none());
+
         let mut inner = self.inner.write().await;
         // Another concurrent call for the same directory won the race while
         // we were awaiting the network and its result is still fresh:
@@ -457,6 +463,20 @@ impl VfsTree {
             },
         );
         Ok(id)
+    }
+
+    /// Drops a local-only entry made by `insert_local_entry` right away,
+    /// without the parent re-list `invalidate_path` would cost: its id no
+    /// longer resolves. For entries the server never lists (local-only
+    /// junk, see `crate::junk`) — a server-listed entry would come back on
+    /// the next listing anyway.
+    #[doc(hidden)]
+    pub async fn forget_local_entry(&self, parent: NodeId, name: &str) {
+        let mut inner = self.inner.write().await;
+        if let Some(id) = inner.known_children.remove(&(parent, name.to_string())) {
+            inner.attrs.remove(&id);
+            inner.stale_files.remove(&id);
+        }
     }
 
     /// Every child of `parent` known to the tree by (parent, name)

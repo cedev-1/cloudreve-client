@@ -9,7 +9,8 @@
 
 use crate::tree::NodeAttr;
 use crate::vfs::{
-    DirNotEmptyError, RenameBusyError, RenameOntoDirectoryError, StaleHandleError, UnlinkBusyError,
+    CrossOverlayRenameError, DirNotEmptyError, JunkNameError, RenameBusyError, RenameOntoDirectoryError,
+    StaleHandleError, UnlinkBusyError,
 };
 
 /// Portable classification of a facade error/outcome, independent of any
@@ -52,6 +53,12 @@ pub enum FrontendErrno {
     /// for a facade-level caller, not something either mounted frontend has
     /// been observed to actually need to produce.
     IsDir,
+    /// A name reserved for local macOS metadata (`crate::junk`):
+    /// [`JunkNameError`].
+    Access,
+    /// A local-only junk file renamed onto a real name:
+    /// [`CrossOverlayRenameError`]. EXDEV makes `mv`/Finder copy instead.
+    CrossDevice,
     /// Everything else. The anyhow causal chain is logged at debug so a
     /// real bug stays diagnosable without ever leaking `anyhow::Error`
     /// details across the frontend boundary.
@@ -80,6 +87,12 @@ pub fn classify_error(err: &anyhow::Error) -> FrontendErrno {
     }
     if err.downcast_ref::<RenameOntoDirectoryError>().is_some() {
         return FrontendErrno::IsDir;
+    }
+    if err.downcast_ref::<JunkNameError>().is_some() {
+        return FrontendErrno::Access;
+    }
+    if err.downcast_ref::<CrossOverlayRenameError>().is_some() {
+        return FrontendErrno::CrossDevice;
     }
     if err.to_string().starts_with("EEXIST") {
         return FrontendErrno::Exist;
@@ -184,6 +197,18 @@ mod tests {
     fn rename_onto_directory_error_classifies_as_is_dir() {
         let err = anyhow::Error::new(RenameOntoDirectoryError { remote_path: "x".into() });
         assert_eq!(classify_error(&err), FrontendErrno::IsDir);
+    }
+
+    #[test]
+    fn a_junk_name_error_classifies_as_access() {
+        let err = anyhow::Error::new(JunkNameError { name: ".Trashes".into() });
+        assert_eq!(classify_error(&err), FrontendErrno::Access);
+    }
+
+    #[test]
+    fn a_cross_overlay_rename_classifies_as_cross_device() {
+        let err = anyhow::Error::new(CrossOverlayRenameError { remote_path: "x".into() });
+        assert_eq!(classify_error(&err), FrontendErrno::CrossDevice);
     }
 
     #[test]

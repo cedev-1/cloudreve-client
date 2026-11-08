@@ -24,6 +24,7 @@ use cloudreve_api::models::explorer::{
 use tokio::sync::{mpsc, Mutex, RwLock};
 
 use crate::cache::{BlockCache, FileKey, BLOCK_SIZE};
+use crate::junk::{self, JunkKind};
 use crate::tree::{NodeAttr, NodeId, VfsTree};
 use crate::writeback::{DraftInit, DraftState, DraftStore, WriteBackQueue};
 
@@ -338,6 +339,51 @@ impl std::fmt::Display for RenameOntoDirectoryError {
 
 impl std::error::Error for RenameOntoDirectoryError {}
 
+/// Returned for a name `crate::junk` reserves ([`JunkKind::Reserved`](crate::junk::JunkKind),
+/// or a local-only junk name used where a real entry would have to be made:
+/// `mkdir`, or renaming a real file onto it) — frontends answer EACCES, the
+/// same refusal hf-mount gives for these names. Never reaches the server.
+/// Detectable via `anyhow::Error::downcast_ref::<JunkNameError>()`.
+#[derive(Debug, Clone)]
+pub struct JunkNameError {
+    pub name: String,
+}
+
+impl std::fmt::Display for JunkNameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?} is reserved for local macOS metadata and is never synced", self.name)
+    }
+}
+
+impl std::error::Error for JunkNameError {}
+
+/// Returned by [`Vfs::rename`] for a local-only junk file (see
+/// `crate::junk`) renamed onto a real name. The overlay and the synced
+/// tree behave like two filesystems, so frontends answer EXDEV, exactly
+/// what `rename(2)` says across volumes: `mv` and Finder then fall back to
+/// copy-and-delete, which creates the real file through the ordinary
+/// upload path. Detectable via
+/// `anyhow::Error::downcast_ref::<CrossOverlayRenameError>()`.
+#[derive(Debug, Clone)]
+pub struct CrossOverlayRenameError {
+    pub remote_path: String,
+}
+
+impl std::fmt::Display for CrossOverlayRenameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "cannot rename local-only {} onto a synced name", self.remote_path)
+    }
+}
+
+impl std::error::Error for CrossOverlayRenameError {}
+
+/// One local-only junk file (see `crate::junk`): its whole content, kept in
+/// memory. AppleDouble sidecars and `.DS_Store` are a few KiB.
+struct JunkFile {
+    data: Vec<u8>,
+    mtime_secs: i64,
+}
+
 /// Test-only rendezvous for pausing `create()` mid-body — see
 /// `Vfs::pause_create_before_registration_for_tests`. Exists because the
 /// window this is meant to test (`create` making a name visible before it
@@ -556,6 +602,13 @@ pub struct Vfs {
     /// events they emit directly (`UploadCancelled` on a reopen/unlink
     /// racing a still-armed debounce timer — see `VfsEvent`'s doc).
     events: mpsc::UnboundedSender<VfsEvent>,
+    /// Local-only junk files (see `crate::junk`), keyed by their would-be
+    /// remote path. Never uploaded, never listed, forgotten on restart.
+    /// A `std::sync::Mutex`: only ever held for the instant of one map
+    /// operation, never across an await.
+    junk: std::sync::Mutex<HashMap<String, JunkFile>>,
+    /// Test-only: see `refuse_local_only_junk_for_tests`.
+    refuse_local_only_junk: std::sync::atomic::AtomicBool,
 }
 
 impl Vfs {
@@ -662,6 +715,8 @@ impl Vfs {
                 create_pause_hook: std::sync::Mutex::new(None),
                 open_pause_hook: std::sync::Mutex::new(None),
                 events: events_tx,
+                junk: std::sync::Mutex::new(HashMap::new()),
+                refuse_local_only_junk: std::sync::atomic::AtomicBool::new(false),
             },
             events_rx,
         ))
@@ -669,6 +724,26 @@ impl Vfs {
 
     pub fn tree(&self) -> &VfsTree {
         &self.tree
+    }
+
+    /// `crate::junk::classify`, unless `refuse_local_only_junk_for_tests`
+    /// turned local-only names into reserved ones.
+    fn junk_kind(&self, name: &str) -> Option<JunkKind> {
+        match junk::classify(name) {
+            Some(JunkKind::LocalOnly) if self.refuse_local_only_junk.load(Ordering::Relaxed) => {
+                Some(JunkKind::Reserved)
+            }
+            kind => kind,
+        }
+    }
+
+    /// Test-only: refuses local-only junk names (EACCES) instead of
+    /// keeping them in the overlay — the policy hf-mount ships. Exists so
+    /// `tests/mounted_macos.rs` can rerun the comparison that decided
+    /// against it (see `crate::junk`).
+    #[doc(hidden)]
+    pub fn refuse_local_only_junk_for_tests(&self) {
+        self.refuse_local_only_junk.store(true, Ordering::Relaxed);
     }
 
     /// Opens a node for reading: resolves its signed download URL once and
@@ -727,6 +802,20 @@ impl Vfs {
         let _open_guard = open_lock.lock().await;
 
         let key = FileKey { remote_path: attr.remote_path.clone(), etag: attr.etag.clone() };
+
+        // Local-only junk (see `crate::junk`): no cache, no draft, no URL —
+        // `read`/`write`/`truncate` serve it from the overlay by path.
+        if junk::is_local_only_path(&key.remote_path) {
+            let size = match self.junk.lock().unwrap().get(&key.remote_path) {
+                Some(file) => file.data.len() as u64,
+                None => bail!("open: {} no longer exists", key.remote_path),
+            };
+            let open_file = Arc::new(OpenFile { key, size, download_url: RwLock::new(None) });
+            let handle_id = self.next_handle.fetch_add(1, Ordering::SeqCst);
+            self.open_files.write().await.insert(handle_id, open_file);
+            return Ok(FileHandle(handle_id));
+        }
+
         self.cache.lock().await.retain(&key);
 
         // Task 9 (promoted fix): a path with an active draft is always read
@@ -830,6 +919,14 @@ impl Vfs {
     /// empty) tail — POSIX semantics frontends rely on, not an error.
     pub async fn read(&self, h: FileHandle, offset: u64, len: u32) -> Result<Bytes> {
         let of = self.open_file(h).await?;
+
+        if junk::is_local_only_path(&of.key.remote_path) {
+            let junk = self.junk.lock().unwrap();
+            let data = junk.get(&of.key.remote_path).map(|f| f.data.as_slice()).unwrap_or_default();
+            let start = (offset as usize).min(data.len());
+            let end = start.saturating_add(len as usize).min(data.len());
+            return Ok(Bytes::copy_from_slice(&data[start..end]));
+        }
 
         // D3: a file with an active draft is read from the draft, never
         // from the block cache — the cache may hold stale (or no) content
@@ -1089,8 +1186,32 @@ impl Vfs {
             .context("create: unknown parent (readdir/lookup it first)")?;
         let remote_path = format!("{}/{name}", parent_attr.remote_path);
 
+        let junk_kind = self.junk_kind(name);
+        if junk_kind == Some(JunkKind::Reserved) {
+            return Err(anyhow::Error::new(JunkNameError { name: name.to_string() }));
+        }
+
         let open_lock = self.open_lock_for(&remote_path);
         let _open_guard = open_lock.lock().await;
+
+        // Local-only junk (see `crate::junk`): the file lives in the
+        // overlay only — no draft, so nothing can ever arm an upload for it.
+        if junk_kind == Some(JunkKind::LocalOnly) {
+            if self.lookup(parent, name).await?.is_some() {
+                anyhow::bail!("EEXIST: an entry named {name:?} already exists in this directory");
+            }
+            self.junk
+                .lock()
+                .unwrap()
+                .insert(remote_path.clone(), JunkFile { data: Vec::new(), mtime_secs: unix_now() });
+            let node = self.tree.insert_local_entry(parent, name).await?;
+            let key = FileKey { remote_path, etag: String::new() };
+            let open_file = Arc::new(OpenFile { key, size: 0, download_url: RwLock::new(None) });
+            let handle_id = self.next_handle.fetch_add(1, Ordering::SeqCst);
+            self.open_files.write().await.insert(handle_id, open_file);
+            return Ok((node, FileHandle(handle_id)));
+        }
+
         let path_lock = self.draft_begin_lock_for(&remote_path);
         let _guard = path_lock.lock().await;
 
@@ -1151,6 +1272,11 @@ impl Vfs {
     /// (the tree's `LISTING_TTL` keeps it cached) to hand back a `NodeId`
     /// without a second network round-trip.
     pub async fn mkdir(&self, parent: NodeId, name: &str) -> Result<NodeId> {
+        // Every junk name, local-only ones included: the overlay holds
+        // plain files only (see `crate::junk`).
+        if junk::classify(name).is_some() {
+            return Err(anyhow::Error::new(JunkNameError { name: name.to_string() }));
+        }
         let parent_attr = self
             .tree
             .getattr(parent)
@@ -1275,6 +1401,12 @@ impl Vfs {
             return Err(anyhow::Error::new(UnlinkBusyError { remote_path }));
         }
 
+        if junk::is_local_only_path(&remote_path) {
+            self.junk.lock().unwrap().remove(&remote_path);
+            self.tree.forget_local_entry(parent, name).await;
+            return Ok(());
+        }
+
         // `cancel` is a harmless no-op if nothing is currently armed for
         // this path (draft still `Editing`, or an upload already
         // `Uploading` — the latter simply finds its draft gone mid-flight,
@@ -1318,6 +1450,11 @@ impl Vfs {
             .await
             .context("failed to delete")?;
 
+        if attr.is_dir {
+            // The folder's local-only junk (see `crate::junk`) went with it.
+            let nested = format!("{remote_path}/");
+            self.junk.lock().unwrap().retain(|path, _| !path.starts_with(&nested));
+        }
         self.tree.invalidate_path(&remote_path).await;
         Ok(())
     }
@@ -1429,6 +1566,24 @@ impl Vfs {
             return Ok(()); // renaming onto itself: nothing to do.
         }
 
+        // Junk (see `crate::junk`): local-only files move among themselves;
+        // a real entry never becomes junk (its content would stop syncing)
+        // and junk never becomes real by rename (EXDEV: `mv`/Finder copy
+        // instead, through the ordinary upload path).
+        let source_is_junk = junk::is_local_only_path(&old_path);
+        match self.junk_kind(new_name) {
+            Some(JunkKind::Reserved) => {
+                return Err(anyhow::Error::new(JunkNameError { name: new_name.to_string() }));
+            }
+            Some(JunkKind::LocalOnly) if !source_is_junk => {
+                return Err(anyhow::Error::new(JunkNameError { name: new_name.to_string() }));
+            }
+            None if source_is_junk => {
+                return Err(anyhow::Error::new(CrossOverlayRenameError { remote_path: old_path }));
+            }
+            _ => {}
+        }
+
         // D10 (phase 4, outermost lock — see `namespace_lock`'s and this
         // method's own doc above): write() only when the SOURCE is a
         // directory, acquired BEFORE `open_lock_for` next, no exceptions.
@@ -1486,6 +1641,18 @@ impl Vfs {
             || self.drafts.lock().await.has_draft_strictly_under(&new_path)
         {
             return Err(anyhow::Error::new(RenameBusyError { remote_path: new_path }));
+        }
+
+        if source_is_junk {
+            {
+                let mut junk = self.junk.lock().unwrap();
+                if let Some(file) = junk.remove(&old_path) {
+                    junk.insert(new_path.clone(), file);
+                }
+            }
+            self.tree.forget_local_entry(parent, name).await;
+            self.tree.insert_local_entry(new_parent, new_name).await?;
+            return Ok(());
         }
 
         let existed_remotely = match self.drafts.lock().await.base_etag(&old_path) {
@@ -1653,6 +1820,18 @@ impl Vfs {
         } else if had_draft {
             self.tree.insert_local_entry(new_parent, new_name).await?;
         }
+        if source_is_dir {
+            // The folder's local-only junk (see `crate::junk`) moves with
+            // it — Finder's `.DS_Store`, the sidecars of the files inside.
+            let nested = format!("{old_path}/");
+            let mut junk = self.junk.lock().unwrap();
+            let moved: Vec<String> = junk.keys().filter(|p| p.starts_with(&nested)).cloned().collect();
+            for path in moved {
+                if let Some(file) = junk.remove(&path) {
+                    junk.insert(format!("{new_path}/{}", &path[nested.len()..]), file);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1664,6 +1843,19 @@ impl Vfs {
     /// it.
     pub async fn write(&self, h: FileHandle, offset: u64, data: &[u8]) -> Result<u32> {
         let of = self.open_file(h).await?;
+        if junk::is_local_only_path(&of.key.remote_path) {
+            let mut junk = self.junk.lock().unwrap();
+            let file = junk
+                .get_mut(&of.key.remote_path)
+                .with_context(|| format!("write: {} no longer exists", of.key.remote_path))?;
+            let end = offset as usize + data.len();
+            if file.data.len() < end {
+                file.data.resize(end, 0);
+            }
+            file.data[offset as usize..end].copy_from_slice(data);
+            file.mtime_secs = unix_now();
+            return Ok(data.len() as u32);
+        }
         self.ensure_drafted(&of).await?;
         self.drafts.lock().await.write(&of.key.remote_path, offset, data)?;
         Ok(data.len() as u32)
@@ -1676,6 +1868,15 @@ impl Vfs {
     /// way to know what the resized file should contain otherwise.
     pub async fn truncate(&self, h: FileHandle, size: u64) -> Result<()> {
         let of = self.open_file(h).await?;
+        if junk::is_local_only_path(&of.key.remote_path) {
+            let mut junk = self.junk.lock().unwrap();
+            let file = junk
+                .get_mut(&of.key.remote_path)
+                .with_context(|| format!("truncate: {} no longer exists", of.key.remote_path))?;
+            file.data.resize(size as usize, 0);
+            file.mtime_secs = unix_now();
+            return Ok(());
+        }
         if !self.has_draft(&of).await {
             // Serialized per-path (see `draft_begin_locks`'s doc): a
             // concurrent `write`/`truncate` on the same undrafted file must
@@ -1710,6 +1911,9 @@ impl Vfs {
                 listing.push((id, attr));
             }
         }
+        // Junk is never listed, local-only files included (see
+        // `crate::junk`); the tree already drops the server's copies.
+        listing.retain(|(_, attr)| junk::classify(&attr.name).is_none());
         for (_, attr) in listing.iter_mut() {
             self.overlay_draft(attr).await;
         }
@@ -1718,7 +1922,14 @@ impl Vfs {
 
     /// Resolves one child by name, falling back to a locally-created entry
     /// (not yet part of any server listing) the same way `readdir` does.
+    /// A junk name resolves only to the local-only overlay, never to the
+    /// server (see `crate::junk`), so it costs no request.
     pub async fn lookup(&self, parent: NodeId, name: &str) -> Result<Option<(NodeId, NodeAttr)>> {
+        match self.junk_kind(name) {
+            Some(JunkKind::Reserved) => return Ok(None),
+            Some(JunkKind::LocalOnly) => return self.lookup_junk(parent, name).await,
+            None => {}
+        }
         if let Some((id, mut attr)) = self.tree.lookup(parent, name).await? {
             self.overlay_draft(&mut attr).await;
             return Ok(Some((id, attr)));
@@ -1732,18 +1943,44 @@ impl Vfs {
         Ok(None)
     }
 
+    /// `lookup` for a local-only junk name. The overlay is keyed by path,
+    /// so the tree entry is (re)made here on demand: one may be missing
+    /// after the folder holding it was renamed.
+    async fn lookup_junk(&self, parent: NodeId, name: &str) -> Result<Option<(NodeId, NodeAttr)>> {
+        let Some(parent_attr) = self.tree.getattr(parent).await? else { return Ok(None) };
+        let path = format!("{}/{name}", parent_attr.remote_path);
+        if !self.junk.lock().unwrap().contains_key(&path) {
+            return Ok(None);
+        }
+        let id = self.tree.insert_local_entry(parent, name).await?;
+        Ok(self.getattr(id).await?.map(|attr| (id, attr)))
+    }
+
     /// Reads one node's attributes, overlaid with its draft's size/mtime if
     /// it has one (D3). Never triggers a listing, same as `VfsTree::getattr`.
     pub async fn getattr(&self, node: NodeId) -> Result<Option<NodeAttr>> {
         let Some(mut attr) = self.tree.getattr(node).await? else { return Ok(None) };
+        if junk::is_local_only_path(&attr.remote_path)
+            && !self.junk.lock().unwrap().contains_key(&attr.remote_path)
+        {
+            return Ok(None);
+        }
         self.overlay_draft(&mut attr).await;
         Ok(Some(attr))
     }
 
     /// Applies D3's overlay in place: if `attr.remote_path` has an active
     /// draft, its size and last-write time replace the tree's (possibly
-    /// stale, possibly nonexistent-yet) attributes.
+    /// stale, possibly nonexistent-yet) attributes. A local-only junk file
+    /// (see `crate::junk`) takes them from the overlay instead.
     async fn overlay_draft(&self, attr: &mut NodeAttr) {
+        if junk::is_local_only_path(&attr.remote_path) {
+            if let Some(file) = self.junk.lock().unwrap().get(&attr.remote_path) {
+                attr.size = file.data.len() as u64;
+                attr.mtime_secs = file.mtime_secs;
+            }
+            return;
+        }
         let drafts = self.drafts.lock().await;
         if let Some(size) = drafts.size(&attr.remote_path) {
             attr.size = size;
@@ -2121,6 +2358,14 @@ async fn fetch_download_url(client: &cloudreve_api::Client, key: &FileKey) -> Re
 /// an inclusive `(first_missing_block, last_missing_block)` pair. Pure and
 /// allocation-light so both the foreground read path and the background
 /// readahead path can share it without either one owning the other.
+/// Wall-clock seconds since the epoch, for a local-only junk file's mtime.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 fn missing_runs(first_block: u64, present: &[bool]) -> Vec<(u64, u64)> {
     let mut runs = Vec::new();
     let mut run_start: Option<u64> = None;

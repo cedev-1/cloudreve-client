@@ -486,6 +486,9 @@ fn to_nfsstat3(errno: FrontendErrno) -> nfsstat3 {
         // Phase 4 task 3, R1: NFSv3's direct, purpose-built code for this
         // exact condition (RFC 1813's own RENAME procedure lists it).
         FrontendErrno::IsDir => nfsstat3::NFS3ERR_ISDIR,
+        // Junk (`crate::junk`): NFSv3's own codes for both conditions.
+        FrontendErrno::Access => nfsstat3::NFS3ERR_ACCES,
+        FrontendErrno::CrossDevice => nfsstat3::NFS3ERR_XDEV,
         FrontendErrno::Io => nfsstat3::NFS3ERR_IO,
     }
 }
@@ -569,6 +572,12 @@ mod tests {
     fn an_unrecognized_error_maps_to_io() {
         let err = anyhow::anyhow!("some transient failure");
         assert_eq!(to_errno(&err), nfsstat3::NFS3ERR_IO);
+    }
+
+    #[test]
+    fn junk_refusals_map_to_acces_and_xdev() {
+        assert_eq!(to_nfsstat3(FrontendErrno::Access), nfsstat3::NFS3ERR_ACCES);
+        assert_eq!(to_nfsstat3(FrontendErrno::CrossDevice), nfsstat3::NFS3ERR_XDEV);
     }
 
     #[test]

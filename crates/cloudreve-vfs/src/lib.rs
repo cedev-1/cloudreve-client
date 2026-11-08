@@ -6,6 +6,7 @@
 
 pub mod cache;
 pub mod frontend_util;
+pub mod junk;
 // Linux-only (Task 4): implements `fuser::Filesystem` over the facade,
 // mounted by `mount.rs`'s `linux_impl` branch. Never compiled on this
 // (macOS) development machine — see `fuse.rs`'s module doc.

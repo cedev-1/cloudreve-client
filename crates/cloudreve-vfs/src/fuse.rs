@@ -482,6 +482,8 @@ fn to_errno(errno: FrontendErrno) -> i32 {
         // Phase 4 task 3, R1: a real, purpose-built errno for this exact
         // condition (`man 2 rename`'s "newpath is a non-empty directory").
         FrontendErrno::IsDir => libc::EISDIR,
+        FrontendErrno::Access => libc::EACCES,
+        FrontendErrno::CrossDevice => libc::EXDEV,
         FrontendErrno::Io => libc::EIO,
     }
 }
@@ -546,6 +548,12 @@ mod tests {
     #[test]
     fn not_found_maps_to_enoent() {
         assert_eq!(to_errno(FrontendErrno::NotFound), libc::ENOENT);
+    }
+
+    #[test]
+    fn junk_refusals_map_to_eacces_and_exdev() {
+        assert_eq!(to_errno(FrontendErrno::Access), libc::EACCES);
+        assert_eq!(to_errno(FrontendErrno::CrossDevice), libc::EXDEV);
     }
 
     #[test]

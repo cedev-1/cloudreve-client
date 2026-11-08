@@ -433,3 +433,37 @@ async fn a_fast_read_is_answered_directly_without_jukebox() {
     let (data, _eof) = fs.read(&id, 0, 11).await.expect("a fast read must not be deferred");
     assert_eq!(data, b"hello world");
 }
+
+/// macOS junk through the NFS trait object: a reserved volume folder name is
+/// refused with ACCES, a sidecar works locally, and renaming it onto a real
+/// name answers XDEV so `mv`/Finder fall back to copy-and-delete.
+#[tokio::test]
+async fn junk_names_map_to_acces_and_a_sidecar_renamed_onto_a_real_name_to_xdev() {
+    let env = VfsTestEnv::new().await;
+    env.expect_uploads().await;
+    env.expect_namespace_ops().await;
+
+    let (vfs, _rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+    let fs = VfsNfs::new(Arc::new(vfs));
+    let root = fs.root_dir();
+
+    assert_eq!(fs.mkdir(&root, &fname(".Trashes")).await.unwrap_err(), nfsstat3::NFS3ERR_ACCES);
+    assert_eq!(
+        fs.create(&root, &fname(".fseventsd"), sattr3::default()).await.unwrap_err(),
+        nfsstat3::NFS3ERR_ACCES
+    );
+
+    let (id, _) = fs.create(&root, &fname("._a.txt"), sattr3::default()).await.unwrap();
+    fs.write(&id, 0, b"xattrs", stable_how::FILE_SYNC).await.unwrap();
+    assert_eq!(fs.lookup(&root, &fname("._a.txt")).await.unwrap().as_u64(), id.as_u64());
+    let (data, _) = fs.read(&id, 0, 64).await.unwrap();
+    assert_eq!(data, b"xattrs");
+
+    assert_eq!(
+        fs.rename(&root, &fname("._a.txt"), &root, &fname("a.txt")).await.unwrap_err(),
+        nfsstat3::NFS3ERR_XDEV
+    );
+    assert_eq!(env.upload_session_count() + env.create_file_call_count(), 0);
+}

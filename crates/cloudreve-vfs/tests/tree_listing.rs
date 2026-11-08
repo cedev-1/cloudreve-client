@@ -214,3 +214,24 @@ async fn invalidating_a_deleted_files_own_path_removes_it() {
     );
     assert!(tree.lookup(tree.root(), "gone.txt").await.unwrap().is_none());
 }
+
+/// macOS metadata another client uploaded never enters the tree: the
+/// facade's local-only overlay of the same name (see `crate::junk`) must
+/// never share a node — and its attributes — with the server's copy.
+#[tokio::test]
+async fn junk_the_server_lists_never_enters_the_tree() {
+    let env = VfsTestEnv::new().await;
+    env.set_remote_files(vec![
+        remote_file("a.txt", 1, "e1"),
+        remote_file(".DS_Store", 6148, "e2"),
+        remote_file("._a.txt", 4096, "e3"),
+        remote_dir(".Spotlight-V100"),
+    ])
+    .await;
+    let tree = VfsTree::new(env.client(), common::REMOTE_BASE.into());
+
+    let names: Vec<String> =
+        tree.readdir(tree.root()).await.unwrap().into_iter().map(|(_, a)| a.name).collect();
+    assert_eq!(names, vec!["a.txt".to_string()]);
+    assert!(tree.lookup(tree.root(), ".DS_Store").await.unwrap().is_none());
+}

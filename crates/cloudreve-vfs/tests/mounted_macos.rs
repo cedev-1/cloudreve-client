@@ -808,3 +808,32 @@ async fn rm_rf_of_a_folder_holding_junk_succeeds_and_server_junk_stays_hidden() 
         env.last_deleted_uris()
     );
 }
+
+/// MEASUREMENT (item 2 of the NFS hardening wave): the same copy matrix as
+/// `macos_copies_of_a_file_with_xattrs_succeed_and_never_upload_junk`, under
+/// the policy hf-mount ships instead — sidecar creation refused with EACCES
+/// (`Vfs::refuse_local_only_junk_for_tests`). Logs `JUNK-POLICY` lines to
+/// the process's stderr; asserts nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn measure_macos_copies_when_sidecars_are_refused() {
+    use std::io::Write;
+
+    let env = VfsTestEnv::new().await;
+    env.expect_uploads().await;
+    env.expect_namespace_ops().await;
+    let vfs = new_test_vfs(&env).await;
+    vfs.refuse_local_only_junk_for_tests();
+
+    let mp = tempfile::tempdir().unwrap();
+    let mountpoint = mp.path().to_path_buf();
+    let _guard = MountpointGuard(mountpoint.clone());
+    let mounted = mount::mount(vfs.clone(), &mountpoint, "CloudreveTest", env.cache_dir())
+        .await
+        .expect("mount should succeed");
+    let results = macos_copy_matrix(&mountpoint).await;
+    mounted.unmount().await.expect("unmount should succeed");
+
+    for (label, ok, err) in results {
+        let _ = writeln!(std::io::stderr(), "JUNK-POLICY policy=refuse step={label:?} exit0={ok} stderr={err:?}");
+    }
+}
