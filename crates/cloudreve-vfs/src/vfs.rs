@@ -1647,6 +1647,11 @@ impl Vfs {
         {
             return Err(anyhow::Error::new(RenameBusyError { remote_path: new_path }));
         }
+        // An upload of the destination's draft already in flight would land
+        // its bytes over whatever this rename puts there: wait it out.
+        if matches!(self.drafts.lock().await.state(&new_path), Some(DraftState::Uploading)) {
+            return Err(anyhow::Error::new(RenameBusyError { remote_path: new_path }));
+        }
 
         if source_is_junk {
             {
@@ -1795,6 +1800,26 @@ impl Vfs {
         // other — see that method's own doc.
         let adopted_etag =
             if !existed_remotely { dest_remote.as_ref().map(|attr| attr.etag.clone()) } else { None };
+
+        // The destination's own draft is replaced by this rename, exactly
+        // like the file it belongs to. A drafted source overwrites it in
+        // `DraftStore::rename` below; a remote source must drop it here, or
+        // it would keep overlaying its bytes on the renamed file and upload
+        // them over it (a never-uploaded draft adopts the now-existing
+        // remote file on its 40004). Its armed timer closes its cycle with
+        // `UploadCancelled`. An upload already in flight was refused as
+        // busy above.
+        {
+            let mut drafts = self.drafts.lock().await;
+            if drafts.state(&new_path).is_some() {
+                if self.write_queue.cancel(&new_path) {
+                    let _ = self.events.send(VfsEvent::UploadCancelled { remote_path: new_path.clone() });
+                }
+                if drafts.state(&old_path).is_none() {
+                    drafts.remove(&new_path)?;
+                }
+            }
+        }
 
         let had_draft = {
             let mut drafts = self.drafts.lock().await;

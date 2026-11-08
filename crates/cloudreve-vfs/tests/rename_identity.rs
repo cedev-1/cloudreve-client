@@ -267,3 +267,47 @@ async fn moving_a_file_to_another_folder_keeps_its_node_id() {
     assert_eq!(vfs.getattr(id).await.unwrap().unwrap().remote_path, common::uri_of("docs/a.txt"));
     assert_eq!(vfs.lookup(docs, "a.txt").await.unwrap().unwrap().0, id);
 }
+
+/// `mv a.txt b.txt` where `b.txt` is a new file still waiting for its first
+/// upload: the rename replaces it, draft included. The stale draft must not
+/// keep showing its own bytes under the name, nor upload them over the
+/// file that replaced it.
+#[tokio::test]
+async fn renaming_over_a_file_still_waiting_for_its_upload_discards_its_draft() {
+    let env = VfsTestEnv::new().await;
+    env.add_remote_file("a.txt", b"from the server".to_vec(), "e1").await;
+    env.serve_file_content("b.txt", b"from the server").await;
+    let vfs = new_vfs(&env).await;
+    let root = vfs.tree().root();
+    let (_, h) = vfs.create(root, "b.txt").await.unwrap();
+    vfs.write(h, 0, b"stale local draft").await.unwrap();
+    vfs.close(h).await.unwrap();
+    let (id, _) = vfs.lookup(root, "a.txt").await.unwrap().unwrap();
+
+    vfs.rename(root, "a.txt", root, "b.txt").await.unwrap();
+
+    assert_eq!(read_by_id(&vfs, id).await, b"from the server");
+    vfs.wait_for_writeback_idle().await;
+    assert_eq!(env.uploaded_content("b.txt"), None, "the replaced draft must never upload");
+}
+
+/// While the destination's draft is uploading, its bytes are on their way
+/// to the very name the rename targets: the rename waits (EBUSY, which NFS
+/// answers as JUKEBOX and the client retries) instead of racing it.
+#[tokio::test]
+async fn renaming_over_a_file_whose_upload_is_in_flight_is_busy() {
+    let env = VfsTestEnv::new().await;
+    env.add_remote_file("a.txt", b"from the server".to_vec(), "e1").await;
+    let vfs = new_vfs(&env).await;
+    let root = vfs.tree().root();
+    let (_, h) = vfs.create(root, "b.txt").await.unwrap();
+    vfs.write(h, 0, b"uploading").await.unwrap();
+    vfs.close(h).await.unwrap();
+    vfs.set_draft_state_for_tests(&common::uri_of("b.txt"), cloudreve_vfs::writeback::DraftState::Uploading)
+        .await
+        .unwrap();
+
+    let err = vfs.rename(root, "a.txt", root, "b.txt").await.unwrap_err();
+    assert!(err.downcast_ref::<cloudreve_vfs::vfs::RenameBusyError>().is_some(), "{err:#}");
+    assert_eq!(env.rename_call_count(), 0);
+}
