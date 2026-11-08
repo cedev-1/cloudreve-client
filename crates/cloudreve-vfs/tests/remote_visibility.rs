@@ -247,3 +247,75 @@ async fn invalidating_a_folder_itself_still_moves_its_mtime_when_its_children_ch
 
     assert!(mtime(&nfs, &docs).await > before);
 }
+
+
+/// Waits out the nudger's debounce and returns what it nudged, sorted.
+async fn nudged(log: &std::sync::Mutex<Vec<String>>) -> Vec<String> {
+    tokio::time::sleep(cloudreve_vfs::nudge::NUDGE_DEBOUNCE + Duration::from_millis(300)).await;
+    let mut seen = log.lock().unwrap().clone();
+    seen.sort();
+    seen
+}
+
+/// A remote change asks for the folder that lists it to be refreshed in
+/// any window showing it — once per burst, whatever the burst's size.
+#[tokio::test]
+async fn a_burst_of_remote_changes_in_one_folder_refreshes_that_folder_once() {
+    let env = VfsTestEnv::new().await;
+    let (vfs, _nfs, _docs) = browsed_docs(&env, vec![file_in("docs", "a.txt", 1, "e1")]).await;
+    let log = vfs.record_nudges_for_tests();
+
+    for i in 0..500 {
+        vfs.remote_changed(&uri(&format!("docs/f{i}.txt"))).await;
+    }
+
+    assert_eq!(nudged(&log).await, vec!["docs".to_string()]);
+}
+
+/// A rename across folders refreshes both, and a change of the drive's
+/// root folder (a new SSE subscription) refreshes the root.
+#[tokio::test]
+async fn a_rename_refreshes_both_folders_and_a_root_change_the_root() {
+    let env = VfsTestEnv::new().await;
+    env.set_remote_files(vec![remote_dir("docs"), remote_dir("old")]).await;
+    let vfs = new_vfs(&env);
+    let root = vfs.tree().root();
+    for name in ["docs", "old"] {
+        let (id, _) = vfs.lookup(root, name).await.unwrap().unwrap();
+        vfs.readdir(id).await.unwrap();
+    }
+    let log = vfs.record_nudges_for_tests();
+
+    vfs.remote_changed(&uri("old/x.txt")).await;
+    vfs.remote_changed(&uri("docs/x.txt")).await;
+    vfs.remote_changed(REMOTE_BASE).await;
+
+    assert_eq!(nudged(&log).await, vec!["".to_string(), "docs".to_string(), "old".to_string()]);
+}
+
+/// A folder nobody opened is shown by no window: no refresh for it.
+#[tokio::test]
+async fn a_remote_change_in_a_folder_never_opened_refreshes_nothing() {
+    let env = VfsTestEnv::new().await;
+    env.set_remote_files(vec![remote_dir("docs")]).await;
+    let vfs = new_vfs(&env);
+    vfs.lookup(vfs.tree().root(), "docs").await.unwrap().unwrap();
+    let log = vfs.record_nudges_for_tests();
+
+    vfs.remote_changed(&uri("docs/a.txt")).await;
+
+    assert!(nudged(&log).await.is_empty());
+}
+
+/// Once the mount is gone (pause, shutdown), nothing is nudged.
+#[tokio::test]
+async fn nothing_is_refreshed_after_nudging_stopped() {
+    let env = VfsTestEnv::new().await;
+    let (vfs, _nfs, _docs) = browsed_docs(&env, vec![file_in("docs", "a.txt", 1, "e1")]).await;
+    let log = vfs.record_nudges_for_tests();
+    vfs.stop_nudging().await;
+
+    vfs.remote_changed(&uri("docs/b.txt")).await;
+
+    assert!(nudged(&log).await.is_empty());
+}

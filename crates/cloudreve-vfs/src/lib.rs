@@ -18,6 +18,7 @@ pub mod fuse;
 // whole module — see its own doc.
 pub mod mount;
 pub mod nfs;
+pub mod nudge;
 pub mod tree;
 pub mod vfs;
 pub mod writeback;

@@ -527,3 +527,54 @@ fn assert_vfs_event_variants_are_exhaustively_handled(e: VfsEvent) {
         | VfsEvent::ConflictSaved { .. } => {}
     }
 }
+
+// ---------------------------------------------------------------------
+// Folder refresh: SSE events reach the vfs nudger for the right folders.
+// ---------------------------------------------------------------------
+
+/// An open Finder/file-manager window only refreshes on a local VFS
+/// operation, so each remote change must reach the vfs nudger
+/// (`cloudreve_vfs::nudge`) for the folder that lists it — through the
+/// production SSE handling, not a hand call. A burst of events coalesces
+/// to one refresh per folder; a rename refreshes both ends; a folder never
+/// opened is left alone.
+#[tokio::test]
+async fn sse_events_refresh_each_affected_open_folder_once() {
+    let env = TestEnv::with_mode(DriveMode::OnDemand).await;
+    let (files, _hits) = mount_listing_mock(&env.server).await;
+    set_files(
+        &files,
+        REMOTE_BASE,
+        vec![remote_dir_at("a", REMOTE_BASE), remote_dir_at("b", REMOTE_BASE), remote_dir_at("closed", REMOTE_BASE)],
+    );
+
+    let vfs = env.mount.vfs.lock().await.clone().expect("on-demand vfs");
+    let root = vfs.tree().root();
+    for name in ["a", "b"] {
+        let (id, _) = vfs.tree().lookup(root, name).await.unwrap().expect("dir");
+        vfs.tree().readdir(id).await.unwrap();
+    }
+    let nudged = vfs.record_nudges_for_tests();
+
+    let mut burst: Vec<String> = (0..50)
+        .map(|i| format!(r#"{{"type":"create","file_id":"f{i}","from":"/a/new-{i}.txt"}}"#))
+        .collect();
+    burst.push(r#"{"type":"rename","file_id":"r","from":"/a/x.txt","to":"/b/x.txt"}"#.into());
+    burst.push(r#"{"type":"modify","file_id":"c","from":"/closed/y.txt"}"#.into());
+    mount_sse(&env.server, format!("event: event\ndata: [{}]\n\n", burst.join(","))).await;
+    tokio::spawn(run_remote_event_loop(env.mount.clone()));
+
+    let mut seen = Vec::new();
+    for _ in 0..60 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        seen = nudged.lock().unwrap().clone();
+        if seen.len() >= 2 {
+            break;
+        }
+    }
+    // Let any duplicate (a broken coalescing) show up before asserting.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    seen = nudged.lock().unwrap().clone();
+    seen.sort();
+    assert_eq!(seen, vec!["a".to_string(), "b".to_string()]);
+}

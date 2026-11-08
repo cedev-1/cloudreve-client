@@ -458,7 +458,8 @@ mod macos_impl {
         MOUNT_OPTS
     }
 
-    async fn mount_with(fs: VfsNfs,mountpoint: &Path, cache_dir: &Path, mount_opts: &str) -> Result<MountedVfs> {
+    async fn mount_with(fs: VfsNfs, mountpoint: &Path, cache_dir: &Path, mount_opts: &str) -> Result<MountedVfs> {
+        let vfs = fs.vfs();
         if let Err(err) = cleanup_stale_mount(mountpoint, cache_dir).await {
             tracing::warn!(
                 mountpoint = %mountpoint.display(),
@@ -499,10 +500,15 @@ mod macos_impl {
             );
         }
 
+        // Attached: from now on a remote change can refresh the folders a
+        // Finder window shows (`crate::nudge`).
+        vfs.start_nudging(crate::nudge::touch_through(mountpoint.to_path_buf()));
+
         Ok(MountedVfs {
             mountpoint: mountpoint.to_path_buf(),
             cache_dir: cache_dir.to_path_buf(),
             server_task: Some(server_task),
+            vfs,
         })
     }
 
@@ -535,6 +541,9 @@ mod macos_impl {
         mountpoint: PathBuf,
         cache_dir: PathBuf,
         server_task: Option<JoinHandle<()>>,
+        /// Held to stop its folder refreshes (`crate::nudge`) before the
+        /// mount goes away.
+        vfs: Arc<Vfs>,
     }
 
     impl MountedVfs {
@@ -544,6 +553,9 @@ mod macos_impl {
         /// `remove_mount_marker`'s doc), then the in-process server task is
         /// aborted. Order matters — see the module doc.
         pub async fn unmount(mut self) -> Result<()> {
+            // No folder refresh may still be touching the mountpoint (an
+            // open fd there would make the unmount busy).
+            self.vfs.stop_nudging().await;
             escalate_unmount(&self.mountpoint).await?;
             remove_mount_marker(&self.cache_dir);
             if let Some(task) = self.server_task.take() {
@@ -570,6 +582,7 @@ mod macos_impl {
         /// attempt on a mount the test still needs intact.
         #[doc(hidden)]
         pub fn abort_server_for_tests(mut self) {
+            self.vfs.stop_nudging_now();
             if let Some(task) = self.server_task.take() {
                 task.abort();
             }
@@ -582,6 +595,7 @@ mod macos_impl {
             // `abort_server_for_tests`) already handled cleanup — see the
             // module doc's sentinel note.
             if let Some(task) = self.server_task.take() {
+                self.vfs.stop_nudging_now();
                 if let Err(err) = escalate_unmount_sync(&self.mountpoint) {
                     tracing::warn!(
                         mountpoint = %self.mountpoint.display(),
@@ -927,7 +941,7 @@ mod linux_impl {
         }
 
         let rt = tokio::runtime::Handle::current();
-        let fs = VfsFuse::new(vfs, rt);
+        let fs = VfsFuse::new(vfs.clone(), rt);
         let options = [
             fuser::MountOption::FSName(volume_name.to_string()),
             fuser::MountOption::Subtype("cloudreve".to_string()),
@@ -950,10 +964,15 @@ mod linux_impl {
             );
         }
 
+        // Attached: from now on a remote change can refresh the folders a
+        // file manager shows (`crate::nudge`).
+        vfs.start_nudging(crate::nudge::touch_through(mountpoint.to_path_buf()));
+
         Ok(MountedVfs {
             mountpoint: mountpoint.to_path_buf(),
             cache_dir: cache_dir.to_path_buf(),
             session: Some(session),
+            vfs,
         })
     }
 
@@ -965,6 +984,9 @@ mod linux_impl {
         mountpoint: PathBuf,
         cache_dir: PathBuf,
         session: Option<fuser::BackgroundSession>,
+        /// Held to stop its folder refreshes (`crate::nudge`) before the
+        /// mount goes away.
+        vfs: Arc<Vfs>,
     }
 
     impl MountedVfs {
@@ -976,6 +998,7 @@ mod linux_impl {
         /// [`blocking_bounded`] rather than an unbounded direct
         /// `/proc/mounts` read.
         pub async fn unmount(mut self) -> Result<()> {
+            self.vfs.stop_nudging().await;
             if let Some(session) = self.session.take() {
                 drop(session);
             }
@@ -1020,6 +1043,7 @@ mod linux_impl {
         /// the same point made from the test's side.
         #[doc(hidden)]
         pub fn abort_server_for_tests(mut self) {
+            self.vfs.stop_nudging_now();
             if let Some(session) = self.session.take() {
                 std::mem::forget(session);
             }
@@ -1029,6 +1053,7 @@ mod linux_impl {
     impl Drop for MountedVfs {
         fn drop(&mut self) {
             if self.session.is_some() {
+                self.vfs.stop_nudging_now();
                 tracing::debug!(
                     mountpoint = %self.mountpoint.display(),
                     "vfs: dropping a fuse mount without an explicit unmount() call — best-effort \

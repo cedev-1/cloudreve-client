@@ -298,12 +298,13 @@ impl Mount {
 
     /// D4 (on-demand): folds a batch of SSE events straight into vfs tree
     /// invalidation — no local paths, no `task_queue`, no `command_tx`.
-    /// `VfsTree::invalidate_path` already does the heavy lifting for a
-    /// single call (self-if-known-dir, plus its parent — see its own doc),
-    /// so this only needs to call it once per event's `from`, plus once
-    /// more for `to` on a rename: the source's old parent and the
-    /// destination's (possibly different) new parent both need their
-    /// cached listing forgotten.
+    /// `Vfs::remote_changed` already does the heavy lifting for a single
+    /// call (tree invalidation of the path and its parent, then a refresh of
+    /// that folder in any open file-manager window, coalesced per folder —
+    /// see `cloudreve_vfs::nudge`), so this only needs to call it once per
+    /// event's `from`, plus once more for `to` on a rename: the source's old
+    /// parent and the destination's (possibly different) new parent both
+    /// need their cached listing forgotten and their window refreshed.
     async fn handle_file_events_on_demand(&self, events: Vec<FileEventData>) -> Result<()> {
         let Some(vfs) = self.vfs.lock().await.clone() else {
             // `start()` hasn't finished building the vfs yet (or this drive

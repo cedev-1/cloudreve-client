@@ -213,6 +213,11 @@ impl VfsNfs {
         }
     }
 
+    /// The facade this adapter serves.
+    pub(crate) fn vfs(&self) -> Arc<Vfs> {
+        self.vfs.clone()
+    }
+
     fn is_never_index(&self, dir: &FileHandleU64, name: &str) -> bool {
         dir.as_u64() == self.vfs.tree().root().0 && name == NEVER_INDEX_NAME
     }

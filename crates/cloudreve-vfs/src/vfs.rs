@@ -25,6 +25,7 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 
 use crate::cache::{BlockCache, FileKey, BLOCK_SIZE};
 use crate::junk::{self, JunkKind};
+use crate::nudge::{Nudger, Perform, NUDGE_DEBOUNCE};
 use crate::tree::{NodeAttr, NodeId, VfsTree};
 use crate::writeback::{DraftInit, DraftState, DraftStore, WriteBackQueue};
 
@@ -609,6 +610,9 @@ pub struct Vfs {
     junk: std::sync::Mutex<HashMap<String, JunkFile>>,
     /// Test-only: see `refuse_local_only_junk_for_tests`.
     refuse_local_only_junk: std::sync::atomic::AtomicBool,
+    /// Refreshes folders open in a file manager after a remote change
+    /// (`crate::nudge`). Present only while the OS mount is attached.
+    nudger: std::sync::Mutex<Option<Nudger>>,
 }
 
 impl Vfs {
@@ -717,6 +721,7 @@ impl Vfs {
                 events: events_tx,
                 junk: std::sync::Mutex::new(HashMap::new()),
                 refuse_local_only_junk: std::sync::atomic::AtomicBool::new(false),
+                nudger: std::sync::Mutex::new(None),
             },
             events_rx,
         ))
@@ -728,9 +733,58 @@ impl Vfs {
 
     /// The one entry point for "this remote path changed on the server"
     /// (an SSE event, a fresh subscription): forgets the tree's cached
-    /// view of it so the next access refetches.
+    /// view of it so the next access refetches, and asks for the folder
+    /// listing it to be refreshed in any file-manager window showing it
+    /// (`crate::nudge`) — if that folder was ever listed, i.e. could be
+    /// on screen at all.
     pub async fn remote_changed(&self, remote_path: &str) {
         self.tree.invalidate_path(remote_path).await;
+        if self.nudger.lock().unwrap().is_none() {
+            return;
+        }
+        if let Some(rel) = self.tree.listed_folder_of(remote_path).await {
+            if let Some(nudger) = self.nudger.lock().unwrap().as_ref() {
+                nudger.request(rel);
+            }
+        }
+    }
+
+    /// Starts refreshing folders through `perform` (`crate::mount` passes
+    /// one that touches the mountpoint), replacing any earlier nudger.
+    pub(crate) fn start_nudging(&self, perform: Perform) {
+        let old = self.nudger.lock().unwrap().replace(Nudger::start(perform, NUDGE_DEBOUNCE));
+        if let Some(old) = old {
+            old.stop_now();
+        }
+    }
+
+    /// Stops refreshing folders; returns once no refresh is running.
+    /// `crate::mount` calls it before detaching the OS mount.
+    pub async fn stop_nudging(&self) {
+        let nudger = self.nudger.lock().unwrap().take();
+        if let Some(nudger) = nudger {
+            nudger.stop().await;
+        }
+    }
+
+    /// [`Vfs::stop_nudging`] for a `Drop` path that cannot await.
+    pub(crate) fn stop_nudging_now(&self) {
+        if let Some(nudger) = self.nudger.lock().unwrap().take() {
+            nudger.stop_now();
+        }
+    }
+
+    /// Test-only: refreshes are recorded (folder path relative to the
+    /// drive root, `""` for the root) instead of touching any mount.
+    #[doc(hidden)]
+    pub fn record_nudges_for_tests(&self) -> Arc<std::sync::Mutex<Vec<String>>> {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let l = log.clone();
+        self.start_nudging(Arc::new(move |rel: &str| {
+            l.lock().unwrap().push(rel.to_string());
+            Ok(())
+        }));
+        log
     }
 
     /// `crate::junk::classify`, unless `refuse_local_only_junk_for_tests`

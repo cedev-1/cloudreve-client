@@ -486,6 +486,31 @@ impl VfsTree {
         }
     }
 
+    /// The folder whose listing a change to `remote_path` affects — its
+    /// parent, or the root itself when `remote_path` is the root — as a
+    /// path relative to the root (`""` for the root), provided that folder
+    /// has been listed: one never listed has nothing on screen to refresh.
+    pub async fn listed_folder_of(&self, remote_path: &str) -> Option<String> {
+        let inner = self.inner.read().await;
+        let base = &inner.attrs.get(&ROOT)?.remote_path;
+        let folder = if remote_path == base {
+            remote_path
+        } else {
+            remote_path.rsplit_once('/')?.0
+        };
+        let listed = inner
+            .attrs
+            .iter()
+            .any(|(id, attr)| attr.is_dir && attr.remote_path == folder && inner.children.contains_key(id));
+        if !listed {
+            return None;
+        }
+        if folder == base {
+            return Some(String::new());
+        }
+        folder.strip_prefix(base.as_str())?.strip_prefix('/').map(str::to_string)
+    }
+
     /// Inserts a local-only entry (created via `Vfs::create`, not yet
     /// confirmed by any server listing) as a child of `parent`, so it is
     /// immediately visible to lookups/readdir once the facade overlays it
