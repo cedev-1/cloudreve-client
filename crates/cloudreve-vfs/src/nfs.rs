@@ -117,6 +117,8 @@ type ReadResult = Result<(Vec<u8>, bool), nfsstat3>;
 /// and cookie scheme.
 pub struct VfsNfs {
     vfs: Arc<Vfs>,
+    /// [`READ_JUKEBOX_AFTER`] in production; see [`VfsNfs::with_read_jukebox_after`].
+    read_jukebox_after: Duration,
     /// READs that outlived [`READ_JUKEBOX_AFTER`] and were answered with
     /// JUKEBOX, still running, waiting for the client's resend.
     slow_reads: Mutex<HashMap<ReadKey, (Instant, JoinHandle<ReadResult>)>>,
@@ -124,7 +126,15 @@ pub struct VfsNfs {
 
 impl VfsNfs {
     pub fn new(vfs: Arc<Vfs>) -> Self {
-        Self { vfs, slow_reads: Mutex::new(HashMap::new()) }
+        Self::with_read_jukebox_after(vfs, READ_JUKEBOX_AFTER)
+    }
+
+    /// Test-only: overrides [`READ_JUKEBOX_AFTER`]. A huge value disables
+    /// JUKEBOX entirely, which is how `tests/mounted_macos.rs` measures the
+    /// client's own soft-timeout budget for a held READ.
+    #[doc(hidden)]
+    pub fn with_read_jukebox_after(vfs: Arc<Vfs>, read_jukebox_after: Duration) -> Self {
+        Self { vfs, read_jukebox_after, slow_reads: Mutex::new(HashMap::new()) }
     }
 }
 
@@ -204,7 +214,7 @@ impl NfsReadFileSystem for VfsNfs {
                 None => tokio::spawn(read_once(self.vfs.clone(), NodeId(key.0), offset, count)),
             }
         };
-        match tokio::time::timeout(READ_JUKEBOX_AFTER, &mut task).await {
+        match tokio::time::timeout(self.read_jukebox_after, &mut task).await {
             Ok(joined) => joined.unwrap_or(Err(nfsstat3::NFS3ERR_IO)),
             Err(_) => {
                 self.slow_reads.lock().unwrap().insert(key, (Instant::now(), task));

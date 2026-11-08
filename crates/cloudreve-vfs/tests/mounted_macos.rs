@@ -435,3 +435,122 @@ async fn a_read_slower_than_the_soft_timeout_still_returns_the_bytes() {
 
     assert_eq!(content.expect("a slow read must not fail"), b"hello world");
 }
+
+/// MEASUREMENT (item 1 of the NFS hardening wave): how long can a READ be
+/// held, unanswered, before the macOS client's soft timeout hands the app
+/// an error? JUKEBOX is disabled (threshold 10 minutes) so the server
+/// really holds each READ for the whole download delay. Before each slow
+/// read, a few fast cold reads train the client's READ RTT estimator, the
+/// way an ordinary warm mount would have. Results go straight to the
+/// process's stderr (bypassing libtest's capture) as `SOFT-BUDGET` lines.
+#[tokio::test(flavor = "multi_thread")]
+async fn measure_soft_timeout_budget_for_a_held_read() {
+    use std::io::Write;
+
+    let variants: [(&str, &str, &[u64]); 2] = [
+        (
+            "rto",
+            "locallocks,mutejukebox,vers=3,tcp,soft,timeo=30,retrans=2",
+            &[500, 1000, 2000, 4000, 8000],
+        ),
+        (
+            "dumbtimer",
+            "locallocks,mutejukebox,vers=3,tcp,soft,dumbtimer,timeo=30,retrans=2",
+            &[1000, 2000, 4000, 8000, 12000],
+        ),
+    ];
+
+    let env = VfsTestEnv::new().await;
+    let mut listing = Vec::new();
+    for (label, _, delays) in &variants {
+        for d in delays.iter() {
+            for w in 0..4 {
+                let name = format!("warm-{label}-{d}-{w}.txt");
+                listing.push(remote_file(&name, 11, "e1"));
+                env.serve_file_content(&name, b"hello world").await;
+            }
+            let name = format!("slow-{label}-{d}.txt");
+            listing.push(remote_file(&name, 11, "e1"));
+            env.serve_file_content(&name, b"hello world").await;
+            env.slow_down_downloads(&name, Duration::from_millis(*d));
+        }
+    }
+    env.set_remote_files(listing).await;
+    let vfs = new_test_vfs(&env).await;
+
+    for (label, opts, delays) in &variants {
+        let mp = tempfile::tempdir().unwrap();
+        let mountpoint = mp.path().to_path_buf();
+        let _guard = MountpointGuard(mountpoint.clone());
+        let mounted = mount::mount_with_nfs_tuning_for_tests(
+            vfs.clone(),
+            &mountpoint,
+            env.cache_dir(),
+            Duration::from_secs(600),
+            opts,
+        )
+        .await
+        .expect("mount should succeed");
+
+        for d in delays.iter() {
+            for w in 0..4 {
+                let p = mountpoint.join(format!("warm-{label}-{d}-{w}.txt"));
+                blocking_with_timeout(move || std::fs::read(&p).unwrap()).await;
+            }
+            let p = mountpoint.join(format!("slow-{label}-{d}.txt"));
+            let started = std::time::Instant::now();
+            let res = tokio::time::timeout(
+                Duration::from_secs(60),
+                tokio::task::spawn_blocking(move || std::fs::read(&p)),
+            )
+            .await
+            .expect("read hung past 60s")
+            .unwrap();
+            let outcome = match &res {
+                Ok(bytes) if bytes == b"hello world" => "OK".to_string(),
+                Ok(bytes) => format!("WRONG BYTES ({} bytes)", bytes.len()),
+                Err(e) => format!("ERR {e} (os {:?})", e.raw_os_error()),
+            };
+            let _ = writeln!(
+                std::io::stderr(),
+                "SOFT-BUDGET variant={label} delay_ms={d} elapsed_ms={} outcome={outcome}",
+                started.elapsed().as_millis()
+            );
+        }
+        mounted.unmount().await.expect("unmount should succeed");
+    }
+}
+
+/// A cold block that takes about a second to download (an ordinary remote
+/// Cloudreve server) must be answered directly, not deferred with JUKEBOX:
+/// every JUKEBOX costs the app a 4s client-side sleep before the resend.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_one_second_read_is_answered_without_the_jukebox_sleep() {
+    let env = VfsTestEnv::new().await;
+    env.set_remote_files(vec![remote_file("remote.txt", 11, "e1")]).await;
+    env.serve_file_content("remote.txt", b"hello world").await;
+    env.slow_down_downloads("remote.txt", Duration::from_millis(1000));
+
+    let vfs = new_test_vfs(&env).await;
+
+    let mp = tempfile::tempdir().unwrap();
+    let mountpoint = mp.path().to_path_buf();
+    let _guard = MountpointGuard(mountpoint.clone());
+
+    let mounted = mount::mount(vfs.clone(), &mountpoint, "CloudreveTest", env.cache_dir())
+        .await
+        .expect("mount should succeed");
+
+    let read_path = mountpoint.join("remote.txt");
+    let started = std::time::Instant::now();
+    let content = blocking_with_timeout(move || std::fs::read(&read_path)).await;
+    let elapsed = started.elapsed();
+
+    mounted.unmount().await.expect("unmount should succeed");
+
+    assert_eq!(content.expect("the read must succeed"), b"hello world");
+    assert!(
+        elapsed < Duration::from_millis(3000),
+        "a 1s download must not pay the 4s JUKEBOX sleep, the read took {elapsed:?}"
+    );
+}

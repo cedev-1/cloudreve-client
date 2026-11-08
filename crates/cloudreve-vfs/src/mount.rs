@@ -278,6 +278,7 @@ mod macos_impl {
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use anyhow::{bail, Context, Result};
     use nfs3_server::tcp::{NFSTcp, NFSTcpListener};
@@ -359,7 +360,26 @@ mod macos_impl {
         // here only so the parameter's purpose is documented at the call
         // site rather than silently swallowed.
         let _ = volume_name;
+        mount_with(VfsNfs::new(vfs), mountpoint, cache_dir, MOUNT_OPTS).await
+    }
 
+    /// Test-only: [`mount`] with the READ JUKEBOX threshold and the
+    /// `mount_nfs` option string (minus `port=`/`mountport=`) replaced —
+    /// how `tests/mounted_macos.rs` measures the client's soft-timeout
+    /// budget for a held READ under different option sets.
+    #[doc(hidden)]
+    pub async fn mount_with_nfs_tuning_for_tests(
+        vfs: Arc<Vfs>,
+        mountpoint: &Path,
+        cache_dir: &Path,
+        read_jukebox_after: Duration,
+        mount_opts: &str,
+    ) -> Result<MountedVfs> {
+        mount_with(VfsNfs::with_read_jukebox_after(vfs, read_jukebox_after), mountpoint, cache_dir, mount_opts)
+            .await
+    }
+
+    async fn mount_with(fs: VfsNfs, mountpoint: &Path, cache_dir: &Path, mount_opts: &str) -> Result<MountedVfs> {
         if let Err(err) = cleanup_stale_mount(mountpoint, cache_dir).await {
             tracing::warn!(
                 mountpoint = %mountpoint.display(),
@@ -368,7 +388,6 @@ mod macos_impl {
             );
         }
 
-        let fs = VfsNfs::new(vfs);
         let listener = NFSTcpListener::bind("127.0.0.1:0", fs)
             .await
             .context("binding the in-process nfs3 server to 127.0.0.1:0")?;
@@ -381,8 +400,9 @@ mod macos_impl {
         });
 
         let mountpoint_owned = mountpoint.to_path_buf();
+        let opts_owned = mount_opts.to_string();
         let mount_result =
-            blocking_bounded(MOUNT_BUDGET, move || run_mount_nfs(&mountpoint_owned, port))
+            blocking_bounded(MOUNT_BUDGET, move || run_mount_nfs(&mountpoint_owned, &opts_owned, port))
                 .await
                 .and_then(std::convert::identity);
         if let Err(err) = mount_result {
@@ -411,9 +431,9 @@ mod macos_impl {
     /// `127.0.0.1:<port>`, attaching it at `mountpoint`. See [`MOUNT_OPTS`]'s
     /// doc for why each flag is there. Synchronous: always reached through
     /// [`blocking_bounded`] (see `mount`'s body), never called directly.
-    fn run_mount_nfs(mountpoint: &Path, port: u16) -> Result<()> {
+    fn run_mount_nfs(mountpoint: &Path, mount_opts: &str, port: u16) -> Result<()> {
         let mp = mountpoint.to_str().context("mountpoint path must be valid utf-8")?;
-        let opts = format!("{MOUNT_OPTS},port={port},mountport={port}");
+        let opts = format!("{mount_opts},port={port},mountport={port}");
         let output = Command::new("/sbin/mount_nfs")
             .args(["-o", &opts, "127.0.0.1:/", mp])
             .output()
@@ -649,7 +669,7 @@ mod macos_impl {
 }
 
 #[cfg(target_os = "macos")]
-pub use macos_impl::{cleanup_stale_mount, mount, MountedVfs};
+pub use macos_impl::{cleanup_stale_mount, mount, mount_with_nfs_tuning_for_tests, MountedVfs};
 
 #[cfg(target_os = "linux")]
 mod linux_impl {
