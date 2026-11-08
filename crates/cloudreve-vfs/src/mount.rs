@@ -367,8 +367,21 @@ mod macos_impl {
     ///     created remotely after an app looked for it resolves at once.
     ///     A miss costs one LOOKUP served from the tree's listing.
     ///
-    /// Measured on the macos-latest CI runner
-    /// (`measure_rpc_and_http_cost_of_mount_options`): see that test's doc.
+    /// Measured on the macos-latest CI runner, two runs each, interleaved
+    /// (`measure_rpc_and_http_cost_of_mount_options`; RPCs counted at the
+    /// adapter, HTTP = listing requests to the Cloudreve server):
+    ///
+    /// | workload                    | before                       | with `actimeo=1,nonegnamecache`       |
+    /// |-----------------------------|------------------------------|---------------------------------------|
+    /// | `ls -lR`, 2,000 files, cold | 197-287 ms, 21 READDIRPLUS, 21 HTTP | 180-198 ms, 21 READDIRPLUS, 21 HTTP |
+    /// | same, 2 s later             | 0 RPC, 0 HTTP (cache trusted) | 22 GETATTR + 21 READDIRPLUS, 0 HTTP  |
+    /// | same, 7 s later             | 0 RPC, 0 HTTP (cache trusted) | 22 GETATTR + 21 READDIRPLUS, 21 HTTP |
+    /// | 200 MB sequential read      | 204-294 MB/s, ~270 GETATTR   | 283-305 MB/s, ~277 GETATTR            |
+    /// | 50 MB write                 | 132-244 MB/s, 56 GETATTR     | 200-220 MB/s, 56 GETATTR              |
+    ///
+    /// The "0 RPC" rows are the staleness this fixes: the kernel answered
+    /// from a cache it would have trusted for up to 60 s. HTTP stays one
+    /// listing per folder per `LISTING_TTL`, however often the kernel asks.
     const MOUNT_OPTS: &str = "locallocks,mutejukebox,vers=3,tcp,soft,dumbtimer,timeo=30,retrans=2,\
                               nobrowse,rsize=1048576,wsize=1048576,readahead=4,actimeo=1,nonegnamecache";
 

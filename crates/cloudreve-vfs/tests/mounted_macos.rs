@@ -1439,7 +1439,9 @@ async fn measure_rpc_and_http_cost_of_mount_options() {
 /// Minimal FSEvents binding for the Finder-level check below.
 mod fsevents {
     use std::ffi::{c_char, c_void, CString};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+
+    type Log = Mutex<Vec<(String, u32)>>;
 
     #[repr(C)]
     struct StreamContext {
@@ -1481,10 +1483,17 @@ mod fsevents {
         fn dispatch_queue_create(label: *const c_char, attr: *const c_void) -> *mut c_void;
     }
 
-    extern "C" fn on_events(_: *const c_void, info: *mut c_void, n: usize, _: *mut c_void, _: *const u32, _: *const u64) {
-        if n > 0 {
-            // SAFETY: `info` is the `AtomicBool` `Watch` keeps alive.
-            unsafe { &*(info as *const AtomicBool) }.store(true, Ordering::SeqCst);
+    extern "C" fn on_events(_: *const c_void, info: *mut c_void, n: usize, paths: *mut c_void, flags: *const u32, _: *const u64) {
+        // SAFETY: `info` is the log `Watch` keeps alive; without
+        // `UseCFTypes`, `paths` is an array of `n` C strings and `flags`
+        // of `n` flags.
+        let log = unsafe { &*(info as *const Log) };
+        let paths = paths as *const *const c_char;
+        for i in 0..n {
+            let (path, flag) = unsafe {
+                (std::ffi::CStr::from_ptr(*paths.add(i)).to_string_lossy().into_owned(), *flags.add(i))
+            };
+            log.lock().unwrap().push((path, flag));
         }
     }
 
@@ -1492,20 +1501,20 @@ mod fsevents {
     /// views refresh from.
     pub struct Watch {
         stream: *mut c_void,
-        seen: Box<AtomicBool>,
+        log: Box<Log>,
     }
 
     // SAFETY: the stream is only started/stopped from the owning thread;
-    // events arrive on its own dispatch queue and only touch `seen`.
+    // events arrive on its own dispatch queue and only touch `log`.
     unsafe impl Send for Watch {}
 
     impl Watch {
         pub fn start(dir: &std::path::Path) -> Self {
-            let seen = Box::new(AtomicBool::new(false));
+            let log: Box<Log> = Box::new(Mutex::new(Vec::new()));
             let path = CString::new(dir.to_str().unwrap()).unwrap();
             let ctx = StreamContext {
                 version: 0,
-                info: &*seen as *const AtomicBool as *mut c_void,
+                info: &*log as *const Log as *mut c_void,
                 retain: std::ptr::null(),
                 release: std::ptr::null(),
                 copy_description: std::ptr::null(),
@@ -1524,15 +1533,16 @@ mod fsevents {
                 assert_eq!(FSEventStreamStart(stream), 1, "FSEventStreamStart failed");
                 stream
             };
-            Self { stream, seen }
+            Self { stream, log }
         }
 
         pub fn seen(&self) -> bool {
-            self.seen.load(Ordering::SeqCst)
+            !self.log.lock().unwrap().is_empty()
         }
 
-        pub fn reset(&self) {
-            self.seen.store(false, Ordering::SeqCst);
+        /// Every (path, flags) received since the last call, cleared.
+        pub fn take(&self) -> Vec<(String, u32)> {
+            std::mem::take(&mut *self.log.lock().unwrap())
         }
     }
 
@@ -1574,9 +1584,9 @@ async fn a_remote_change_reaches_an_fsevents_stream_on_the_open_folder_within_3s
     }
     let live = watch.seen();
     tokio::time::sleep(Duration::from_millis(500)).await;
-    watch.reset();
+    let warmup_events = watch.take();
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let spurious = watch.seen();
+    let spurious = watch.take();
 
     env.set_remote_files_at(
         "docs",
@@ -1596,12 +1606,21 @@ async fn a_remote_change_reaches_an_fsevents_stream_on_the_open_folder_within_3s
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let change_events = watch.take();
     drop(watch);
     mounted.unmount().await.expect("unmount should succeed");
 
+    {
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr(),
+            "FSEVENTS warmup={warmup_events:?} spurious={spurious:?} change={change_events:?}"
+        );
+    }
     report_latency("FSEvents on docs/", took);
     assert!(live, "the FSEvents stream never saw a local operation on the folder: nothing to measure");
-    assert!(!spurious, "an event arrived before any change: the check would prove nothing");
+    assert!(spurious.is_empty(), "an event arrived before any change: the check would prove nothing");
     let took = took.expect("no FSEvents event for the open folder: Finder would never refresh it");
     assert!(took <= REMOTE_CHANGE_VISIBLE_WITHIN, "FSEvents took {took:?}");
 }
