@@ -1261,17 +1261,24 @@ async fn a_remote_change_wakes_a_kqueue_watch_on_the_open_folder_within_3s() {
     // SAFETY: registers one well-formed change on a live kqueue.
     let rc = unsafe { libc::kevent(kq, &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
     assert_eq!(rc, 0, "kevent register failed");
+    // Registering the watch makes the NFS client poll the folder's
+    // attributes (`nfs_vnop_monitor`; `nfs_mount_sock_thread` re-polls
+    // monitored vnodes every 5 s), and that poll alone also reports a moved
+    // mtime. Let the first poll pass, then require three changes in a row
+    // to each wake the watch within 1 s: a 5 s poll cannot do that.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    blocking_with_timeout(move || while wait_note_write(kq, Duration::from_millis(10)).is_some() {}).await;
 
-    env.set_remote_files_at(
-        "docs",
-        vec![
-            file_in("docs", "a.txt", 1, "e1", "2026-01-02T00:00:00Z"),
-            file_in("docs", "b.txt", 2, "e2", "2026-03-01T10:00:00Z"),
-        ],
-    )
-    .await;
-    vfs.remote_changed(&format!("{}/docs/b.txt", common::REMOTE_BASE)).await;
-    let woke = blocking_with_timeout(move || wait_note_write(kq, Duration::from_secs(5))).await;
+    let mut files = vec![file_in("docs", "a.txt", 1, "e1", "2026-01-02T00:00:00Z")];
+    let mut woke = Vec::new();
+    for round in 0..3 {
+        files.push(file_in("docs", &format!("b{round}.txt"), 2, "e2", "2026-03-01T10:00:00Z"));
+        env.set_remote_files_at("docs", files.clone()).await;
+        vfs.remote_changed(&format!("{}/docs/b{round}.txt", common::REMOTE_BASE)).await;
+        woke.push(blocking_with_timeout(move || wait_note_write(kq, Duration::from_secs(5))).await);
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        blocking_with_timeout(move || while wait_note_write(kq, Duration::from_millis(10)).is_some() {}).await;
+    }
     let d = docs.clone();
     let listed = blocking_with_timeout(move || {
         let mut names = names_in(&d);
@@ -1287,10 +1294,14 @@ async fn a_remote_change_wakes_a_kqueue_watch_on_the_open_folder_within_3s() {
     vfs.wait_for_writeback_idle().await;
     mounted.unmount().await.expect("unmount should succeed");
 
-    report_latency("kqueue NOTE_WRITE on docs/", woke);
-    let woke = woke.expect("no NOTE_WRITE on the open folder: Finder would never refresh it");
-    assert!(woke <= REMOTE_CHANGE_VISIBLE_WITHIN, "NOTE_WRITE took {woke:?}");
-    assert_eq!(listed, vec!["a.txt".to_string(), "b.txt".to_string()], "what Finder re-reads");
+    for (round, took) in woke.iter().enumerate() {
+        report_latency(&format!("kqueue NOTE_WRITE on docs/ #{round}"), *took);
+    }
+    for took in &woke {
+        let took = took.expect("no NOTE_WRITE on the open folder: Finder would never refresh it");
+        assert!(took <= Duration::from_secs(1), "NOTE_WRITE took {took:?}");
+    }
+    assert_eq!(listed, ["a.txt", "b0.txt", "b1.txt", "b2.txt"], "what Finder re-reads");
     assert_eq!(env.upload_session_count(), 0, "a refresh must never upload anything");
 }
 
@@ -1571,15 +1582,17 @@ async fn a_remote_change_reaches_an_fsevents_stream_on_the_open_folder_within_3s
     // The stream registers with fseventsd asynchronously and only gets
     // events newer than that: prove it live with a local operation first
     // (a local-only junk file, never uploaded), then start from silence.
-    let probe = docs.join("._fsevents-warmup");
+    // The probe is the production refresh itself, run by hand (a plain
+    // `std::fs::write` of another `._` name through the canonical path
+    // produced no event on the CI runner, for reasons not pinned down).
+    let probe = cloudreve_vfs::nudge::touch_through(mp.clone());
+    let mut warmup_errors = Vec::new();
     let warm_start = std::time::Instant::now();
     while !watch.seen() && warm_start.elapsed() < Duration::from_secs(10) {
         let p = probe.clone();
-        blocking_with_timeout(move || {
-            let _ = std::fs::write(&p, b"x");
-            let _ = std::fs::remove_file(&p);
-        })
-        .await;
+        if let Err(err) = blocking_with_timeout(move || p("docs")).await {
+            warmup_errors.push(err.to_string());
+        }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
     let live = watch.seen();
@@ -1615,7 +1628,7 @@ async fn a_remote_change_reaches_an_fsevents_stream_on_the_open_folder_within_3s
         use std::io::Write;
         let _ = writeln!(
             std::io::stderr(),
-            "FSEVENTS warmup={warmup_events:?} spurious={spurious:?} change={change_events:?}"
+            "FSEVENTS warmup={warmup_events:?} warmup_errors={warmup_errors:?} spurious={spurious:?} change={change_events:?}"
         );
     }
     report_latency("FSEvents on docs/", took);
