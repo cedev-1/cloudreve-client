@@ -428,3 +428,45 @@ async fn renaming_an_open_file_through_the_mount_fails_with_ebusy() {
 
     mounted.unmount().await.expect("unmount should succeed");
 }
+
+/// `mv a b` then writing to `b` right away: the kernel moves its dentry and
+/// keeps using the inode it already had for `a` for as long as the entry
+/// stays cached (5s), without a fresh LOOKUP — so the renamed file must
+/// still answer to that inode.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_renamed_file_is_writable_through_the_kernels_cached_inode() {
+    use std::io::Write;
+
+    let env = VfsTestEnv::new().await;
+    env.set_remote_files(vec![remote_file("a.txt", 5, "e1")]).await;
+    env.serve_file_content("a.txt", b"hello").await;
+    env.serve_file_content("b.txt", b"hello").await;
+    env.expect_uploads().await;
+    env.expect_namespace_ops().await;
+
+    let vfs = new_test_vfs(&env).await;
+
+    let mp = tempfile::tempdir().unwrap();
+    let mountpoint = mp.path().to_path_buf();
+    let _guard = MountpointGuard(mountpoint.clone());
+    let mounted = mount::mount(vfs.clone(), &mountpoint, "CloudreveTest", env.cache_dir())
+        .await
+        .expect("mount should succeed");
+
+    let (a, b) = (mountpoint.join("a.txt"), mountpoint.join("b.txt"));
+    let res = blocking_with_timeout(move || -> std::io::Result<Vec<u8>> {
+        std::fs::metadata(&a)?;
+        std::fs::rename(&a, &b)?;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&b)?;
+        f.write_all(b" world")?;
+        drop(f);
+        std::fs::read(&b)
+    })
+    .await;
+
+    let content = res.expect("rename then append through the mount");
+    assert_eq!(content, b"hello world");
+    wait_for_upload(&vfs, &env, "b.txt", b"hello world").await;
+    assert_eq!(env.uploaded_content("a.txt"), None);
+    mounted.unmount().await.expect("unmount should succeed");
+}

@@ -864,6 +864,12 @@ fn mount_table_options(path: &std::path::Path) -> Option<String> {
 /// file. The mount is `nobrowse` (no Desktop/sidebar volume — the folder
 /// itself stays where the user put it) and its root holds an empty,
 /// read-only `.metadata_never_index`, Apple's documented opt-out.
+///
+/// `mdutil -s` cannot prove the marker works: on the macos-latest runner it
+/// answers "Error: unknown indexing state." for this mount (exit 0) —
+/// Spotlight does not manage the volume at all. What it can show is that
+/// indexing is never reported enabled; the marker's own presence and
+/// read-only-ness are asserted directly.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_mount_is_nobrowse_and_opts_out_of_spotlight() {
     let env = VfsTestEnv::new().await;
@@ -905,8 +911,8 @@ async fn the_mount_is_nobrowse_and_opts_out_of_spotlight() {
     assert!(write.is_err(), ".metadata_never_index must be read-only");
     assert_eq!(names, vec!["a.txt".to_string()], ".metadata_never_index must not be listed");
     assert!(
-        mdutil_ok && mdutil_out.to_lowercase().contains("disabled"),
-        "mdutil -s must report indexing disabled, got (exit0={mdutil_ok}): {mdutil_out}"
+        !mdutil_out.to_lowercase().contains("indexing enabled"),
+        "Spotlight must not index the mount, mdutil -s said (exit0={mdutil_ok}): {mdutil_out}"
     );
 }
 
@@ -937,4 +943,53 @@ async fn reading_a_4_mib_file_through_the_mount_uses_1_mib_reads() {
     let reads = log.lock().unwrap().clone();
     assert_eq!(reads.iter().max().copied(), Some(1_048_576), "READ sizes: {reads:?}");
     assert!(reads.len() <= 8, "4 MiB should take about 4 READs, took {}: {reads:?}", reads.len());
+}
+
+/// The downloader idiom through the OS: open `dl.part`, write, rename it to
+/// its final name while the fd stays open, keep writing, close. The kernel
+/// keeps writing by the fileid it holds, so every byte must reach the
+/// server under the final name and nothing under the old one.
+#[tokio::test(flavor = "multi_thread")]
+async fn writing_through_an_fd_kept_open_across_a_rename_uploads_every_byte() {
+    use std::io::Write;
+
+    let env = VfsTestEnv::new().await;
+    env.expect_uploads().await;
+    env.expect_namespace_ops().await;
+    let vfs = new_test_vfs(&env).await;
+    // The mock upload endpoint does not add what it receives to the
+    // listing: hold uploads back until the sequence is done.
+    vfs.set_debounce_for_tests(Duration::from_secs(5));
+
+    let mp = tempfile::tempdir().unwrap();
+    let mountpoint = mp.path().to_path_buf();
+    let _guard = MountpointGuard(mountpoint.clone());
+    let mounted = mount::mount(vfs.clone(), &mountpoint, "CloudreveTest", env.cache_dir())
+        .await
+        .expect("mount should succeed");
+
+    let first: Vec<u8> = (0..65_536u32).map(|i| (i % 241) as u8).collect();
+    let second: Vec<u8> = (0..65_536u32).map(|i| (i % 239) as u8).collect();
+    let (part, done) = (mountpoint.join("dl.part"), mountpoint.join("dl.bin"));
+    let (a, b) = (first.clone(), second.clone());
+    let res = blocking_with_timeout(move || -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&part)?;
+        f.write_all(&a)?;
+        std::fs::rename(&part, &done)?;
+        f.write_all(&b)?;
+        f.sync_all()?;
+        drop(f);
+        Ok(())
+    })
+    .await;
+    vfs.wait_for_writeback_idle().await;
+    mounted.unmount().await.expect("unmount should succeed");
+
+    res.expect("open/write/rename/write/close through the mount");
+    let mut expected = first;
+    expected.extend_from_slice(&second);
+    let uploaded = env.uploaded_content("dl.bin");
+    assert_eq!(uploaded.as_ref().map(Vec::len), Some(expected.len()), "dl.bin uploaded size");
+    assert!(uploaded.as_deref() == Some(&expected[..]), "dl.bin must hold every byte written");
+    assert_eq!(env.uploaded_content("dl.part"), None, "nothing may be uploaded under the old name");
 }
