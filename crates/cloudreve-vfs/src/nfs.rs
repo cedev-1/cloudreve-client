@@ -243,6 +243,7 @@ fn never_index_attr() -> fattr3 {
         mtime_secs: 0,
         atime_secs: 0,
         ctime_secs: 0,
+        time_nsecs: 0,
     })
 }
 
@@ -666,9 +667,9 @@ fn to_fattr3(attr: &FrontendAttr) -> fattr3 {
         rdev: specdata3::default(),
         fsid: 0,
         fileid: attr.fileid,
-        atime: to_nfstime3(attr.atime_secs),
-        mtime: to_nfstime3(attr.mtime_secs),
-        ctime: to_nfstime3(attr.ctime_secs),
+        atime: to_nfstime3(attr.atime_secs, attr.time_nsecs),
+        mtime: to_nfstime3(attr.mtime_secs, attr.time_nsecs),
+        ctime: to_nfstime3(attr.ctime_secs, attr.time_nsecs),
     }
 }
 
@@ -677,9 +678,11 @@ fn to_fattr3(attr: &FrontendAttr) -> fattr3 {
 /// far-future timestamp (neither of which a well-behaved server should ever
 /// send) becomes the nearest representable bound instead of silently
 /// aliasing to an unrelated time.
-fn to_nfstime3(secs: i64) -> nfstime3 {
-    let seconds = u32::try_from(secs).unwrap_or(if secs < 0 { 0 } else { u32::MAX });
-    nfstime3 { seconds, nseconds: 0 }
+fn to_nfstime3(secs: i64, nsecs: u32) -> nfstime3 {
+    match u32::try_from(secs) {
+        Ok(seconds) => nfstime3 { seconds, nseconds: nsecs.min(999_999_999) },
+        Err(_) => nfstime3 { seconds: if secs < 0 { 0 } else { u32::MAX }, nseconds: 0 },
+    }
 }
 
 #[cfg(test)]
@@ -736,6 +739,6 @@ mod tests {
 
     #[test]
     fn negative_mtime_clamps_to_zero() {
-        assert_eq!(to_nfstime3(-5).seconds, 0);
+        assert_eq!(to_nfstime3(-5, 7).seconds, 0);
     }
 }

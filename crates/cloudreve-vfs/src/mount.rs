@@ -351,8 +351,26 @@ mod macos_impl {
     ///     without it macOS also lists a second, duplicate volume on the
     ///     Desktop and sidebar. Belt and braces for Spotlight too, with the
     ///     root's `.metadata_never_index` (see `nfs::NEVER_INDEX_NAME`).
+    ///   - `actimeo=1`: the client trusts cached attributes for 1 s instead
+    ///     of the 5-60 s default (`acregmin..acdirmax`; the timeout grows
+    ///     with the file's age, `nfs_attrcachetimeout`, so an old file sat
+    ///     at 60 s). Remote changes reach the kernel only through GETATTR:
+    ///     a file's new size, and a folder's moved mtime (`tree.rs`,
+    ///     `bump_dir_mtime`) — the cue that makes it purge that folder's
+    ///     cached names and READDIR buffers. With rdirplus, a READDIR more
+    ///     than `timeout - 1` s after the last one also refetches the
+    ///     listing (`nfs_vnop_readdir`, `n_rdirplusstamp_sof`). Not `noac`/
+    ///     `actimeo=0`: a zero timeout disables that rdirplus refetch.
+    ///     The GETATTRs are answered from memory; HTTP stays bounded by
+    ///     `tree::LISTING_TTL`. Same knob as hf-mount (`actimeo={ttl}`).
+    ///   - `nonegnamecache`: a lookup that failed is not cached, so a name
+    ///     created remotely after an app looked for it resolves at once.
+    ///     A miss costs one LOOKUP served from the tree's listing.
+    ///
+    /// Measured on the macos-latest CI runner
+    /// (`measure_rpc_and_http_cost_of_mount_options`): see that test's doc.
     const MOUNT_OPTS: &str = "locallocks,mutejukebox,vers=3,tcp,soft,dumbtimer,timeo=30,retrans=2,\
-                              nobrowse,rsize=1048576,wsize=1048576,readahead=4";
+                              nobrowse,rsize=1048576,wsize=1048576,readahead=4,actimeo=1,nonegnamecache";
 
     /// Mounts `vfs` as a real NFS drive at `mountpoint` (D1). `mountpoint`
     /// must already exist as an empty directory. `volume_name` is advisory

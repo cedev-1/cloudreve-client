@@ -1,3 +1,5 @@
+          echo "--- mutation: mount options without actimeo=1,nonegnamecache"
+          VFS_TEST_MOUNT_OPTS="locallocks,mutejukebox,vers=3,tcp,soft,dumbtimer,timeo=30,retrans=2,nobrowse,rsize=1048576,wsize=1048576,readahead=4" cargo test -p cloudreve-vfs --test mounted_macos -- --nocapture remotely remote_change 2>&1 | grep -E "REMOTE-CHANGE-LATENCY|^test " || true
 name: CI
 
 on:
@@ -84,5 +86,10 @@ jobs:
       - name: Measure remote-change latency and mount cost (temporary)
         if: always()
         run: |
+          BASE="locallocks,mutejukebox,vers=3,tcp,soft,dumbtimer,timeo=30,retrans=2,nobrowse,rsize=1048576,wsize=1048576,readahead=4"
           cargo test -p cloudreve-vfs --test mounted_macos -- --nocapture remotely remote_change 2>&1 | grep -E "REMOTE-CHANGE-LATENCY|^test " || true
+          echo "--- mutation: mount options without actimeo=1,nonegnamecache"
+          VFS_TEST_MOUNT_OPTS="$BASE" cargo test -p cloudreve-vfs --test mounted_macos -- --nocapture remotely remote_change 2>&1 | grep -E "REMOTE-CHANGE-LATENCY|^test " || true
+          echo "--- mutation: actimeo=1 without nonegnamecache"
+          VFS_TEST_MOUNT_OPTS="$BASE,actimeo=1" cargo test -p cloudreve-vfs --test mounted_macos -- --nocapture remotely remote_change 2>&1 | grep -E "REMOTE-CHANGE-LATENCY|^test " || true
           cargo test -p cloudreve-vfs --test mounted_macos -- --ignored --nocapture measure_rpc_and_http_cost_of_mount_options 2>&1 | grep -E "MOUNT-COST|^test " || true

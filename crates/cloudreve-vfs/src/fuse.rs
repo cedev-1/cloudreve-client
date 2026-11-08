@@ -88,11 +88,16 @@
 //! `reply.entry`/`reply.attr` both take a `ttl: &Duration` telling the
 //! KERNEL how long it may serve a cached copy of the returned attributes
 //! without asking again (`reply.rs:178` `ReplyEntry::entry`, `reply.rs:212`
-//! `ReplyAttr::attr`). [`ATTR_TTL`] reuses `tree::LISTING_TTL` (5s)
-//! verbatim rather than inventing a second constant: the facade's own
-//! directory listings are only trusted for that long before a fresh network
-//! round-trip, so letting the kernel cache metadata LONGER than that would
-//! let it serve attributes staler than the facade itself would ever serve.
+//! `ReplyAttr::attr`). [`ATTR_TTL`] is 1 s, shorter than the tree's own
+//! `LISTING_TTL` (5 s): a remote change reaches the kernel only when it asks
+//! again (FUSE's `notify_inval_*` would push it, but needs fuser's
+//! `abi-7-12` feature and still emits no inotify event for a file manager —
+//! see `crate::nudge`), so the TTL is the visibility bound for a name
+//! deleted or renamed remotely and for a file's new size. The extra
+//! LOOKUP/GETATTR calls are answered from memory; HTTP stays bounded by
+//! `LISTING_TTL`. A failed lookup is never cached (`lookup` replies an
+//! error, not a zero-inode entry), so a name created remotely resolves at
+//! once. Same 1 s as the macOS mount's `actimeo=1` (`mount.rs`).
 //!
 //! ## Disclosed simplifications (mirroring `nfs.rs`'s own disclosed list)
 //!
@@ -136,12 +141,12 @@ use fuser::{
 };
 
 use crate::frontend_util::{classify_error, to_frontend_attr, FrontendAttr, FrontendErrno};
-use crate::tree::{NodeId, LISTING_TTL};
+use crate::tree::NodeId;
 use crate::vfs::{FileHandle, Vfs};
 
 /// Kernel-side cache TTL for every `getattr`/`lookup`/`create`/`mkdir`
 /// reply's attributes — see the module doc's "Attribute TTLs" section.
-const ATTR_TTL: Duration = LISTING_TTL;
+const ATTR_TTL: Duration = Duration::from_secs(1);
 
 /// FUSE adapter over [`Vfs`]. See the module doc for the sync/async bridge,
 /// handle model, and inode scheme.
@@ -500,7 +505,7 @@ fn errno_for(err: &anyhow::Error) -> i32 {
 
 /// Converts the portable [`FrontendAttr`] into fuser's `FileAttr`.
 fn to_file_attr(attr: &FrontendAttr) -> FileAttr {
-    let mtime = to_system_time(attr.mtime_secs);
+    let mtime = to_system_time(attr.mtime_secs, attr.time_nsecs);
     FileAttr {
         ino: attr.fileid,
         size: attr.size,
@@ -526,9 +531,9 @@ fn to_file_attr(attr: &FrontendAttr) -> FileAttr {
 /// a well-behaved server should never send) clamps to the epoch rather than
 /// underflowing `SystemTime`'s unsigned duration-since-epoch representation
 /// — same clamp-not-wrap philosophy as `nfs.rs`'s `to_nfstime3`.
-fn to_system_time(secs: i64) -> SystemTime {
+fn to_system_time(secs: i64, nsecs: u32) -> SystemTime {
     if secs >= 0 {
-        SystemTime::UNIX_EPOCH + Duration::from_secs(secs as u64)
+        SystemTime::UNIX_EPOCH + Duration::new(secs as u64, nsecs.min(999_999_999))
     } else {
         SystemTime::UNIX_EPOCH
     }

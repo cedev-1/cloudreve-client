@@ -44,6 +44,10 @@ pub struct NodeAttr {
     pub remote_path: String,
     pub size: u64,
     pub mtime_secs: i64,
+    /// Sub-second part of the mtime. Always 0 for a file (the server's
+    /// clock has whole seconds). A directory's moves when its listing
+    /// changes, see [`bump_dir_mtime`].
+    pub mtime_nsecs: u32,
     pub is_dir: bool,
     /// Empty for directories: Cloudreve only versions file content.
     pub etag: String,
@@ -96,6 +100,7 @@ impl VfsTree {
                 remote_path: remote_base,
                 size: 0,
                 mtime_secs: 0,
+                mtime_nsecs: 0,
                 is_dir: true,
                 etag: String::new(),
             },
@@ -160,6 +165,33 @@ impl VfsTree {
             }
         }
         Ok(self.inner.read().await.attrs.get(&node).cloned())
+    }
+
+    /// Re-lists `node` first if it is a directory that was listed before
+    /// and whose listing is no longer fresh (invalidated, or past
+    /// [`LISTING_TTL`]), so the attributes a frontend reports for it carry
+    /// the server's current state — in particular a moved mtime when its
+    /// children changed (see `bump_dir_mtime`), the kernel's only cue to
+    /// drop what it cached for that directory. A directory never listed has
+    /// nothing cached anywhere and costs nothing here; a fresh one is served
+    /// from memory, so HTTP stays bounded by the listing TTL however often
+    /// the kernel asks. A failed re-list (offline) keeps the last known
+    /// attributes.
+    pub async fn refresh_dir_if_stale(&self, node: NodeId) {
+        let stale = {
+            let inner = self.inner.read().await;
+            let is_dir = inner.attrs.get(&node).is_some_and(|attr| attr.is_dir);
+            let fresh = inner
+                .listed_at
+                .get(&node)
+                .is_some_and(|listed_at| listed_at.elapsed() < LISTING_TTL);
+            is_dir && inner.children.contains_key(&node) && !fresh
+        };
+        if stale {
+            if let Err(err) = self.ensure_listed(node).await {
+                tracing::debug!(?err, "vfs tree: re-list of a stale directory failed, serving last known attrs");
+            }
+        }
     }
 
     /// Fetches and caches a directory's children the first time it is read,
@@ -248,6 +280,13 @@ impl VfsTree {
             .filter_map(|id| inner.attrs.get(id).map(|attr| (attr.name.clone(), *id)))
             .collect();
 
+        // Whether the kernel may already hold a view of this listing — the
+        // only case in which a change has to be signalled to it at all —
+        // and whether this listing changed anything it could have cached
+        // (a name, or a child's attributes READDIRPLUS handed out).
+        let was_listed = inner.children.contains_key(&dir);
+        let mut changed = false;
+
         let mut child_ids = Vec::with_capacity(files.len());
         for f in files {
             let key = (dir, f.name.clone());
@@ -264,6 +303,7 @@ impl VfsTree {
                 remote_path: f.path,
                 size: f.size.max(0) as u64,
                 mtime_secs: parse_rfc3339(&f.updated_at),
+                mtime_nsecs: 0,
                 is_dir: f.file_type == file_type::FOLDER,
                 etag: f.primary_entity.unwrap_or_default(),
             };
@@ -278,6 +318,18 @@ impl VfsTree {
                     attr.size = old.size;
                     attr.mtime_secs = old.mtime_secs;
                 }
+                // A directory's mtime is ours, not the server's (see
+                // `bump_dir_mtime`): Cloudreve's `updated_at` for a folder
+                // does not follow its children, so it can be older than
+                // what the kernel was told. Never move it backwards.
+                if attr.is_dir && old.is_dir && (old.mtime_secs, old.mtime_nsecs) > (attr.mtime_secs, 0) {
+                    attr.mtime_secs = old.mtime_secs;
+                    attr.mtime_nsecs = old.mtime_nsecs;
+                }
+                changed |= old.size != attr.size
+                    || (old.mtime_secs, old.mtime_nsecs) != (attr.mtime_secs, attr.mtime_nsecs)
+                    || old.is_dir != attr.is_dir
+                    || old.etag != attr.etag;
             }
             inner.attrs.insert(id, attr);
             inner.stale_files.remove(&id);
@@ -313,8 +365,21 @@ impl VfsTree {
         // resident.
         for (name, ghost_id) in old_children {
             if !fresh_names.contains(&name) {
+                changed = true;
                 inner.known_children.remove(&(dir, name));
                 remove_subtree(&mut inner, ghost_id);
+            }
+        }
+
+        // A name the previous listing did not have (a remote create or the
+        // target of a remote rename) is a change too.
+        if let Some(old_ids) = inner.children.get(&dir) {
+            let old_ids: std::collections::HashSet<&NodeId> = old_ids.iter().collect();
+            changed |= child_ids.iter().any(|id| !old_ids.contains(id));
+        }
+        if was_listed && changed {
+            if let Some(attr) = inner.attrs.get_mut(&dir) {
+                bump_dir_mtime(attr);
             }
         }
 
@@ -342,8 +407,8 @@ impl VfsTree {
         let mut inner = self.inner.write().await;
 
         // The directory named by `remote_path` itself, if any is known:
-        // forget its own listing outright, exactly like `LISTING_TTL`
-        // expiring early. Deliberately does NOT remove the directory's own
+        // its own listing is treated as expired, exactly like `LISTING_TTL`
+        // running out early. Deliberately does NOT remove the directory's own
         // `NodeAttr` (unlike the file case at the bottom of this function):
         // `ensure_listed` needs `attrs.get(&dir).remote_path` to know what
         // to re-list, so the node must stay resolvable by its `NodeId`.
@@ -360,8 +425,11 @@ impl VfsTree {
             .iter()
             .find(|(_, attr)| attr.is_dir && attr.remote_path == remote_path)
             .map(|(id, _)| *id);
+        // Only `listed_at` goes, exactly like the parent below: the last-
+        // known `children` must survive for `ensure_listed` to diff the
+        // fresh listing against — that diff prunes the ghosts AND decides
+        // whether this directory's mtime moves (see `bump_dir_mtime`).
         if let Some(dir_id) = self_dir_id {
-            inner.children.remove(&dir_id);
             inner.listed_at.remove(&dir_id);
         }
 
@@ -460,6 +528,7 @@ impl VfsTree {
                 // The facade overlays the draft's real mtime (D3); this is
                 // just the placeholder for an entry with no draft yet.
                 mtime_secs: 0,
+                mtime_nsecs: 0,
                 is_dir: false,
                 etag: String::new(),
             },
@@ -646,6 +715,32 @@ impl VfsTree {
             *listed_at = Instant::now() - LISTING_TTL - Duration::from_secs(1);
         }
     }
+}
+
+/// Moves a directory's reported mtime forward because its listing changed
+/// on the server: to now, or one nanosecond past what the kernel was last
+/// told if that is later, so it never repeats or goes backwards.
+///
+/// This is what makes a remote change visible through NFS at all. Apple's
+/// client keeps a directory's cached names, negative entries and READDIR
+/// buffers until a GETATTR shows that directory's mtime changed
+/// (`kext/nfs_vnops.c`, `nfs_getattr`: `NFS_CHANGED_NC` -> `cache_purge`,
+/// `NFS_CHANGED` -> `nfs_invaldir`, both mtime comparisons for NFSv3).
+/// Cloudreve's `updated_at` for a folder does not move when its children
+/// change, so the server's value alone would leave the kernel's view stale
+/// for as long as it stays cached. It is also `nfs3_server`'s READDIR
+/// cookie verifier, which is what a changed directory should get.
+fn bump_dir_mtime(attr: &mut NodeAttr) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let now = (now.as_secs() as i64, now.subsec_nanos());
+    let next = if attr.mtime_nsecs >= 999_999_999 {
+        (attr.mtime_secs + 1, 0)
+    } else {
+        (attr.mtime_secs, attr.mtime_nsecs + 1)
+    };
+    (attr.mtime_secs, attr.mtime_nsecs) = now.max(next);
 }
 
 /// Removes a pruned node's own bookkeeping and, when it was a directory,

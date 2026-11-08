@@ -1060,9 +1060,17 @@ async fn mount_and_browse_docs(
     let vfs = new_test_vfs(env).await;
     let mp = tempfile::tempdir().unwrap().keep();
     let guard = MountpointGuard(mp.clone());
-    let mounted = mount::mount(vfs.clone(), &mp, "CloudreveTest", env.cache_dir())
-        .await
-        .expect("mount should succeed");
+    // `VFS_TEST_MOUNT_OPTS` replaces the mount options, nothing else (same
+    // server, same folder refresh): how CI shows these tests go red
+    // without `actimeo=1,nonegnamecache`.
+    let mounted = match std::env::var("VFS_TEST_MOUNT_OPTS") {
+        Ok(opts) => {
+            let counts = Arc::new(cloudreve_vfs::nfs::RpcCounts::default());
+            mount::mount_with_rpc_counts_for_tests(vfs.clone(), &mp, env.cache_dir(), &opts, counts).await
+        }
+        Err(_) => mount::mount(vfs.clone(), &mp, "CloudreveTest", env.cache_dir()).await,
+    }
+    .expect("mount should succeed");
     let docs = mp.join("docs");
     let root = mp.clone();
     let d = docs.clone();
@@ -1319,7 +1327,8 @@ fn cost_since(a: Cost, b: Cost) -> Cost {
 /// Measurement, not a pass/fail test (run on CI with `--ignored
 /// --nocapture`): what a scripted workload costs at the NFS adapter (RPCs)
 /// and at the Cloudreve server (HTTP listings), and how fast it runs, under
-/// the production mount options versus `ALT_OPTS`. Workload: `ls -lR` of a
+/// the production mount options versus the ones before `actimeo=1,
+/// nonegnamecache` (`BASELINE_OPTS`), each twice. Workload: `ls -lR` of a
 /// 20 x 100 = 2,000-file tree, the same again 2 s later (attribute caches
 /// of a short `actimeo` expired, the tree's 5 s listing TTL not) and 7 s
 /// later (both expired), a 200 MB sequential read, a 50 MB write (upload
@@ -1331,12 +1340,15 @@ async fn measure_rpc_and_http_cost_of_mount_options() {
 
     const BASELINE_OPTS: &str = "locallocks,mutejukebox,vers=3,tcp,soft,dumbtimer,timeo=30,retrans=2,\
                                  nobrowse,rsize=1048576,wsize=1048576,readahead=4";
-    let production = mount::production_mount_opts_for_tests();
-    let mut option_sets = vec![("baseline", BASELINE_OPTS.to_string())];
-    if production != BASELINE_OPTS {
-        option_sets.push(("production", production.to_string()));
-    }
-    option_sets.push(("baseline+actimeo=1,nonegnamecache", format!("{BASELINE_OPTS},actimeo=1,nonegnamecache")));
+    // Each set twice, interleaved, so run-to-run noise on the shared
+    // runner shows next to any difference between the sets.
+    let production = mount::production_mount_opts_for_tests().to_string();
+    let option_sets = [
+        ("baseline#1", BASELINE_OPTS.to_string()),
+        ("production#1", production.clone()),
+        ("baseline#2", BASELINE_OPTS.to_string()),
+        ("production#2", production),
+    ];
 
     const MB: usize = 1_048_576;
     let big: Vec<u8> = (0..200 * MB).map(|i| (i % 251) as u8).collect();

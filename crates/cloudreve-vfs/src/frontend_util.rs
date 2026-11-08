@@ -130,6 +130,8 @@ pub struct FrontendAttr {
     pub mtime_secs: i64,
     pub atime_secs: i64,
     pub ctime_secs: i64,
+    /// Sub-second part shared by all three times ([`NodeAttr::mtime_nsecs`]).
+    pub time_nsecs: u32,
 }
 
 /// Builds a [`FrontendAttr`] for `fileid` from the facade's own [`NodeAttr`]
@@ -146,6 +148,7 @@ pub fn to_frontend_attr(fileid: u64, attr: &NodeAttr) -> FrontendAttr {
         mtime_secs: attr.mtime_secs,
         atime_secs: attr.mtime_secs,
         ctime_secs: attr.mtime_secs,
+        time_nsecs: attr.mtime_nsecs,
     }
 }
 
@@ -237,6 +240,7 @@ mod tests {
             remote_path: "cloudreve://x/a.txt".into(),
             size: 42,
             mtime_secs: 1_700_000_000,
+            mtime_nsecs: 0,
             is_dir: false,
             etag: "e1".into(),
         };

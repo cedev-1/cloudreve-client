@@ -2000,8 +2000,12 @@ impl Vfs {
     }
 
     /// Reads one node's attributes, overlaid with its draft's size/mtime if
-    /// it has one (D3). Never triggers a listing, same as `VfsTree::getattr`.
+    /// it has one (D3). The frontends' GETATTR: a directory whose listing
+    /// is stale is re-listed first (`VfsTree::refresh_dir_if_stale`), so
+    /// the kernel sees its mtime move when its children changed remotely;
+    /// a file triggers a listing only as `VfsTree::getattr` says.
     pub async fn getattr(&self, node: NodeId) -> Result<Option<NodeAttr>> {
+        self.tree.refresh_dir_if_stale(node).await;
         let Some(mut attr) = self.tree.getattr(node).await? else { return Ok(None) };
         if junk::is_local_only_path(&attr.remote_path)
             && !self.junk.lock().unwrap().contains_key(&attr.remote_path)
