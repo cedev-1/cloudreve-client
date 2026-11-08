@@ -993,3 +993,428 @@ async fn writing_through_an_fd_kept_open_across_a_rename_uploads_every_byte() {
     assert!(uploaded.as_deref() == Some(&expected[..]), "dl.bin must hold every byte written");
     assert_eq!(env.uploaded_content("dl.part"), None, "nothing may be uploaded under the old name");
 }
+
+// ---------------------------------------------------------------------
+// Remote changes reaching the mount: what another device or the web UI
+// did must show through `stat`/`read_dir` within a few seconds, with no
+// action from the user. The change goes through `Vfs::remote_changed`,
+// the same entry point the sync crate's SSE handler calls.
+// ---------------------------------------------------------------------
+
+/// Upper bound on how long a remote change may take to show through the
+/// mount, as the product promises it.
+const REMOTE_CHANGE_VISIBLE_WITHIN: Duration = Duration::from_secs(3);
+
+/// How long a poll keeps watching, so a red run reports how far off it is
+/// instead of only "not within 3 s".
+const REMOTE_CHANGE_POLL_FOR: Duration = Duration::from_secs(10);
+
+/// A file of `{REMOTE_BASE}/{dir}` as the list API returns it.
+fn file_in(dir: &str, name: &str, size: i64, etag: &str, updated_at: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": 0,
+        "id": format!("file-{dir}-{name}"),
+        "name": name,
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": updated_at,
+        "size": size,
+        "path": format!("{}/{dir}/{name}", common::REMOTE_BASE),
+        "primary_entity": etag,
+    })
+}
+
+/// Polls `check` (a blocking `std::fs` probe) every 50 ms until it holds or
+/// [`REMOTE_CHANGE_POLL_FOR`] runs out. Returns how long it took.
+async fn poll_until<F>(check: F) -> Option<Duration>
+where
+    F: Fn() -> bool + Send + Sync + 'static,
+{
+    let check = Arc::new(check);
+    let start = std::time::Instant::now();
+    while start.elapsed() < REMOTE_CHANGE_POLL_FOR {
+        let c = check.clone();
+        if blocking_with_timeout(move || c()).await {
+            return Some(start.elapsed());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    None
+}
+
+fn names_in(dir: &std::path::Path) -> Vec<String> {
+    match std::fs::read_dir(dir) {
+        Ok(entries) => entries.filter_map(|e| e.ok()?.file_name().into_string().ok()).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Mounts a drive whose `docs/` folder holds `files`, then browses it the
+/// way Finder would (list the root, list `docs/`, stat every file) so the
+/// kernel has everything cached before the remote change lands.
+async fn mount_and_browse_docs(
+    env: &VfsTestEnv,
+    files: Vec<serde_json::Value>,
+) -> (Arc<Vfs>, mount::MountedVfs, PathBuf, MountpointGuard) {
+    env.set_remote_files(vec![common::remote_dir("docs")]).await;
+    env.set_remote_files_at("docs", files).await;
+    let vfs = new_test_vfs(env).await;
+    let mp = tempfile::tempdir().unwrap().keep();
+    let guard = MountpointGuard(mp.clone());
+    let mounted = mount::mount(vfs.clone(), &mp, "CloudreveTest", env.cache_dir())
+        .await
+        .expect("mount should succeed");
+    let docs = mp.join("docs");
+    let root = mp.clone();
+    let d = docs.clone();
+    blocking_with_timeout(move || {
+        names_in(&root);
+        for name in names_in(&d) {
+            let _ = std::fs::metadata(d.join(name));
+        }
+    })
+    .await;
+    (vfs, mounted, mp, guard)
+}
+
+fn report_latency(label: &str, took: Option<Duration>) {
+    use std::io::Write;
+    let shown = took.map_or_else(|| format!("not within {REMOTE_CHANGE_POLL_FOR:?}"), |d| format!("{d:?}"));
+    let _ = writeln!(std::io::stderr(), "REMOTE-CHANGE-LATENCY {label}: {shown}");
+}
+
+fn assert_within_bound(label: &str, took: Option<Duration>) {
+    report_latency(label, took);
+    let took = took.unwrap_or_else(|| panic!("{label}: not visible within {REMOTE_CHANGE_POLL_FOR:?}"));
+    assert!(
+        took <= REMOTE_CHANGE_VISIBLE_WITHIN,
+        "{label}: took {took:?}, more than {REMOTE_CHANGE_VISIBLE_WITHIN:?}"
+    );
+}
+
+/// (a) A file edited on the web shows its new size through `stat`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_modified_remotely_shows_its_new_size_within_3s() {
+    let env = VfsTestEnv::new().await;
+    let (vfs, mounted, mp, _guard) =
+        mount_and_browse_docs(&env, vec![file_in("docs", "report.txt", 5, "e1", "2026-01-02T00:00:00Z")]).await;
+    let p = mp.join("docs/report.txt");
+    let q = p.clone();
+    assert_eq!(blocking_with_timeout(move || std::fs::metadata(&q).unwrap().len()).await, 5);
+
+    env.set_remote_files_at("docs", vec![file_in("docs", "report.txt", 9, "e2", "2026-03-01T10:00:00Z")]).await;
+    vfs.remote_changed(&format!("{}/docs/report.txt", common::REMOTE_BASE)).await;
+    let took = poll_until(move || std::fs::metadata(&p).map(|m| m.len()).ok() == Some(9)).await;
+    mounted.unmount().await.expect("unmount should succeed");
+
+    assert_within_bound("modified size via stat", took);
+}
+
+/// (b) A name the mount already answered "no such file" for, then created
+/// remotely, becomes visible — the kernel's negative name cache must not
+/// hide it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_created_remotely_after_a_failed_lookup_becomes_visible_within_3s() {
+    let env = VfsTestEnv::new().await;
+    let (vfs, mounted, mp, _guard) =
+        mount_and_browse_docs(&env, vec![file_in("docs", "a.txt", 1, "e1", "2026-01-02T00:00:00Z")]).await;
+    let p = mp.join("docs/new.txt");
+    let q = p.clone();
+    let before = blocking_with_timeout(move || {
+        let first = std::fs::metadata(&q).is_err();
+        first && std::fs::metadata(&q).is_err()
+    })
+    .await;
+    assert!(before, "docs/new.txt must not exist yet");
+
+    env.set_remote_files_at(
+        "docs",
+        vec![
+            file_in("docs", "a.txt", 1, "e1", "2026-01-02T00:00:00Z"),
+            file_in("docs", "new.txt", 4, "n1", "2026-03-01T10:00:00Z"),
+        ],
+    )
+    .await;
+    vfs.remote_changed(&format!("{}/docs/new.txt", common::REMOTE_BASE)).await;
+    let took = poll_until(move || std::fs::metadata(&p).is_ok()).await;
+    mounted.unmount().await.expect("unmount should succeed");
+
+    assert_within_bound("created after ENOENT via stat", took);
+}
+
+/// (c) A file deleted remotely leaves the folder listing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_deleted_remotely_disappears_from_the_listing_within_3s() {
+    let env = VfsTestEnv::new().await;
+    let (vfs, mounted, mp, _guard) = mount_and_browse_docs(
+        &env,
+        vec![
+            file_in("docs", "keep.txt", 1, "e1", "2026-01-02T00:00:00Z"),
+            file_in("docs", "gone.txt", 2, "e2", "2026-01-02T00:00:00Z"),
+        ],
+    )
+    .await;
+    let docs = mp.join("docs");
+    let d = docs.clone();
+    assert!(blocking_with_timeout(move || names_in(&d)).await.contains(&"gone.txt".to_string()));
+
+    env.set_remote_files_at("docs", vec![file_in("docs", "keep.txt", 1, "e1", "2026-01-02T00:00:00Z")]).await;
+    vfs.remote_changed(&format!("{}/docs/gone.txt", common::REMOTE_BASE)).await;
+    let took = poll_until(move || {
+        let names = names_in(&docs);
+        names.contains(&"keep.txt".to_string())
+            && !names.contains(&"gone.txt".to_string())
+            && std::fs::metadata(docs.join("gone.txt")).is_err()
+    })
+    .await;
+    mounted.unmount().await.expect("unmount should succeed");
+
+    assert_within_bound("deleted gone from read_dir and stat", took);
+}
+
+/// (d) A file renamed remotely shows under its new name only.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_renamed_remotely_shows_the_new_name_and_not_the_old_within_3s() {
+    let env = VfsTestEnv::new().await;
+    let (vfs, mounted, mp, _guard) =
+        mount_and_browse_docs(&env, vec![file_in("docs", "draft.txt", 3, "e1", "2026-01-02T00:00:00Z")]).await;
+    let docs = mp.join("docs");
+
+    env.set_remote_files_at("docs", vec![file_in("docs", "final.txt", 3, "e1", "2026-01-02T00:00:00Z")]).await;
+    // What the SSE handler does for a rename: both ends.
+    vfs.remote_changed(&format!("{}/docs/draft.txt", common::REMOTE_BASE)).await;
+    vfs.remote_changed(&format!("{}/docs/final.txt", common::REMOTE_BASE)).await;
+    let took = poll_until(move || {
+        let names = names_in(&docs);
+        names == vec!["final.txt".to_string()]
+            && std::fs::metadata(docs.join("final.txt")).is_ok()
+            && std::fs::metadata(docs.join("draft.txt")).is_err()
+    })
+    .await;
+    mounted.unmount().await.expect("unmount should succeed");
+
+    assert_within_bound("renamed via read_dir and stat", took);
+}
+
+/// Waits up to `within` for a `NOTE_WRITE` on the kqueue `kq`. Returns
+/// how long it took, or `None`.
+fn wait_note_write(kq: i32, within: Duration) -> Option<Duration> {
+    let start = std::time::Instant::now();
+    loop {
+        let left = within.checked_sub(start.elapsed())?;
+        let timeout =
+            libc::timespec { tv_sec: left.as_secs() as libc::time_t, tv_nsec: left.subsec_nanos() as libc::c_long };
+        // SAFETY: an all-zero kevent is a valid out-buffer.
+        let mut ev: libc::kevent = unsafe { std::mem::zeroed() };
+        // SAFETY: `kq` is a live kqueue, `ev` a valid buffer of one event.
+        let n = unsafe { libc::kevent(kq, std::ptr::null(), 0, &mut ev, 1, &timeout) };
+        if n > 0 && ev.fflags & libc::NOTE_WRITE != 0 {
+            return Some(start.elapsed());
+        }
+        if n < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return None;
+        }
+    }
+}
+
+/// An open Finder window learns about a folder's change from the kernel
+/// (kqueue/FSEvents), which only reports operations done locally through
+/// the VFS. A remote change goes through `Vfs::remote_changed` — the SSE
+/// entry point — and must reach a `NOTE_WRITE` watch on the folder, opened
+/// `O_EVTONLY` through the mount the way Finder watches it, within 3 s.
+/// What Finder then re-reads must already hold the new file, and the
+/// refresh must neither upload anything nor show up in the listing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_remote_change_wakes_a_kqueue_watch_on_the_open_folder_within_3s() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let env = VfsTestEnv::new().await;
+    env.expect_uploads().await;
+    let (vfs, mounted, mp, _guard) =
+        mount_and_browse_docs(&env, vec![file_in("docs", "a.txt", 1, "e1", "2026-01-02T00:00:00Z")]).await;
+    let docs = mp.join("docs");
+
+    let path = std::ffi::CString::new(docs.as_os_str().as_bytes()).unwrap();
+    // SAFETY: plain syscalls on a NUL-terminated path / fresh descriptors.
+    let (fd, kq) = unsafe { (libc::open(path.as_ptr(), libc::O_EVTONLY), libc::kqueue()) };
+    assert!(fd >= 0 && kq >= 0, "open O_EVTONLY / kqueue failed");
+    let change = libc::kevent {
+        ident: fd as usize,
+        filter: libc::EVFILT_VNODE,
+        flags: libc::EV_ADD | libc::EV_CLEAR,
+        fflags: libc::NOTE_WRITE,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    };
+    // SAFETY: registers one well-formed change on a live kqueue.
+    let rc = unsafe { libc::kevent(kq, &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
+    assert_eq!(rc, 0, "kevent register failed");
+
+    env.set_remote_files_at(
+        "docs",
+        vec![
+            file_in("docs", "a.txt", 1, "e1", "2026-01-02T00:00:00Z"),
+            file_in("docs", "b.txt", 2, "e2", "2026-03-01T10:00:00Z"),
+        ],
+    )
+    .await;
+    vfs.remote_changed(&format!("{}/docs/b.txt", common::REMOTE_BASE)).await;
+    let woke = blocking_with_timeout(move || wait_note_write(kq, Duration::from_secs(5))).await;
+    let d = docs.clone();
+    let listed = blocking_with_timeout(move || {
+        let mut names = names_in(&d);
+        names.sort();
+        names
+    })
+    .await;
+    // SAFETY: closing descriptors this test opened.
+    unsafe {
+        libc::close(kq);
+        libc::close(fd);
+    }
+    vfs.wait_for_writeback_idle().await;
+    mounted.unmount().await.expect("unmount should succeed");
+
+    report_latency("kqueue NOTE_WRITE on docs/", woke);
+    let woke = woke.expect("no NOTE_WRITE on the open folder: Finder would never refresh it");
+    assert!(woke <= REMOTE_CHANGE_VISIBLE_WITHIN, "NOTE_WRITE took {woke:?}");
+    assert_eq!(listed, vec!["a.txt".to_string(), "b.txt".to_string()], "what Finder re-reads");
+    assert_eq!(env.upload_session_count(), 0, "a refresh must never upload anything");
+}
+
+/// Snapshot of a mount's RPC tally plus the HTTP listing requests the mock
+/// Cloudreve server answered.
+#[derive(Debug, Clone, Copy, Default)]
+struct Cost {
+    getattr: u64,
+    lookup: u64,
+    readdirplus: u64,
+    read: u64,
+    write: u64,
+    http_list: usize,
+}
+
+fn cost_now(counts: &cloudreve_vfs::nfs::RpcCounts, env: &VfsTestEnv) -> Cost {
+    use std::sync::atomic::Ordering::Relaxed;
+    Cost {
+        getattr: counts.getattr.load(Relaxed),
+        lookup: counts.lookup.load(Relaxed),
+        readdirplus: counts.readdirplus.load(Relaxed),
+        read: counts.read.load(Relaxed),
+        write: counts.write.load(Relaxed),
+        http_list: env.list_request_count(),
+    }
+}
+
+fn cost_since(a: Cost, b: Cost) -> Cost {
+    Cost {
+        getattr: b.getattr - a.getattr,
+        lookup: b.lookup - a.lookup,
+        readdirplus: b.readdirplus - a.readdirplus,
+        read: b.read - a.read,
+        write: b.write - a.write,
+        http_list: b.http_list - a.http_list,
+    }
+}
+
+/// Measurement, not a pass/fail test (run on CI with `--ignored
+/// --nocapture`): what a scripted workload costs at the NFS adapter (RPCs)
+/// and at the Cloudreve server (HTTP listings), and how fast it runs, under
+/// the production mount options versus `ALT_OPTS`. Workload: `ls -lR` of a
+/// 20 x 100 = 2,000-file tree, the same again 2 s later (attribute caches
+/// of a short `actimeo` expired, the tree's 5 s listing TTL not) and 7 s
+/// later (both expired), a 200 MB sequential read, a 50 MB write (upload
+/// held back by a long debounce: only the mount is measured).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn measure_rpc_and_http_cost_of_mount_options() {
+    use std::io::{Read, Write};
+
+    const BASELINE_OPTS: &str = "locallocks,mutejukebox,vers=3,tcp,soft,dumbtimer,timeo=30,retrans=2,\
+                                 nobrowse,rsize=1048576,wsize=1048576,readahead=4";
+    let production = mount::production_mount_opts_for_tests();
+    let mut option_sets = vec![("baseline", BASELINE_OPTS.to_string())];
+    if production != BASELINE_OPTS {
+        option_sets.push(("production", production.to_string()));
+    }
+    option_sets.push(("baseline+actimeo=1,nonegnamecache", format!("{BASELINE_OPTS},actimeo=1,nonegnamecache")));
+
+    const MB: usize = 1_048_576;
+    let big: Vec<u8> = (0..200 * MB).map(|i| (i % 251) as u8).collect();
+    for (label, opts) in option_sets {
+        let env = VfsTestEnv::new().await;
+        let mut root = vec![remote_file("big.bin", big.len() as i64, "e1")];
+        for d in 0..20 {
+            let dir = format!("d{d:02}");
+            root.push(common::remote_dir(&dir));
+            let files = (0..100).map(|f| file_in(&dir, &format!("f{f:03}.txt"), 10, "e", "2026-01-02T00:00:00Z")).collect();
+            env.set_remote_files_at(&dir, files).await;
+        }
+        env.set_remote_files(root).await;
+        env.serve_file_content("big.bin", &big).await;
+        let vfs = new_test_vfs(&env).await;
+        vfs.set_debounce_for_tests(Duration::from_secs(600));
+        let mp = tempfile::tempdir().unwrap().keep();
+        let _guard = MountpointGuard(mp.clone());
+        let counts = Arc::new(cloudreve_vfs::nfs::RpcCounts::default());
+        let mounted = mount::mount_with_rpc_counts_for_tests(vfs.clone(), &mp, env.cache_dir(), &opts, counts.clone())
+            .await
+            .expect("mount should succeed");
+
+        let mut report = |phase: &str, before: Cost, took: Duration, extra: String| {
+            let c = cost_since(before, cost_now(&counts, &env));
+            let _ = writeln!(
+                std::io::stderr(),
+                "MOUNT-COST opts={label} phase={phase} took={took:?} getattr={} lookup={} readdirplus={} read={} write={} http_list={} {extra}",
+                c.getattr, c.lookup, c.readdirplus, c.read, c.write, c.http_list
+            );
+        };
+        let ls = |mp: PathBuf| move || {
+            let out = std::process::Command::new("/bin/ls").arg("-lR").arg(&mp).output().unwrap();
+            String::from_utf8_lossy(&out.stdout).lines().filter(|l| l.contains(".txt")).count()
+        };
+
+        for (phase, pause) in [("ls-lR-cold", 0u64), ("ls-lR-after-2s", 2), ("ls-lR-after-7s", 7)] {
+            tokio::time::sleep(Duration::from_secs(pause)).await;
+            let before = cost_now(&counts, &env);
+            let start = std::time::Instant::now();
+            let n = blocking_with_timeout(ls(mp.clone())).await;
+            report(phase, before, start.elapsed(), format!("files_listed={n}"));
+        }
+
+        let before = cost_now(&counts, &env);
+        let start = std::time::Instant::now();
+        let p = mp.join("big.bin");
+        let read_bytes = blocking_with_timeout(move || {
+            let mut f = std::fs::File::open(&p).unwrap();
+            let mut buf = vec![0u8; MB];
+            let mut total = 0usize;
+            loop {
+                let n = f.read(&mut buf).unwrap();
+                if n == 0 {
+                    break total;
+                }
+                total += n;
+            }
+        })
+        .await;
+        let took = start.elapsed();
+        report("read-200MB", before, took, format!("bytes={read_bytes} MBps={:.1}", read_bytes as f64 / MB as f64 / took.as_secs_f64()));
+
+        let before = cost_now(&counts, &env);
+        let start = std::time::Instant::now();
+        let p = mp.join("written.bin");
+        blocking_with_timeout(move || {
+            let mut f = std::fs::File::create(&p).unwrap();
+            let chunk = vec![7u8; MB];
+            for _ in 0..50 {
+                f.write_all(&chunk).unwrap();
+            }
+            f.sync_all().unwrap();
+        })
+        .await;
+        let took = start.elapsed();
+        report("write-50MB", before, took, format!("MBps={:.1}", 50.0 / took.as_secs_f64()));
+
+        mounted.unmount().await.expect("unmount should succeed");
+    }
+}

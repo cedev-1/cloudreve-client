@@ -80,3 +80,9 @@ jobs:
 
       - name: Run tests
         run: cargo test -p cloudreve-vfs
+
+      - name: Measure remote-change latency and mount cost (temporary)
+        if: always()
+        run: |
+          cargo test -p cloudreve-vfs --test mounted_macos -- --nocapture remotely remote_change 2>&1 | grep -E "REMOTE-CHANGE-LATENCY|^test " || true
+          cargo test -p cloudreve-vfs --test mounted_macos -- --ignored --nocapture measure_rpc_and_http_cost_of_mount_options 2>&1 | grep -E "MOUNT-COST|^test " || true

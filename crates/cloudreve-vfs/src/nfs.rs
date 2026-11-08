@@ -68,6 +68,7 @@
 //! generation number, which is a different mechanism).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -161,6 +162,8 @@ pub struct VfsNfs {
     /// Test-only: the `count` of every READ received, see
     /// [`VfsNfs::with_read_log`].
     read_log: Option<Arc<Mutex<Vec<u32>>>>,
+    /// Test-only: per-procedure RPC counts, see [`VfsNfs::with_rpc_counts`].
+    rpc_counts: Option<Arc<RpcCounts>>,
     /// [`READ_JUKEBOX_AFTER`] in production; see [`VfsNfs::with_read_jukebox_after`].
     read_jukebox_after: Duration,
     /// READs that outlived [`READ_JUKEBOX_AFTER`] and were answered with
@@ -178,7 +181,13 @@ impl VfsNfs {
     /// client's own soft-timeout budget for a held READ.
     #[doc(hidden)]
     pub fn with_read_jukebox_after(vfs: Arc<Vfs>, read_jukebox_after: Duration) -> Self {
-        Self { vfs, read_jukebox_after, read_log: None, slow_reads: Mutex::new(HashMap::new()) }
+        Self {
+            vfs,
+            read_jukebox_after,
+            read_log: None,
+            rpc_counts: None,
+            slow_reads: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Test-only: records the `count` of every READ RPC into `log`, so a
@@ -189,9 +198,35 @@ impl VfsNfs {
         self
     }
 
+    /// Test-only: counts every GETATTR/LOOKUP/READDIRPLUS/READ/WRITE this
+    /// adapter answers into `counts`, so a mounted test can measure what a
+    /// workload costs at the server under a given set of mount options.
+    #[doc(hidden)]
+    pub fn with_rpc_counts(mut self, counts: Arc<RpcCounts>) -> Self {
+        self.rpc_counts = Some(counts);
+        self
+    }
+
+    fn count(&self, pick: impl Fn(&RpcCounts) -> &AtomicU64) {
+        if let Some(counts) = &self.rpc_counts {
+            pick(counts).fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     fn is_never_index(&self, dir: &FileHandleU64, name: &str) -> bool {
         dir.as_u64() == self.vfs.tree().root().0 && name == NEVER_INDEX_NAME
     }
+}
+
+/// Test-only RPC tally of one mount, see [`VfsNfs::with_rpc_counts`].
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct RpcCounts {
+    pub getattr: AtomicU64,
+    pub lookup: AtomicU64,
+    pub readdirplus: AtomicU64,
+    pub read: AtomicU64,
+    pub write: AtomicU64,
 }
 
 /// [`NEVER_INDEX_NAME`]'s attributes: an empty read-only file whose times
@@ -245,6 +280,7 @@ impl NfsReadFileSystem for VfsNfs {
         dirid: &FileHandleU64,
         filename: &filename3<'_>,
     ) -> Result<FileHandleU64, nfsstat3> {
+        self.count(|c| &c.lookup);
         let parent = NodeId(dirid.as_u64());
         let name = name_str(filename)?;
         if self.is_never_index(dirid, &name) {
@@ -261,6 +297,7 @@ impl NfsReadFileSystem for VfsNfs {
     }
 
     async fn getattr(&self, id: &FileHandleU64) -> Result<fattr3, nfsstat3> {
+        self.count(|c| &c.getattr);
         if id.as_u64() == NEVER_INDEX_FILEID {
             return Ok(never_index_attr());
         }
@@ -278,6 +315,7 @@ impl NfsReadFileSystem for VfsNfs {
         offset: u64,
         count: u32,
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
+        self.count(|c| &c.read);
         // A READ that cannot finish within `READ_JUKEBOX_AFTER` (cold
         // hydration from a slow server) is answered with JUKEBOX and its
         // task parked here; the client's resend of the same READ picks the
@@ -313,6 +351,7 @@ impl NfsReadFileSystem for VfsNfs {
         dirid: &FileHandleU64,
         cookie: u64,
     ) -> Result<impl ReadDirPlusIterator<FileHandleU64>, nfsstat3> {
+        self.count(|c| &c.readdirplus);
         let dir = NodeId(dirid.as_u64());
         let listing = self.vfs.readdir(dir).await.map_err(|e| to_errno(&e))?;
         let start = cookie as usize;
@@ -396,6 +435,7 @@ impl NfsFileSystem for VfsNfs {
         data: &[u8],
         _stable: stable_how,
     ) -> Result<(fattr3, stable_how), nfsstat3> {
+        self.count(|c| &c.write);
         if id.as_u64() == NEVER_INDEX_FILEID {
             return Err(nfsstat3::NFS3ERR_ACCES);
         }

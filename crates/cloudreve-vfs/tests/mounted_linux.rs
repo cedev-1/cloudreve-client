@@ -470,3 +470,285 @@ async fn a_renamed_file_is_writable_through_the_kernels_cached_inode() {
     assert_eq!(env.uploaded_content("a.txt"), None);
     mounted.unmount().await.expect("unmount should succeed");
 }
+
+// ---------------------------------------------------------------------
+// Remote changes reaching the mount: what another device or the web UI
+// did must show through `stat`/`read_dir` within a few seconds, with no
+// action from the user. The change goes through `Vfs::remote_changed`,
+// the same entry point the sync crate's SSE handler calls.
+// ---------------------------------------------------------------------
+
+/// Upper bound on how long a remote change may take to show through the
+/// mount, as the product promises it.
+const REMOTE_CHANGE_VISIBLE_WITHIN: Duration = Duration::from_secs(3);
+
+/// How long a poll keeps watching, so a red run reports how far off it is
+/// instead of only "not within 3 s".
+const REMOTE_CHANGE_POLL_FOR: Duration = Duration::from_secs(10);
+
+/// A file of `{REMOTE_BASE}/{dir}` as the list API returns it.
+fn file_in(dir: &str, name: &str, size: i64, etag: &str, updated_at: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": 0,
+        "id": format!("file-{dir}-{name}"),
+        "name": name,
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": updated_at,
+        "size": size,
+        "path": format!("{}/{dir}/{name}", common::REMOTE_BASE),
+        "primary_entity": etag,
+    })
+}
+
+/// Polls `check` (a blocking `std::fs` probe) every 50 ms until it holds or
+/// [`REMOTE_CHANGE_POLL_FOR`] runs out. Returns how long it took.
+async fn poll_until<F>(check: F) -> Option<Duration>
+where
+    F: Fn() -> bool + Send + Sync + 'static,
+{
+    let check = Arc::new(check);
+    let start = std::time::Instant::now();
+    while start.elapsed() < REMOTE_CHANGE_POLL_FOR {
+        let c = check.clone();
+        if blocking_with_timeout(move || c()).await {
+            return Some(start.elapsed());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    None
+}
+
+fn names_in(dir: &std::path::Path) -> Vec<String> {
+    match std::fs::read_dir(dir) {
+        Ok(entries) => entries.filter_map(|e| e.ok()?.file_name().into_string().ok()).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Mounts a drive whose `docs/` folder holds `files`, then browses it the
+/// way a file manager would (list the root, list `docs/`, stat every file) so the
+/// kernel has everything cached before the remote change lands.
+async fn mount_and_browse_docs(
+    env: &VfsTestEnv,
+    files: Vec<serde_json::Value>,
+) -> (Arc<Vfs>, mount::MountedVfs, PathBuf, MountpointGuard) {
+    env.set_remote_files(vec![common::remote_dir("docs")]).await;
+    env.set_remote_files_at("docs", files).await;
+    let vfs = new_test_vfs(env).await;
+    let mp = tempfile::tempdir().unwrap().keep();
+    let guard = MountpointGuard(mp.clone());
+    let mounted = mount::mount(vfs.clone(), &mp, "CloudreveTest", env.cache_dir())
+        .await
+        .expect("mount should succeed");
+    let docs = mp.join("docs");
+    let root = mp.clone();
+    let d = docs.clone();
+    blocking_with_timeout(move || {
+        names_in(&root);
+        for name in names_in(&d) {
+            let _ = std::fs::metadata(d.join(name));
+        }
+    })
+    .await;
+    (vfs, mounted, mp, guard)
+}
+
+fn report_latency(label: &str, took: Option<Duration>) {
+    use std::io::Write;
+    let shown = took.map_or_else(|| format!("not within {REMOTE_CHANGE_POLL_FOR:?}"), |d| format!("{d:?}"));
+    let _ = writeln!(std::io::stderr(), "REMOTE-CHANGE-LATENCY {label}: {shown}");
+}
+
+fn assert_within_bound(label: &str, took: Option<Duration>) {
+    report_latency(label, took);
+    let took = took.unwrap_or_else(|| panic!("{label}: not visible within {REMOTE_CHANGE_POLL_FOR:?}"));
+    assert!(
+        took <= REMOTE_CHANGE_VISIBLE_WITHIN,
+        "{label}: took {took:?}, more than {REMOTE_CHANGE_VISIBLE_WITHIN:?}"
+    );
+}
+
+/// (a) A file edited on the web shows its new size through `stat`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_modified_remotely_shows_its_new_size_within_3s() {
+    let env = VfsTestEnv::new().await;
+    let (vfs, mounted, mp, _guard) =
+        mount_and_browse_docs(&env, vec![file_in("docs", "report.txt", 5, "e1", "2026-01-02T00:00:00Z")]).await;
+    let p = mp.join("docs/report.txt");
+    let q = p.clone();
+    assert_eq!(blocking_with_timeout(move || std::fs::metadata(&q).unwrap().len()).await, 5);
+
+    env.set_remote_files_at("docs", vec![file_in("docs", "report.txt", 9, "e2", "2026-03-01T10:00:00Z")]).await;
+    vfs.remote_changed(&format!("{}/docs/report.txt", common::REMOTE_BASE)).await;
+    let took = poll_until(move || std::fs::metadata(&p).map(|m| m.len()).ok() == Some(9)).await;
+    mounted.unmount().await.expect("unmount should succeed");
+
+    assert_within_bound("modified size via stat", took);
+}
+
+/// (b) A name the mount already answered "no such file" for, then created
+/// remotely, becomes visible — the kernel's negative name cache must not
+/// hide it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_created_remotely_after_a_failed_lookup_becomes_visible_within_3s() {
+    let env = VfsTestEnv::new().await;
+    let (vfs, mounted, mp, _guard) =
+        mount_and_browse_docs(&env, vec![file_in("docs", "a.txt", 1, "e1", "2026-01-02T00:00:00Z")]).await;
+    let p = mp.join("docs/new.txt");
+    let q = p.clone();
+    let before = blocking_with_timeout(move || {
+        let first = std::fs::metadata(&q).is_err();
+        first && std::fs::metadata(&q).is_err()
+    })
+    .await;
+    assert!(before, "docs/new.txt must not exist yet");
+
+    env.set_remote_files_at(
+        "docs",
+        vec![
+            file_in("docs", "a.txt", 1, "e1", "2026-01-02T00:00:00Z"),
+            file_in("docs", "new.txt", 4, "n1", "2026-03-01T10:00:00Z"),
+        ],
+    )
+    .await;
+    vfs.remote_changed(&format!("{}/docs/new.txt", common::REMOTE_BASE)).await;
+    let took = poll_until(move || std::fs::metadata(&p).is_ok()).await;
+    mounted.unmount().await.expect("unmount should succeed");
+
+    assert_within_bound("created after ENOENT via stat", took);
+}
+
+/// (c) A file deleted remotely leaves the folder listing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_deleted_remotely_disappears_from_the_listing_within_3s() {
+    let env = VfsTestEnv::new().await;
+    let (vfs, mounted, mp, _guard) = mount_and_browse_docs(
+        &env,
+        vec![
+            file_in("docs", "keep.txt", 1, "e1", "2026-01-02T00:00:00Z"),
+            file_in("docs", "gone.txt", 2, "e2", "2026-01-02T00:00:00Z"),
+        ],
+    )
+    .await;
+    let docs = mp.join("docs");
+    let d = docs.clone();
+    assert!(blocking_with_timeout(move || names_in(&d)).await.contains(&"gone.txt".to_string()));
+
+    env.set_remote_files_at("docs", vec![file_in("docs", "keep.txt", 1, "e1", "2026-01-02T00:00:00Z")]).await;
+    vfs.remote_changed(&format!("{}/docs/gone.txt", common::REMOTE_BASE)).await;
+    let took = poll_until(move || {
+        let names = names_in(&docs);
+        names.contains(&"keep.txt".to_string())
+            && !names.contains(&"gone.txt".to_string())
+            && std::fs::metadata(docs.join("gone.txt")).is_err()
+    })
+    .await;
+    mounted.unmount().await.expect("unmount should succeed");
+
+    assert_within_bound("deleted gone from read_dir and stat", took);
+}
+
+/// (d) A file renamed remotely shows under its new name only.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_renamed_remotely_shows_the_new_name_and_not_the_old_within_3s() {
+    let env = VfsTestEnv::new().await;
+    let (vfs, mounted, mp, _guard) =
+        mount_and_browse_docs(&env, vec![file_in("docs", "draft.txt", 3, "e1", "2026-01-02T00:00:00Z")]).await;
+    let docs = mp.join("docs");
+
+    env.set_remote_files_at("docs", vec![file_in("docs", "final.txt", 3, "e1", "2026-01-02T00:00:00Z")]).await;
+    // What the SSE handler does for a rename: both ends.
+    vfs.remote_changed(&format!("{}/docs/draft.txt", common::REMOTE_BASE)).await;
+    vfs.remote_changed(&format!("{}/docs/final.txt", common::REMOTE_BASE)).await;
+    let took = poll_until(move || {
+        let names = names_in(&docs);
+        names == vec!["final.txt".to_string()]
+            && std::fs::metadata(docs.join("final.txt")).is_ok()
+            && std::fs::metadata(docs.join("draft.txt")).is_err()
+    })
+    .await;
+    mounted.unmount().await.expect("unmount should succeed");
+
+    assert_within_bound("renamed via read_dir and stat", took);
+}
+
+
+/// Waits up to `within` for an `IN_CREATE`/`IN_DELETE` on the inotify
+/// instance `ino`. Returns how long it took, or `None`.
+fn wait_inotify(ino: i32, within: Duration) -> Option<Duration> {
+    let start = std::time::Instant::now();
+    loop {
+        let left = within.checked_sub(start.elapsed())?;
+        let mut pfd = libc::pollfd { fd: ino, events: libc::POLLIN, revents: 0 };
+        // SAFETY: one valid pollfd.
+        let n = unsafe { libc::poll(&mut pfd, 1, left.as_millis() as libc::c_int) };
+        if n == 0 {
+            return None;
+        }
+        if n > 0 {
+            let mut buf = [0u8; 4096];
+            // SAFETY: reads into a buffer of the given length.
+            let len = unsafe { libc::read(ino, buf.as_mut_ptr().cast(), buf.len()) };
+            if len >= std::mem::size_of::<libc::inotify_event>() as isize {
+                // SAFETY: the kernel wrote at least one whole inotify_event.
+                let ev: libc::inotify_event = unsafe { std::ptr::read_unaligned(buf.as_ptr().cast()) };
+                if ev.mask & (libc::IN_CREATE | libc::IN_DELETE) != 0 {
+                    return Some(start.elapsed());
+                }
+            }
+        }
+    }
+}
+
+/// A file manager (Nautilus/GIO, Dolphin) learns about a folder's change
+/// from inotify, which FUSE only feeds for operations done locally through
+/// the VFS — the kernel's `notify_inval_*` paths emit no fsnotify event on
+/// the parent. A remote change goes through `Vfs::remote_changed` and must
+/// reach an inotify watch on the folder within 3 s; what the file manager
+/// then re-reads must hold the new file; nothing is uploaded.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_remote_change_wakes_an_inotify_watch_on_the_open_folder_within_3s() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let env = VfsTestEnv::new().await;
+    env.expect_uploads().await;
+    let (vfs, mounted, mp, _guard) =
+        mount_and_browse_docs(&env, vec![file_in("docs", "a.txt", 1, "e1", "2026-01-02T00:00:00Z")]).await;
+    let docs = mp.join("docs");
+
+    let path = std::ffi::CString::new(docs.as_os_str().as_bytes()).unwrap();
+    // SAFETY: a plain syscall returning a fresh descriptor.
+    let ino = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
+    assert!(ino >= 0, "inotify_init1 failed");
+    // SAFETY: a live inotify descriptor and a NUL-terminated path.
+    let wd = unsafe { libc::inotify_add_watch(ino, path.as_ptr(), libc::IN_CREATE | libc::IN_DELETE) };
+    assert!(wd >= 0, "inotify_add_watch failed: {}", std::io::Error::last_os_error());
+
+    env.set_remote_files_at(
+        "docs",
+        vec![
+            file_in("docs", "a.txt", 1, "e1", "2026-01-02T00:00:00Z"),
+            file_in("docs", "b.txt", 2, "e2", "2026-03-01T10:00:00Z"),
+        ],
+    )
+    .await;
+    vfs.remote_changed(&format!("{}/docs/b.txt", common::REMOTE_BASE)).await;
+    let woke = blocking_with_timeout(move || wait_inotify(ino, Duration::from_secs(5))).await;
+    let d = docs.clone();
+    let listed = blocking_with_timeout(move || {
+        let mut names = names_in(&d);
+        names.sort();
+        names
+    })
+    .await;
+    // SAFETY: closing a descriptor this test opened.
+    unsafe { libc::close(ino) };
+    vfs.wait_for_writeback_idle().await;
+    mounted.unmount().await.expect("unmount should succeed");
+
+    report_latency("inotify on docs/", woke);
+    let woke = woke.expect("no inotify event on the open folder: the file manager would never refresh it");
+    assert!(woke <= REMOTE_CHANGE_VISIBLE_WITHIN, "inotify took {woke:?}");
+    assert_eq!(listed, vec!["a.txt".to_string(), "b.txt".to_string()], "what the file manager re-reads");
+    assert_eq!(env.upload_session_count(), 0, "a refresh must never upload anything");
+}

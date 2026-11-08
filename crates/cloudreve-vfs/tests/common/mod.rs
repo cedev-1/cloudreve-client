@@ -40,7 +40,8 @@ pub fn uri_of(name: &str) -> String {
 /// Files to serve for a listing, keyed by the full remote directory uri
 /// (e.g. `REMOTE_BASE` for the root, `"{REMOTE_BASE}/photos"` for a subdir).
 type FilesState = Arc<Mutex<HashMap<String, Vec<Value>>>>;
-type ContentStore = Arc<Mutex<HashMap<String, Vec<u8>>>>;
+/// `Arc` so a ranged GET of a big file clones a pointer, not the whole file.
+type ContentStore = Arc<Mutex<HashMap<String, Arc<Vec<u8>>>>>;
 type RequestLog = Arc<Mutex<HashMap<String, Vec<Option<String>>>>>;
 /// `(uris, dst)` recorded from the most recent mocked `move_files` call.
 type LastMove = Arc<Mutex<Option<(Vec<String>, String)>>>;
@@ -351,7 +352,7 @@ impl VfsTestEnv {
                     with_delay(
                         ResponseTemplate::new(200)
                             .insert_header("Accept-Ranges", "bytes")
-                            .set_body_bytes(content),
+                            .set_body_bytes(content.to_vec()),
                     )
                 })
                 .mount(&server)
@@ -917,7 +918,7 @@ impl VfsTestEnv {
         self.contents
             .lock()
             .unwrap()
-            .insert(name.to_string(), content.to_vec());
+            .insert(name.to_string(), Arc::new(content.to_vec()));
     }
 
     /// Makes `name`'s download endpoint answer `status` (e.g. 500) for the

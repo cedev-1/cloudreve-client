@@ -420,7 +420,27 @@ mod macos_impl {
         mount_with(VfsNfs::new(vfs).with_read_log(read_log), mountpoint, cache_dir, MOUNT_OPTS).await
     }
 
-    async fn mount_with(fs: VfsNfs, mountpoint: &Path, cache_dir: &Path, mount_opts: &str) -> Result<MountedVfs> {
+    /// Test-only: [`mount`] with the `mount_nfs` option string replaced
+    /// and every RPC tallied into `counts` (see [`VfsNfs::with_rpc_counts`])
+    /// — how `tests/mounted_macos.rs` measures what an option set costs.
+    #[doc(hidden)]
+    pub async fn mount_with_rpc_counts_for_tests(
+        vfs: Arc<Vfs>,
+        mountpoint: &Path,
+        cache_dir: &Path,
+        mount_opts: &str,
+        counts: Arc<crate::nfs::RpcCounts>,
+    ) -> Result<MountedVfs> {
+        mount_with(VfsNfs::new(vfs).with_rpc_counts(counts), mountpoint, cache_dir, mount_opts).await
+    }
+
+    /// Test-only: the option string [`mount`] passes to `mount_nfs`.
+    #[doc(hidden)]
+    pub fn production_mount_opts_for_tests() -> &'static str {
+        MOUNT_OPTS
+    }
+
+    async fn mount_with(fs: VfsNfs,mountpoint: &Path, cache_dir: &Path, mount_opts: &str) -> Result<MountedVfs> {
         if let Err(err) = cleanup_stale_mount(mountpoint, cache_dir).await {
             tracing::warn!(
                 mountpoint = %mountpoint.display(),
@@ -711,7 +731,8 @@ mod macos_impl {
 
 #[cfg(target_os = "macos")]
 pub use macos_impl::{
-    cleanup_stale_mount, mount, mount_with_nfs_tuning_for_tests, mount_with_read_log_for_tests, MountedVfs,
+    cleanup_stale_mount, mount, mount_with_nfs_tuning_for_tests, mount_with_read_log_for_tests,
+    mount_with_rpc_counts_for_tests, production_mount_opts_for_tests, MountedVfs,
 };
 
 #[cfg(target_os = "linux")]
