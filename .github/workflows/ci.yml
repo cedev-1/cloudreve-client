@@ -81,16 +81,9 @@ jobs:
       - name: Run tests
         run: cargo test -p cloudreve-vfs
 
-      - name: Measure remote-change latency and mount cost (temporary)
+      - name: Measure remote-change latency (temporary)
         if: always()
         run: |
-          BASE="locallocks,mutejukebox,vers=3,tcp,soft,dumbtimer,timeo=30,retrans=2,nobrowse,rsize=1048576,wsize=1048576,readahead=4"
-          cargo test -p cloudreve-vfs --test mounted_macos -- --nocapture remotely remote_change 2>&1 | grep -E "REMOTE-CHANGE-LATENCY|^test " || true
+          for i in 1 2 3 4 5; do cargo test -p cloudreve-vfs --test mounted_macos -- --nocapture remote_change 2>&1 | grep -E "REMOTE-CHANGE-LATENCY|^test " || true; done
           echo "--- mutation: folder refresh (nudge) off"
-          VFS_TEST_NO_NUDGE=1 cargo test -p cloudreve-vfs --test mounted_macos -- --nocapture remote_change 2>&1 | grep -E "REMOTE-CHANGE-LATENCY|^test " || true
-          echo "--- mutation: mount options without actimeo=1,nonegnamecache"
-          VFS_TEST_MOUNT_OPTS="$BASE" cargo test -p cloudreve-vfs --test mounted_macos -- --nocapture remotely 2>&1 | grep -E "REMOTE-CHANGE-LATENCY|^test " || true
-          echo "--- mutation: neither the options nor the nudge"
-          VFS_TEST_NO_NUDGE=1 VFS_TEST_MOUNT_OPTS="$BASE,nonegnamecache" cargo test -p cloudreve-vfs --test mounted_macos -- --nocapture remotely 2>&1 | grep -E "REMOTE-CHANGE-LATENCY|^test " || true
-          echo "--- mutation: actimeo=1 without the nudge"
-          VFS_TEST_NO_NUDGE=1 VFS_TEST_MOUNT_OPTS="$BASE,actimeo=1,nonegnamecache" cargo test -p cloudreve-vfs --test mounted_macos -- --nocapture remotely 2>&1 | grep -E "REMOTE-CHANGE-LATENCY|^test " || true
+          for i in 1 2 3; do VFS_TEST_NO_NUDGE=1 cargo test -p cloudreve-vfs --test mounted_macos -- --nocapture remote_change 2>&1 | grep -E "REMOTE-CHANGE-LATENCY|^test " || true; done

@@ -320,7 +320,7 @@ impl VfsTree {
                 }
                 // A directory's mtime is ours, not the server's (see
                 // `bump_dir_mtime`): Cloudreve's `updated_at` for a folder
-                // does not follow its children, so it can be older than
+                // need not follow its children, so it can be older than
                 // what the kernel was told. Never move it backwards.
                 if attr.is_dir && old.is_dir && (old.mtime_secs, old.mtime_nsecs) > (attr.mtime_secs, 0) {
                     attr.mtime_secs = old.mtime_secs;
@@ -751,9 +751,10 @@ impl VfsTree {
 /// buffers until a GETATTR shows that directory's mtime changed
 /// (`kext/nfs_vnops.c`, `nfs_getattr`: `NFS_CHANGED_NC` -> `cache_purge`,
 /// `NFS_CHANGED` -> `nfs_invaldir`, both mtime comparisons for NFSv3).
-/// Cloudreve's `updated_at` for a folder does not move when its children
-/// change, so the server's value alone would leave the kernel's view stale
-/// for as long as it stays cached. It is also `nfs3_server`'s READDIR
+/// Cloudreve's `updated_at` for a folder is not relied on to move when its
+/// children change (not verified against the server either way), so the
+/// server's value alone could leave the kernel's view stale for as long as
+/// it stays cached. It is also `nfs3_server`'s READDIR
 /// cookie verifier, which is what a changed directory should get.
 fn bump_dir_mtime(attr: &mut NodeAttr) {
     let now = std::time::SystemTime::now()

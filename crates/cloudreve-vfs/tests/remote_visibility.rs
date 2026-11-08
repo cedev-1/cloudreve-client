@@ -131,9 +131,9 @@ async fn a_folder_mtime_holds_still_when_a_re_list_finds_nothing_new() {
 }
 
 /// Re-listing the PARENT reports the folder with the server's own
-/// `updated_at`, which Cloudreve does not move for a child change. That
-/// must not walk the folder's mtime back to the old value (two changes in
-/// a row would then look like none to the kernel).
+/// `updated_at`, which need not move for a child change (the mock's does
+/// not). That must not walk the folder's mtime back to the old value (two
+/// changes in a row would then look like none to the kernel).
 #[tokio::test]
 async fn re_listing_the_parent_never_moves_a_folder_mtime_backwards() {
     let env = VfsTestEnv::new().await;

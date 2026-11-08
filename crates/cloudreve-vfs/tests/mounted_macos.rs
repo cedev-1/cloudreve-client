@@ -1530,6 +1530,10 @@ mod fsevents {
         pub fn seen(&self) -> bool {
             self.seen.load(Ordering::SeqCst)
         }
+
+        pub fn reset(&self) {
+            self.seen.store(false, Ordering::SeqCst);
+        }
     }
 
     impl Drop for Watch {
@@ -1554,8 +1558,24 @@ async fn a_remote_change_reaches_an_fsevents_stream_on_the_open_folder_within_3s
         mount_and_browse_docs(&env, vec![file_in("docs", "a.txt", 1, "e1", "2026-01-02T00:00:00Z")]).await;
     let docs = std::fs::canonicalize(mp.join("docs")).unwrap();
     let watch = fsevents::Watch::start(&docs);
-    // FSEvents only delivers events newer than the stream's start.
+    // The stream registers with fseventsd asynchronously and only gets
+    // events newer than that: prove it live with a local operation first
+    // (a local-only junk file, never uploaded), then start from silence.
+    let probe = docs.join("._fsevents-warmup");
+    let warm_start = std::time::Instant::now();
+    while !watch.seen() && warm_start.elapsed() < Duration::from_secs(10) {
+        let p = probe.clone();
+        blocking_with_timeout(move || {
+            let _ = std::fs::write(&p, b"x");
+            let _ = std::fs::remove_file(&p);
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let live = watch.seen();
     tokio::time::sleep(Duration::from_millis(500)).await;
+    watch.reset();
+    tokio::time::sleep(Duration::from_millis(300)).await;
     let spurious = watch.seen();
 
     env.set_remote_files_at(
@@ -1580,6 +1600,7 @@ async fn a_remote_change_reaches_an_fsevents_stream_on_the_open_folder_within_3s
     mounted.unmount().await.expect("unmount should succeed");
 
     report_latency("FSEvents on docs/", took);
+    assert!(live, "the FSEvents stream never saw a local operation on the folder: nothing to measure");
     assert!(!spurious, "an event arrived before any change: the check would prove nothing");
     let took = took.expect("no FSEvents event for the open folder: Finder would never refresh it");
     assert!(took <= REMOTE_CHANGE_VISIBLE_WITHIN, "FSEvents took {took:?}");
