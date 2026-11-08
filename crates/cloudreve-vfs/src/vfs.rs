@@ -764,15 +764,6 @@ impl Vfs {
         // unrelated per-path lock keys and could interleave.
         let _ns_guard = self.namespace_lock.read().await;
 
-        let attr = self
-            .tree
-            .getattr(node)
-            .await?
-            .context("open: unknown node (readdir/lookup it first)")?;
-        if attr.is_dir {
-            bail!("cannot open a directory as a file");
-        }
-
         // Held through the whole rest of this call, including registering
         // the new handle at the very end: this is the other half of
         // `rename`'s EBUSY guard (see `open_locks`'s field doc) — an open
@@ -780,26 +771,31 @@ impl Vfs {
         // visible in `open_files`) before a racing `rename`'s busy-check can
         // run.
         //
-        // The reverse ordering is NOT fully closed, and an earlier version
-        // of this comment overclaimed that it was. `attr` above is resolved
-        // (via `tree.getattr`) BEFORE this lock is taken, so an open racing
-        // a `rename` that commits first still waits here on the SAME lock
-        // key (both resolve to the entry's pre-rename path) but then
-        // resumes holding a now-STALE `attr.remote_path` — waiting does NOT
-        // re-resolve it. In practice this fails LOUDLY rather than leaving a
-        // surviving stale handle: by the time the rename has committed, its
-        // draft (if any) has already migrated to the new path, so
-        // `has_draft` below is false, and the `fetch_download_url` call
-        // further down 404s against the server for a path that no longer
-        // exists there — this whole function returns that error before ever
-        // reaching the final `open_files.write().await.insert(..)`, so
-        // nothing stale is ever registered. Reachable only via NFS's
-        // per-RPC concurrency (FUSE's single dispatch thread can't race its
-        // own calls this way); `create` has the same shape, narrower
-        // (its parent attr is likewise resolved before its own
-        // `open_lock_for` call).
-        let open_lock = self.open_lock_for(&attr.remote_path);
-        let _open_guard = open_lock.lock().await;
+        // The reverse ordering: the path is resolved before the lock can be
+        // taken, so an open racing a `rename` that commits first waits on
+        // the entry's PRE-rename path lock. A rename keeps the node's
+        // identity (`VfsTree::rename_entry`), so the node is re-resolved once
+        // the lock is held and, if it moved meanwhile, the open retries on
+        // its new path — it never registers a handle under the old one. This
+        // is what lets an NFS WRITE that races the RENAME of the same file
+        // (the kernel writes by fileid) land in the migrated draft instead of
+        // failing. `create` resolves its parent the same way, unretried: a
+        // parent renamed in that window fails the create loudly instead.
+        let (attr, _open_guard) = loop {
+            let attr = self
+                .tree
+                .getattr(node)
+                .await?
+                .context("open: unknown node (readdir/lookup it first)")?;
+            if attr.is_dir {
+                bail!("cannot open a directory as a file");
+            }
+            let guard = self.open_lock_for(&attr.remote_path).lock_owned().await;
+            let now = self.tree.getattr(node).await?.context("open: the node went away")?;
+            if now.remote_path == attr.remote_path {
+                break (now, guard);
+            }
+        };
 
         let key = FileKey { remote_path: attr.remote_path.clone(), etag: attr.etag.clone() };
 
@@ -1480,6 +1476,15 @@ impl Vfs {
     /// so its eventual upload (successful or not) always lands under the
     /// NEW path, never the old one.
     ///
+    /// IDENTITY: the entry keeps its `NodeId` (`VfsTree::rename_entry`) — a
+    /// directory keeps its whole resident subtree's — and an entry replaced
+    /// at the destination retires its own. The EBUSY contract below is about
+    /// facade HANDLES, whose path is fixed when opened; the kernel's fileid
+    /// or inode is the `NodeId`, and an `open` by it after (or racing) the
+    /// rename resolves the new path. That is what keeps a downloader writing
+    /// `x.part` through NFS, which opens a facade handle per WRITE, working
+    /// across the rename to `x`.
+    ///
     /// EBUSY CONTRACT (cycle A of the phase-2 debt burn-down, replacing the
     /// phase-2 "known blocker" this used to document): a handle open on the
     /// entry being renamed makes this call fail with [`RenameBusyError`]
@@ -1650,8 +1655,7 @@ impl Vfs {
                     junk.insert(new_path.clone(), file);
                 }
             }
-            self.tree.forget_local_entry(parent, name).await;
-            self.tree.insert_local_entry(new_parent, new_name).await?;
+            self.tree.rename_entry(parent, name, new_parent, new_name).await;
             return Ok(());
         }
 
@@ -1808,6 +1812,13 @@ impl Vfs {
             self.write_queue.migrate_armed_timer(&old_path, new_path.clone());
         }
 
+        // The entry keeps its NodeId under the new name (see
+        // `VfsTree::rename_entry`): the kernel goes on addressing a renamed
+        // file by the fileid/inode it already holds, and a WRITE that
+        // arrives after this point must reach the migrated draft, not a
+        // dead id. Done before the invalidations below so they refresh the
+        // moved node in place instead of dropping it.
+        self.tree.rename_entry(parent, name, new_parent, new_name).await;
         self.tree.invalidate_path(&old_path).await;
         if existed_remotely || dest_remote.is_some() {
             // The destination side changed remotely — either the ordinary

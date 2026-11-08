@@ -120,6 +120,9 @@ pub struct VfsTestEnv {
     last_deleted_uris: Arc<Mutex<Vec<String>>>,
     rename_calls: Arc<AtomicUsize>,
     last_rename: Arc<Mutex<Option<(String, String)>>>,
+    /// Artificial delay on every `POST /file/rename` response — see
+    /// `slow_down_renames`.
+    rename_delay: Arc<Mutex<Duration>>,
     move_calls: Arc<AtomicUsize>,
     last_move: LastMove,
 }
@@ -168,6 +171,7 @@ impl VfsTestEnv {
         let last_deleted_uris = Arc::new(Mutex::new(Vec::new()));
         let rename_calls = Arc::new(AtomicUsize::new(0));
         let last_rename = Arc::new(Mutex::new(None));
+        let rename_delay = Arc::new(Mutex::new(Duration::ZERO));
         let move_calls = Arc::new(AtomicUsize::new(0));
         let last_move = Arc::new(Mutex::new(None));
 
@@ -383,6 +387,7 @@ impl VfsTestEnv {
             last_deleted_uris,
             rename_calls,
             last_rename,
+            rename_delay,
             move_calls,
             last_move,
         }
@@ -467,10 +472,12 @@ impl VfsTestEnv {
             let files = self.files.clone();
             let rename_calls = self.rename_calls.clone();
             let last_rename = self.last_rename.clone();
+            let rename_delay = self.rename_delay.clone();
             Mock::given(method("POST"))
                 .and(path("/api/v4/file/rename"))
                 .respond_with(move |req: &Request| {
                     rename_calls.fetch_add(1, Ordering::SeqCst);
+                    let delay = *rename_delay.lock().unwrap();
                     let request: RenameFileService =
                         req.body_json().expect("decode RenameFileService body");
                     *last_rename.lock().unwrap() =
@@ -508,6 +515,7 @@ impl VfsTestEnv {
                     }
                     files.entry(parent_uri.to_string()).or_default().push(entry.clone());
                     ResponseTemplate::new(200)
+                        .set_delay(delay)
                         .set_body_json(json!({ "code": 0, "msg": "", "data": entry }))
                 })
                 .mount(&self.server)
@@ -563,6 +571,13 @@ impl VfsTestEnv {
                 .mount(&self.server)
                 .await;
         }
+    }
+
+    /// Delays every future `POST /file/rename` response by `delay`, so a
+    /// test can land another call while a rename is mid-flight (the
+    /// request is counted by `rename_call_count` on arrival).
+    pub fn slow_down_renames(&self, delay: Duration) {
+        *self.rename_delay.lock().unwrap() = delay;
     }
 
     /// Total `POST /file/create` requests received so far.

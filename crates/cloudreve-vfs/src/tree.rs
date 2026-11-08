@@ -26,7 +26,8 @@ pub const LISTING_TTL: Duration = Duration::from_secs(5);
 
 /// Opaque handle to a node in the tree. Allocated once per (parent, name)
 /// pair and stable for the lifetime of the `VfsTree`, so frontends (NFS on
-/// macOS, FUSE on Linux) can cache by id across repeated lookups.
+/// macOS, FUSE on Linux) can cache by id across repeated lookups. A rename
+/// carries it to the new (parent, name) (see `VfsTree::rename_entry`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeId(pub u64);
 
@@ -68,7 +69,8 @@ struct Inner {
     /// case it is treated the same as "not read yet".
     listed_at: HashMap<NodeId, Instant>,
     /// Ids assigned to (parent, name) pairs, kept even if the directory is
-    /// ever re-listed, so a node's id never changes for the tree's lifetime.
+    /// ever re-listed, so a node's id never changes for the tree's lifetime
+    /// — a rename re-keys the pair rather than minting a new id.
     known_children: HashMap<(NodeId, String), NodeId>,
     /// Files whose own path was invalidated (SSE, write-back), mapped to
     /// the directory that lists them. Their `attrs` entry is kept — the
@@ -463,6 +465,73 @@ impl VfsTree {
             },
         );
         Ok(id)
+    }
+
+    /// A rename that already happened (on the server, or in the local-only
+    /// draft/overlay state) carries the entry's identity along: the
+    /// `NodeId` the kernel holds for `old_parent`/`old_name` now names
+    /// `new_parent`/`new_name`, so an app still writing to it by fileid or
+    /// inode (a downloader renaming `x.part`, an editor saving) keeps
+    /// reaching the same file. A directory keeps its whole resident
+    /// subtree: children are keyed by the directory's id, which does not
+    /// change, and every descendant's `remote_path` is rewritten.
+    ///
+    /// An entry already known at the destination (rename over an existing
+    /// file) is retired with its subtree: its id stops resolving rather
+    /// than aliasing the file that replaced it.
+    ///
+    /// The moved id leaves `old_parent`'s listed `children` — or the next
+    /// re-list of `old_parent` would prune it as a ghost under its new name
+    /// — and joins `new_parent`'s if it was a listed (server) entry.
+    pub async fn rename_entry(&self, old_parent: NodeId, old_name: &str, new_parent: NodeId, new_name: &str) {
+        let mut inner = self.inner.write().await;
+        let Some(new_parent_path) = inner.attrs.get(&new_parent).map(|a| a.remote_path.clone()) else {
+            return;
+        };
+        let Some(id) = inner.known_children.remove(&(old_parent, old_name.to_string())) else {
+            return;
+        };
+        if let Some(dest) = inner.known_children.remove(&(new_parent, new_name.to_string())) {
+            if dest != id {
+                if let Some(list) = inner.children.get_mut(&new_parent) {
+                    list.retain(|c| *c != dest);
+                }
+                remove_subtree(&mut inner, dest);
+            }
+        }
+        let was_listed = match inner.children.get_mut(&old_parent) {
+            Some(list) => {
+                let before = list.len();
+                list.retain(|c| *c != id);
+                list.len() != before
+            }
+            None => false,
+        };
+        // Only a server-listed entry joins the new parent's listing: a
+        // local-only one (a draft never uploaded, a junk file) must stay
+        // out of `children`, whose re-list diff would prune it as a ghost.
+        if was_listed {
+            if let Some(list) = inner.children.get_mut(&new_parent) {
+                list.push(id);
+            }
+        }
+        inner.known_children.insert((new_parent, new_name.to_string()), id);
+        if let Some(parent) = inner.stale_files.get_mut(&id) {
+            *parent = new_parent;
+        }
+
+        let new_path = format!("{new_parent_path}/{new_name}");
+        let Some(attr) = inner.attrs.get_mut(&id) else { return };
+        let old_path = std::mem::replace(&mut attr.remote_path, new_path.clone());
+        attr.name = new_name.to_string();
+        if attr.is_dir {
+            let old_prefix = format!("{old_path}/");
+            for attr in inner.attrs.values_mut() {
+                if let Some(rest) = attr.remote_path.strip_prefix(&old_prefix) {
+                    attr.remote_path = format!("{new_path}/{rest}");
+                }
+            }
+        }
     }
 
     /// Drops a local-only entry made by `insert_local_entry` right away,
