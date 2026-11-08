@@ -44,7 +44,16 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 /// The local-only junk name created and removed to wake watchers.
-pub const NUDGE_NAME: &str = "._cloudreve-refresh";
+///
+/// Not an AppleDouble `._` name: Apple's NFS client answers a lookup of
+/// `._X` with ENOENT on its own, without asking the server and without
+/// letting `open(O_CREAT)` go on to CREATE, whenever it holds the folder's
+/// complete READDIRPLUS listing and `._X` is not in it (`kext/nfs_vnops.c`,
+/// `nfs_dir_buf_cache_lookup` `skipdu`, then `nfs_vnop_lookup`: "Skip lookup
+/// for du files"). Measured on CI: a `._` probe right after browsing a
+/// folder failed with ENOENT every time; it only worked once a remote
+/// change had already made the kernel drop that listing.
+pub const NUDGE_NAME: &str = ".cloudreve-refresh";
 
 /// How long requests are gathered before the folders they name are nudged.
 pub const NUDGE_DEBOUNCE: Duration = Duration::from_millis(200);
@@ -205,6 +214,13 @@ mod tests {
     #[test]
     fn the_nudge_name_is_local_only_junk() {
         assert_eq!(crate::junk::classify(NUDGE_NAME), Some(crate::junk::JunkKind::LocalOnly));
+    }
+
+    /// See [`NUDGE_NAME`]: the macOS client refuses to create a `._` name
+    /// missing from a listing it holds in full.
+    #[test]
+    fn the_nudge_name_is_not_an_appledouble_sidecar() {
+        assert!(!NUDGE_NAME.starts_with("._"));
     }
 
     #[test]

@@ -1582,28 +1582,12 @@ async fn a_remote_change_reaches_an_fsevents_stream_on_the_open_folder_within_3s
     // The stream registers with fseventsd asynchronously and only gets
     // events newer than that: prove it live with a local operation first
     // (a local-only junk file, never uploaded), then start from silence.
-    // The probe is the production refresh itself, run by hand (a plain
-    // `std::fs::write` of another `._` name through the canonical path
-    // produced no event on the CI runner, for reasons not pinned down).
+    // The probe is the production refresh itself, run by hand on a folder
+    // whose listing the kernel holds in full: it must work then too (an
+    // AppleDouble `._` probe failed with ENOENT exactly there, see
+    // `nudge::NUDGE_NAME`).
     let probe = cloudreve_vfs::nudge::touch_through(mp.clone());
     let mut warmup_errors = Vec::new();
-    {
-        let (d, root) = (mp.join("docs"), mp.clone());
-        let steps = blocking_with_timeout(move || {
-            let p = d.join("._probe");
-            let c = std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(&p).map(drop);
-            let m = std::fs::metadata(&p).map(|m| m.len());
-            let r = std::fs::remove_file(&p);
-            let q = root.join("._probe");
-            let c2 = std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(&q).map(drop);
-            let r2 = std::fs::remove_file(&q);
-            let dm = std::fs::metadata(&d).map(|m| m.is_dir());
-            format!("docs: create={c:?} stat={m:?} remove={r:?} | root: create={c2:?} remove={r2:?} | docs stat={dm:?}")
-        })
-        .await;
-        use std::io::Write;
-        let _ = writeln!(std::io::stderr(), "FSEVENTS-PROBE {steps}");
-    }
     let warm_start = std::time::Instant::now();
     while !watch.seen() && warm_start.elapsed() < Duration::from_secs(10) {
         let p = probe.clone();
@@ -1649,6 +1633,7 @@ async fn a_remote_change_reaches_an_fsevents_stream_on_the_open_folder_within_3s
         );
     }
     report_latency("FSEvents on docs/", took);
+    assert!(warmup_errors.is_empty(), "the folder refresh failed on a freshly listed folder: {warmup_errors:?}");
     assert!(live, "the FSEvents stream never saw a local operation on the folder: nothing to measure");
     assert!(spurious.is_empty(), "an event arrived before any change: the check would prove nothing");
     let took = took.expect("no FSEvents event for the open folder: Finder would never refresh it");

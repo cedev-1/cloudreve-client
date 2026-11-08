@@ -11,7 +11,8 @@
 //!
 //! Two kinds, decided per name:
 //!
-//! - [`JunkKind::LocalOnly`] — `._*`, `.DS_Store`, `.VolumeIcon.icns`:
+//! - [`JunkKind::LocalOnly`] — `._*`, `.DS_Store`, `.VolumeIcon.icns`, and
+//!   the app's own `.cloudreve-refresh` (`crate::nudge`):
 //!   creating, writing, reading, renaming and deleting them all SUCCEED,
 //!   but the bytes live only in the facade's in-memory overlay (see
 //!   `Vfs`'s `junk` field) and are never uploaded. Refusing them instead
@@ -54,7 +55,8 @@ pub enum JunkKind {
     Reserved,
 }
 
-const LOCAL_ONLY_NAMES: &[&str] = &[".DS_Store", ".VolumeIcon.icns"];
+// `crate::nudge::NUDGE_NAME`: the app's own folder-refresh probe.
+const LOCAL_ONLY_NAMES: &[&str] = &[".DS_Store", ".VolumeIcon.icns", ".cloudreve-refresh"];
 
 const RESERVED_NAMES: &[&str] = &[
     ".Spotlight-V100",

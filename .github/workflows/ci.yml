@@ -84,6 +84,6 @@ jobs:
       - name: Measure remote-change latency (temporary)
         if: always()
         run: |
-          for i in 1; do cargo test -p cloudreve-vfs --test mounted_macos -- --nocapture remote_change 2>&1 | grep -E "REMOTE-CHANGE-LATENCY|FSEVENTS|^test " || true; done
+          for i in 1 2 3; do cargo test -p cloudreve-vfs --test mounted_macos -- --nocapture remote_change 2>&1 | grep -E "REMOTE-CHANGE-LATENCY|FSEVENTS|^test " || true; done
           echo "--- mutation: folder refresh (nudge) off"
           for i in 1; do VFS_TEST_NO_NUDGE=1 cargo test -p cloudreve-vfs --test mounted_macos -- --nocapture remote_change 2>&1 | grep -E "REMOTE-CHANGE-LATENCY|FSEVENTS|^test " || true; done
