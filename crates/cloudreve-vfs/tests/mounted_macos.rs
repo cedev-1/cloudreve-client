@@ -450,7 +450,13 @@ async fn a_read_slower_than_the_soft_timeout_still_returns_the_bytes() {
 ///   the LOOKUP itself waits on the network.
 /// Results go straight to the process's stderr (bypassing libtest's
 /// capture) as `SOFT-BUDGET` lines.
+///
+/// Ignored: it takes ~80s and asserts nothing. Its results are recorded on
+/// `nfs::READ_JUKEBOX_AFTER` and `mount.rs`'s `MOUNT_OPTS`. Rerun with
+/// `cargo test -p cloudreve-vfs --test mounted_macos -- --ignored
+/// measure_soft_timeout_budget_for_held_rpcs`.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore]
 async fn measure_soft_timeout_budget_for_held_rpcs() {
     use std::io::Write;
     use std::os::unix::process::ExitStatusExt;
@@ -616,4 +622,48 @@ async fn a_one_second_read_is_answered_without_the_jukebox_sleep() {
         elapsed < Duration::from_millis(3000),
         "a 1s download must not pay the 4s JUKEBOX sleep, the read took {elapsed:?}"
     );
+}
+
+/// A LOOKUP waiting on a slow directory listing (a big folder on a remote
+/// server) must not fail with ETIMEDOUT: without `dumbtimer` the client
+/// times LOOKUPs with an RTO learned from millisecond loopback replies and
+/// gave up after under 2s on CI. The warm-up trains that estimator the way
+/// any mount in use would have.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lookup_in_a_slowly_listed_folder_does_not_time_out() {
+    let env = VfsTestEnv::new().await;
+    let mut listing = vec![common::remote_dir("big")];
+    for i in 0..30 {
+        listing.push(remote_file(&format!("warm-{i}.txt"), 11, "e1"));
+    }
+    env.set_remote_files(listing).await;
+    let mut inside = remote_file("x.txt", 11, "e1");
+    inside["path"] = serde_json::json!(format!("{}/big/x.txt", common::REMOTE_BASE));
+    env.set_remote_files_at("big", vec![inside]).await;
+    env.slow_down_listing("big", Duration::from_millis(4000));
+
+    let vfs = new_test_vfs(&env).await;
+
+    let mp = tempfile::tempdir().unwrap();
+    let mountpoint = mp.path().to_path_buf();
+    let _guard = MountpointGuard(mountpoint.clone());
+
+    let mounted = mount::mount(vfs.clone(), &mountpoint, "CloudreveTest", env.cache_dir())
+        .await
+        .expect("mount should succeed");
+
+    let warm_dir = mountpoint.clone();
+    blocking_with_timeout(move || {
+        for i in 0..30 {
+            std::fs::metadata(warm_dir.join(format!("warm-{i}.txt"))).unwrap();
+        }
+    })
+    .await;
+
+    let p = mountpoint.join("big").join("x.txt");
+    let res = blocking_with_timeout(move || std::fs::metadata(&p).map(|m| m.len())).await;
+
+    mounted.unmount().await.expect("unmount should succeed");
+
+    assert_eq!(res.expect("the lookup must wait for the listing, not time out"), 11);
 }

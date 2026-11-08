@@ -371,7 +371,7 @@ async fn a_slow_read_answers_jukebox_then_serves_the_bytes_from_one_download() {
     let env = VfsTestEnv::new().await;
     env.set_remote_files(vec![remote_file("slow.txt", 11, "e1")]).await;
     env.serve_file_content("slow.txt", b"hello world").await;
-    env.slow_down_downloads("slow.txt", Duration::from_millis(1500));
+    env.slow_down_downloads("slow.txt", Duration::from_millis(3000));
 
     let (vfs, _rx) =
         Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
@@ -384,8 +384,8 @@ async fn a_slow_read_answers_jukebox_then_serves_the_bytes_from_one_download() {
     let first = fs.read(&id, 0, 11).await;
     assert_eq!(first.unwrap_err(), nfsstat3::NFS3ERR_JUKEBOX);
     assert!(
-        started.elapsed() < Duration::from_millis(1000),
-        "the JUKEBOX reply must come back well before the 1.5s download finishes, took {:?}",
+        started.elapsed() < Duration::from_millis(2600),
+        "the JUKEBOX reply must come back well before the 3s download finishes, took {:?}",
         started.elapsed()
     );
 
@@ -412,14 +412,16 @@ async fn a_slow_read_answers_jukebox_then_serves_the_bytes_from_one_download() {
     );
 }
 
-/// The counterpart: a read the server CAN answer promptly is answered on
-/// the first try — JUKEBOX is only for genuinely slow fetches, since each
-/// one costs the app a multi-second client-side sleep.
+/// The counterpart: a block that takes 1.5s to download — an ordinary cold
+/// read from a remote Cloudreve server — is answered on the first try.
+/// JUKEBOX is only for genuinely slow fetches, since each one costs the app
+/// a 4s client-side sleep before the resend.
 #[tokio::test]
 async fn a_fast_read_is_answered_directly_without_jukebox() {
     let env = VfsTestEnv::new().await;
     env.set_remote_files(vec![remote_file("fast.txt", 11, "e1")]).await;
     env.serve_file_content("fast.txt", b"hello world").await;
+    env.slow_down_downloads("fast.txt", Duration::from_millis(1500));
 
     let (vfs, _rx) =
         Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)

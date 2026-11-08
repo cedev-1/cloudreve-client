@@ -89,18 +89,42 @@ use crate::vfs::Vfs;
 /// `NFS3ERR_JUKEBOX` instead (the fetch keeps running in the background;
 /// see [`VfsNfs::read`]).
 ///
-/// Why so short: on a `soft` mount Apple's NFS client (`kext/nfs_socket.c`,
-/// `nfs_request_timer`) fails an RPC once it has hit `retrans` timeouts
-/// with no reply, and for READ that timeout is NOT `timeo` — it is the
-/// adaptive RTO learned from past READ replies (floor 62.5 ms, doubling per
-/// consecutive timeout). On a warm loopback mount, where cached reads reply
-/// in a millisecond, three timeouts can add up to well under a second. A
-/// JUKEBOX reply arriving inside that budget is a real reply: it resets the
-/// timeout counters and makes the client sleep (4s, 8s, 16s) and resend the
-/// same READ. A soft mount gives up after the 16s sleep, so a single block
-/// fetch can take ~28s before the app sees EIO — versus a few seconds
-/// before.
-pub const READ_JUKEBOX_AFTER: Duration = Duration::from_millis(250);
+/// Each JUKEBOX costs the app a client-side sleep of at least 4s before
+/// the resend (`kext/nfs_socket.c`, `nfs_request_finish`: `r_delay` 4, 8,
+/// 16, then 30s, at which point a soft mount gives up — a READ still
+/// unanswered after ~28s of sleeps fails), so this must be as long as the
+/// mount allows: a cold 1 MiB block from a remote server routinely takes
+/// a second or two, and must be served directly.
+///
+/// The ceiling is the client's soft timeout. In `nfs_request_timer` an
+/// RPC with no reply times out after `timeo` (with `dumbtimer`, see
+/// `mount.rs`'s `MOUNT_OPTS`; without it, an RTO learned from past
+/// replies), the timeout doubles per consecutive timeout of the mount, and
+/// a soft mount fails the RPC at its `retrans + 1`-th timeout: 3s + 3s + 3s
+/// = 9s at the earliest for `timeo=30,retrans=2` (when other replies keep
+/// resetting the mount's timeout count), 3 + 6 + 10s otherwise. 2s stays
+/// under even the FIRST timeout, so no READ of a live server ever bumps the
+/// mount-wide timeout count — which also halves the "too long" cap for
+/// every other request (`maxtime`), down to 3.3s once eight RPCs timed out.
+///
+/// Measured on the macos-latest CI runner, JUKEBOX disabled, after warm-up
+/// traffic (`measure_soft_timeout_budget_for_held_rpcs`):
+///
+/// | held for | read(2) | mmap (cmp) | LOOKUP, RTO timer | LOOKUP, dumbtimer |
+/// |----------|---------|------------|-------------------|-------------------|
+/// | 0.25-1s  | ok      | ok         | ok                | ok                |
+/// | 2s       | ok      | ok         | ETIMEDOUT @1.8s   | ok                |
+/// | 4s       | ok      | ok         | ETIMEDOUT @0.7s   | ok                |
+/// | 8s       | ok      | ok         | ETIMEDOUT @1.4s   | ok                |
+///
+/// read(2) never times out because the client issues it as an async
+/// readahead buffer, whose RPC is `R_NOINTR` and exempt from the soft
+/// timeout (`nfs_bio.c`, `nfs_buf_readahead`); the mmap probe most likely
+/// survived because the READ RTO had not converged yet (initial srtt is 1s and
+/// drifts down 1/8 per reply), but a synchronous READ times out like the
+/// LOOKUP column once it has. JUKEBOX is what keeps those reads alive
+/// past 9s.
+pub const READ_JUKEBOX_AFTER: Duration = Duration::from_secs(2);
 
 /// A READ answered with JUKEBOX whose client never came back (it gave up,
 /// or the app went away) is dropped after this long, so its result does

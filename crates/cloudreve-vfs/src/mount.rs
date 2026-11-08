@@ -305,15 +305,25 @@ mod macos_impl {
     ///     test: without it, an RPC against a mount whose server has died
     ///     blocks forever instead of returning ETIMEDOUT. `timeo` is in
     ///     DECISECONDS per `mount_nfs(8)` — `timeo=30` is 3 real seconds per
-    ///     retry, `retrans=2` bounds the whole soft-timeout window to ~9s.
-    ///     That window is shorter still for READ: Apple's client times READs
-    ///     with an RTO learned from past replies, not `timeo`. A slow READ
-    ///     therefore never holds its RPC: the server answers
-    ///     `NFS3ERR_JUKEBOX` and the client resends (see
+    ///     timeout, and a soft mount fails an RPC at its third timeout
+    ///     (`retrans=2`): after 9s (3+3+3, when other replies keep resetting
+    ///     the mount's backoff) to 19s (3+6+10, an idle mount) — the worst
+    ///     hang an app sees on a dead server. A READ slower than that is
+    ///     answered `NFS3ERR_JUKEBOX` and resent by the client (see
     ///     `nfs::READ_JUKEBOX_AFTER`). `hard` was the alternative, rejected
     ///     because a dead server would then hang every app touching the
     ///     mount until `deadtimeout`, and because `deadtimeout` also counts
     ///     a merely slow RPC as "unresponsive" and would zombie a live mount.
+    ///   - `dumbtimer`: without it `timeo` only applies to the rarer RPCs;
+    ///     GETATTR/LOOKUP/READ/WRITE time out after an RTO learned from past
+    ///     replies (`kext/nfs_socket.c`, `NFS_RTO`), floored at 62.5ms. On a
+    ///     loopback mount every warm reply takes a millisecond, so the learned
+    ///     RTO collapses and a LOOKUP waiting on a slow directory listing
+    ///     failed with ETIMEDOUT after 0.7-1.8s on CI (see
+    ///     `measure_soft_timeout_budget_for_held_rpcs` in
+    ///     `tests/mounted_macos.rs`). `mount_nfs(8)`: "the dumbtimer option
+    ///     should be specified when using [timeo] to manually tune the
+    ///     timeout interval".
     ///   - `mutejukebox`: the client otherwise reports a mount that keeps
     ///     answering JUKEBOX as unresponsive (the "server connections
     ///     interrupted" dialog) — here JUKEBOX is normal operation.
@@ -324,7 +334,7 @@ mod macos_impl {
     ///     layer: `nolocks` made them fail with ENOTSUP, which breaks
     ///     SQLite, Office and Python's `filelock`. Client-local locks are
     ///     exactly right here — this kernel is the export's only client.
-    const MOUNT_OPTS: &str = "locallocks,mutejukebox,vers=3,tcp,soft,timeo=30,retrans=2";
+    const MOUNT_OPTS: &str = "locallocks,mutejukebox,vers=3,tcp,soft,dumbtimer,timeo=30,retrans=2";
 
     /// Mounts `vfs` as a real NFS drive at `mountpoint` (D1). `mountpoint`
     /// must already exist as an empty directory. `volume_name` is advisory
