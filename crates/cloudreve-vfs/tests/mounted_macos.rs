@@ -344,3 +344,58 @@ async fn mounting_over_a_stale_leftover_mountpoint_succeeds_via_pre_clean() {
     );
 }
 
+
+/// Advisory locks through the mount must WORK, not fail with ENOTSUP:
+/// SQLite, Office and Python's `filelock` all take an `flock`/`fcntl` lock
+/// before touching a file and give up when the syscall itself is refused.
+/// The in-process server has no NLM, so the mount must handle locks on the
+/// client side (`locallocks`) rather than rejecting them (`nolocks`).
+#[tokio::test(flavor = "multi_thread")]
+async fn flock_and_fcntl_locks_succeed_through_the_mount() {
+    use std::os::fd::AsRawFd;
+
+    let env = VfsTestEnv::new().await;
+    env.set_remote_files(vec![remote_file("db.sqlite", 11, "e1")]).await;
+    env.serve_file_content("db.sqlite", b"hello world").await;
+
+    let vfs = new_test_vfs(&env).await;
+
+    let mp = tempfile::tempdir().unwrap();
+    let mountpoint = mp.path().to_path_buf();
+    let _guard = MountpointGuard(mountpoint.clone());
+
+    let mounted = mount::mount(vfs.clone(), &mountpoint, "CloudreveTest", env.cache_dir())
+        .await
+        .expect("mount should succeed");
+
+    let path = mountpoint.join("db.sqlite");
+    let (flock_res, fcntl_res) = blocking_with_timeout(move || {
+        let file = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
+        let fd = file.as_raw_fd();
+
+        let flock_res = if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            unsafe { libc::flock(fd, libc::LOCK_UN) };
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        };
+
+        let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+        lock.l_type = libc::F_RDLCK as libc::c_short;
+        lock.l_whence = libc::SEEK_SET as libc::c_short;
+        let fcntl_res = if unsafe { libc::fcntl(fd, libc::F_SETLK, &lock) } == 0 {
+            lock.l_type = libc::F_UNLCK as libc::c_short;
+            unsafe { libc::fcntl(fd, libc::F_SETLK, &lock) };
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        };
+        (flock_res, fcntl_res)
+    })
+    .await;
+
+    mounted.unmount().await.expect("unmount should succeed");
+
+    assert!(flock_res.is_ok(), "flock through the mount failed: {flock_res:?}");
+    assert!(fcntl_res.is_ok(), "fcntl F_SETLK through the mount failed: {fcntl_res:?}");
+}

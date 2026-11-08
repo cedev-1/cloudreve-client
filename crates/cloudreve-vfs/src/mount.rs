@@ -305,10 +305,14 @@ mod macos_impl {
     ///     blocks forever instead of returning ETIMEDOUT. `timeo` is in
     ///     DECISECONDS per `mount_nfs(8)` — `timeo=30` is 3 real seconds per
     ///     retry, `retrans=2` bounds the whole soft-timeout window to ~9s.
-    ///   - `nolocks`: this server implements no NLM (network lock manager);
-    ///     without it, mount_nfs's own lock-daemon handshake stalls the
-    ///     mount.
-    const MOUNT_OPTS: &str = "nolocks,vers=3,tcp,soft,timeo=30,retrans=2";
+    ///   - `locallocks`: this server implements no NLM (network lock
+    ///     manager); without a lock option, mount_nfs's own lock-daemon
+    ///     handshake stalls the mount. `locallocks` (not `nolocks`) keeps
+    ///     flock/fcntl working by taking every lock in the client's VFS
+    ///     layer: `nolocks` made them fail with ENOTSUP, which breaks
+    ///     SQLite, Office and Python's `filelock`. Client-local locks are
+    ///     exactly right here — this kernel is the export's only client.
+    const MOUNT_OPTS: &str = "locallocks,vers=3,tcp,soft,timeo=30,retrans=2";
 
     /// Mounts `vfs` as a real NFS drive at `mountpoint` (D1). `mountpoint`
     /// must already exist as an empty directory. `volume_name` is advisory
