@@ -1,5 +1,3 @@
-          echo "--- mutation: mount options without actimeo=1,nonegnamecache"
-          VFS_TEST_MOUNT_OPTS="locallocks,mutejukebox,vers=3,tcp,soft,dumbtimer,timeo=30,retrans=2,nobrowse,rsize=1048576,wsize=1048576,readahead=4" cargo test -p cloudreve-vfs --test mounted_macos -- --nocapture remotely remote_change 2>&1 | grep -E "REMOTE-CHANGE-LATENCY|^test " || true
 name: CI
 
 on:

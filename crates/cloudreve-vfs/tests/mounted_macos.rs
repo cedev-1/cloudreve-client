@@ -1372,7 +1372,7 @@ async fn measure_rpc_and_http_cost_of_mount_options() {
             .await
             .expect("mount should succeed");
 
-        let mut report = |phase: &str, before: Cost, took: Duration, extra: String| {
+        let report = |phase: &str, before: Cost, took: Duration, extra: String| {
             let c = cost_since(before, cost_now(&counts, &env));
             let _ = writeln!(
                 std::io::stderr(),

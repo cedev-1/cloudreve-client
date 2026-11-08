@@ -564,17 +564,15 @@ async fn sse_events_refresh_each_affected_open_folder_once() {
     mount_sse(&env.server, format!("event: event\ndata: [{}]\n\n", burst.join(","))).await;
     tokio::spawn(run_remote_event_loop(env.mount.clone()));
 
-    let mut seen = Vec::new();
     for _ in 0..60 {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        seen = nudged.lock().unwrap().clone();
-        if seen.len() >= 2 {
+        if nudged.lock().unwrap().len() >= 2 {
             break;
         }
     }
     // Let any duplicate (a broken coalescing) show up before asserting.
     tokio::time::sleep(Duration::from_millis(500)).await;
-    seen = nudged.lock().unwrap().clone();
+    let mut seen = nudged.lock().unwrap().clone();
     seen.sort();
     assert_eq!(seen, vec!["a".to_string(), "b".to_string()]);
 }
