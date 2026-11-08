@@ -726,6 +726,13 @@ impl Vfs {
         &self.tree
     }
 
+    /// The one entry point for "this remote path changed on the server"
+    /// (an SSE event, a fresh subscription): forgets the tree's cached
+    /// view of it so the next access refetches.
+    pub async fn remote_changed(&self, remote_path: &str) {
+        self.tree.invalidate_path(remote_path).await;
+    }
+
     /// `crate::junk::classify`, unless `refuse_local_only_junk_for_tests`
     /// turned local-only names into reserved ones.
     fn junk_kind(&self, name: &str) -> Option<JunkKind> {

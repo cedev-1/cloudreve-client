@@ -213,7 +213,7 @@ impl Mount {
                         if self.config.read().await.mode == DriveMode::OnDemand {
                             if let Some(vfs) = self.vfs.lock().await.clone() {
                                 let remote_base = self.config.read().await.remote_path.clone();
-                                vfs.tree().invalidate_path(&remote_base).await;
+                                vfs.remote_changed(&remote_base).await;
                             }
                         } else {
                             tracing::info!(target: "drive::remote_events", "New subscription, triggering full sync");
@@ -314,9 +314,9 @@ impl Mount {
         let remote_base = self.config.read().await.remote_path.clone();
 
         for event in &events {
-            vfs.tree().invalidate_path(&event_path_to_remote_uri(&remote_base, &event.from)).await;
+            vfs.remote_changed(&event_path_to_remote_uri(&remote_base, &event.from)).await;
             if event.event_type == FileEventType::Rename && !event.to.is_empty() {
-                vfs.tree().invalidate_path(&event_path_to_remote_uri(&remote_base, &event.to)).await;
+                vfs.remote_changed(&event_path_to_remote_uri(&remote_base, &event.to)).await;
             }
         }
         Ok(())
