@@ -436,49 +436,74 @@ async fn a_read_slower_than_the_soft_timeout_still_returns_the_bytes() {
     assert_eq!(content.expect("a slow read must not fail"), b"hello world");
 }
 
-/// MEASUREMENT (item 1 of the NFS hardening wave): how long can a READ be
-/// held, unanswered, before the macOS client's soft timeout hands the app
+/// MEASUREMENT (item 1 of the NFS hardening wave): how long can the macOS
+/// client wait for an unanswered RPC before its soft timeout hands the app
 /// an error? JUKEBOX is disabled (threshold 10 minutes) so the server
-/// really holds each READ for the whole download delay. Before each slow
-/// read, a few fast cold reads train the client's READ RTT estimator, the
-/// way an ordinary warm mount would have. Results go straight to the
-/// process's stderr (bypassing libtest's capture) as `SOFT-BUDGET` lines.
+/// really holds each call for the whole delay. Three probes, each preceded
+/// by fast warm-up traffic that trains the client's RTT estimator the way
+/// an ordinary warm mount would have:
+/// - `read`: `std::fs::read`, which goes through the buffer cache — its
+///   READ is issued as an async readahead buffer (`nfs_bio.c`).
+/// - `mmap`: `/usr/bin/cmp` against a local copy; cmp mmaps regular
+///   files, so the READ comes from a synchronous pagein.
+/// - `lookup`: `stat` of a file in a directory whose listing is slow, so
+///   the LOOKUP itself waits on the network.
+/// Results go straight to the process's stderr (bypassing libtest's
+/// capture) as `SOFT-BUDGET` lines.
 #[tokio::test(flavor = "multi_thread")]
-async fn measure_soft_timeout_budget_for_a_held_read() {
+async fn measure_soft_timeout_budget_for_held_rpcs() {
     use std::io::Write;
+    use std::os::unix::process::ExitStatusExt;
 
-    let variants: [(&str, &str, &[u64]); 2] = [
-        (
-            "rto",
-            "locallocks,mutejukebox,vers=3,tcp,soft,timeo=30,retrans=2",
-            &[500, 1000, 2000, 4000, 8000],
-        ),
-        (
-            "dumbtimer",
-            "locallocks,mutejukebox,vers=3,tcp,soft,dumbtimer,timeo=30,retrans=2",
-            &[1000, 2000, 4000, 8000, 12000],
-        ),
+    const DELAYS_MS: [u64; 6] = [250, 500, 1000, 2000, 4000, 8000];
+    let variants: [(&str, &str); 2] = [
+        ("rto", "locallocks,mutejukebox,vers=3,tcp,soft,timeo=30,retrans=2"),
+        ("dumbtimer", "locallocks,mutejukebox,vers=3,tcp,soft,dumbtimer,timeo=30,retrans=2"),
     ];
+    let content = b"hello world";
+    let local = tempfile::tempdir().unwrap();
+    let local_copy = local.path().join("copy.txt");
+    std::fs::write(&local_copy, content).unwrap();
 
     let env = VfsTestEnv::new().await;
     let mut listing = Vec::new();
-    for (label, _, delays) in &variants {
-        for d in delays.iter() {
+    for (label, _) in &variants {
+        for d in DELAYS_MS {
             for w in 0..4 {
                 let name = format!("warm-{label}-{d}-{w}.txt");
                 listing.push(remote_file(&name, 11, "e1"));
-                env.serve_file_content(&name, b"hello world").await;
+                env.serve_file_content(&name, content).await;
             }
-            let name = format!("slow-{label}-{d}.txt");
-            listing.push(remote_file(&name, 11, "e1"));
-            env.serve_file_content(&name, b"hello world").await;
-            env.slow_down_downloads(&name, Duration::from_millis(*d));
+            for probe in ["read", "mmap"] {
+                let name = format!("{probe}-{label}-{d}.txt");
+                listing.push(remote_file(&name, 11, "e1"));
+                env.serve_file_content(&name, content).await;
+                env.slow_down_downloads(&name, Duration::from_millis(d));
+            }
+            let dir = format!("dir-{label}-{d}");
+            listing.push(common::remote_dir(&dir));
+            let mut inside = remote_file("x.txt", 11, "e1");
+            inside["path"] = serde_json::json!(format!("{}/{dir}/x.txt", common::REMOTE_BASE));
+            env.set_remote_files_at(&dir, vec![inside]).await;
+            env.slow_down_listing(&dir, Duration::from_millis(d));
         }
     }
     env.set_remote_files(listing).await;
     let vfs = new_test_vfs(&env).await;
 
-    for (label, opts, delays) in &variants {
+    let report = |label: &str, probe: &str, d: u64, started: std::time::Instant, outcome: String| {
+        let _ = writeln!(
+            std::io::stderr(),
+            "SOFT-BUDGET variant={label} probe={probe} delay_ms={d} elapsed_ms={} outcome={outcome}",
+            started.elapsed().as_millis()
+        );
+    };
+    let io_outcome = |res: &std::io::Result<()>| match res {
+        Ok(()) => "OK".to_string(),
+        Err(e) => format!("ERR {e} (os {:?})", e.raw_os_error()),
+    };
+
+    for (label, opts) in &variants {
         let mp = tempfile::tempdir().unwrap();
         let mountpoint = mp.path().to_path_buf();
         let _guard = MountpointGuard(mountpoint.clone());
@@ -492,30 +517,68 @@ async fn measure_soft_timeout_budget_for_a_held_read() {
         .await
         .expect("mount should succeed");
 
-        for d in delays.iter() {
-            for w in 0..4 {
-                let p = mountpoint.join(format!("warm-{label}-{d}-{w}.txt"));
-                blocking_with_timeout(move || std::fs::read(&p).unwrap()).await;
-            }
-            let p = mountpoint.join(format!("slow-{label}-{d}.txt"));
+        for d in DELAYS_MS {
+            let warm = |mountpoint: PathBuf| async move {
+                for w in 0..4 {
+                    let p = mountpoint.join(format!("warm-{label}-{d}-{w}.txt"));
+                    blocking_with_timeout(move || std::fs::read(&p).unwrap()).await;
+                }
+            };
+
+            warm(mountpoint.clone()).await;
+            let p = mountpoint.join(format!("read-{label}-{d}.txt"));
             let started = std::time::Instant::now();
             let res = tokio::time::timeout(
                 Duration::from_secs(60),
-                tokio::task::spawn_blocking(move || std::fs::read(&p)),
+                tokio::task::spawn_blocking(move || {
+                    std::fs::read(&p).and_then(|b| {
+                        if b == b"hello world" {
+                            Ok(())
+                        } else {
+                            Err(std::io::Error::other("wrong bytes"))
+                        }
+                    })
+                }),
             )
             .await
             .expect("read hung past 60s")
             .unwrap();
-            let outcome = match &res {
-                Ok(bytes) if bytes == b"hello world" => "OK".to_string(),
-                Ok(bytes) => format!("WRONG BYTES ({} bytes)", bytes.len()),
-                Err(e) => format!("ERR {e} (os {:?})", e.raw_os_error()),
+            report(label, "read", d, started, io_outcome(&res));
+
+            warm(mountpoint.clone()).await;
+            let p = mountpoint.join(format!("mmap-{label}-{d}.txt"));
+            let copy = local_copy.clone();
+            let started = std::time::Instant::now();
+            let status = tokio::time::timeout(
+                Duration::from_secs(60),
+                tokio::task::spawn_blocking(move || {
+                    std::process::Command::new("/usr/bin/cmp").arg(&p).arg(&copy).output()
+                }),
+            )
+            .await
+            .expect("cmp hung past 60s")
+            .unwrap()
+            .unwrap();
+            let outcome = match (status.status.code(), status.status.signal()) {
+                (Some(0), _) => "OK".to_string(),
+                (code, signal) => format!(
+                    "ERR code={code:?} signal={signal:?} stderr={}",
+                    String::from_utf8_lossy(&status.stderr).trim()
+                ),
             };
-            let _ = writeln!(
-                std::io::stderr(),
-                "SOFT-BUDGET variant={label} delay_ms={d} elapsed_ms={} outcome={outcome}",
-                started.elapsed().as_millis()
-            );
+            report(label, "mmap", d, started, outcome);
+
+            warm(mountpoint.clone()).await;
+            let p = mountpoint.join(format!("dir-{label}-{d}")).join("x.txt");
+            let started = std::time::Instant::now();
+            let res = tokio::time::timeout(
+                Duration::from_secs(60),
+                tokio::task::spawn_blocking(move || std::fs::metadata(&p).map(|_| ())),
+            )
+            .await
+            .expect("stat hung past 60s")
+            .unwrap();
+            report(label, "lookup", d, started, io_outcome(&res));
         }
         mounted.unmount().await.expect("unmount should succeed");
     }

@@ -83,6 +83,9 @@ pub struct VfsTestEnv {
     bytes_served: BytesServedLog,
     download_request_count: Arc<AtomicUsize>,
     list_requests: Arc<AtomicUsize>,
+    /// Per-directory-uri artificial delay on the listing endpoint — see
+    /// `slow_down_listing`.
+    listing_delays: DownloadDelays,
     upload_chunks: UploadChunksStore,
     latest_session_for_name: LatestSessionForName,
     existing_upload_uris: ExistingUploadUris,
@@ -144,6 +147,7 @@ impl VfsTestEnv {
         let bytes_served: BytesServedLog = Arc::new(Mutex::new(HashMap::new()));
         let download_request_count = Arc::new(AtomicUsize::new(0));
         let list_requests = Arc::new(AtomicUsize::new(0));
+        let listing_delays: DownloadDelays = Arc::new(Mutex::new(HashMap::new()));
         let upload_chunks: UploadChunksStore = Arc::new(Mutex::new(HashMap::new()));
         let latest_session_for_name: LatestSessionForName = Arc::new(Mutex::new(HashMap::new()));
         let existing_upload_uris: ExistingUploadUris =
@@ -176,6 +180,7 @@ impl VfsTestEnv {
         {
             let files = files.clone();
             let list_requests = list_requests.clone();
+            let listing_delays = listing_delays.clone();
             Mock::given(method("GET"))
                 .and(path("/api/v4/file"))
                 .respond_with(move |req: &Request| {
@@ -187,7 +192,8 @@ impl VfsTestEnv {
                         .map(|(_, v)| v.into_owned())
                         .unwrap_or_default();
                     let dir_files = files.lock().unwrap().get(&uri).cloned().unwrap_or_default();
-                    ResponseTemplate::new(200).set_body_json(json!({
+                    let delay = listing_delays.lock().unwrap().get(&uri).copied().unwrap_or_default();
+                    ResponseTemplate::new(200).set_delay(delay).set_body_json(json!({
                         "code": 0,
                         "msg": "",
                         "data": {
@@ -358,6 +364,7 @@ impl VfsTestEnv {
             bytes_served,
             download_request_count,
             list_requests,
+            listing_delays,
             upload_chunks,
             latest_session_for_name,
             existing_upload_uris,
@@ -871,6 +878,12 @@ impl VfsTestEnv {
                 .push(remote_file(name, content.len() as i64, etag));
         }
         self.serve_file_content(name, &content).await;
+    }
+
+    /// Delays every future listing response for `"{REMOTE_BASE}/{subdir}"`
+    /// by `delay` (a slow Cloudreve server listing a big folder).
+    pub fn slow_down_listing(&self, subdir: &str, delay: Duration) {
+        self.listing_delays.lock().unwrap().insert(format!("{REMOTE_BASE}/{subdir}"), delay);
     }
 
     /// Total number of `GET /api/v4/file` (listing) requests served so far.
