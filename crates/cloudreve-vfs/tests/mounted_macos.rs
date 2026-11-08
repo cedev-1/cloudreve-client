@@ -399,3 +399,39 @@ async fn flock_and_fcntl_locks_succeed_through_the_mount() {
     assert!(flock_res.is_ok(), "flock through the mount failed: {flock_res:?}");
     assert!(fcntl_res.is_ok(), "fcntl F_SETLK through the mount failed: {fcntl_res:?}");
 }
+
+/// A cold read whose download takes 12s (a slow Cloudreve server) must
+/// still return the right bytes through the mount, not EIO/ETIMEDOUT: the
+/// `soft` mount (kept for crash recovery) gives up on an RPC left
+/// unanswered for a few retransmit timeouts, so the server answers
+/// `NFS3ERR_JUKEBOX` while the fetch runs and the kernel resends the READ.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_slower_than_the_soft_timeout_still_returns_the_bytes() {
+    let env = VfsTestEnv::new().await;
+    env.set_remote_files(vec![remote_file("slow.txt", 11, "e1")]).await;
+    env.serve_file_content("slow.txt", b"hello world").await;
+    env.slow_down_downloads("slow.txt", Duration::from_secs(12));
+
+    let vfs = new_test_vfs(&env).await;
+
+    let mp = tempfile::tempdir().unwrap();
+    let mountpoint = mp.path().to_path_buf();
+    let _guard = MountpointGuard(mountpoint.clone());
+
+    let mounted = mount::mount(vfs.clone(), &mountpoint, "CloudreveTest", env.cache_dir())
+        .await
+        .expect("mount should succeed");
+
+    let read_path = mountpoint.join("slow.txt");
+    let content = tokio::time::timeout(
+        Duration::from_secs(60),
+        tokio::task::spawn_blocking(move || std::fs::read(&read_path)),
+    )
+    .await
+    .expect("the read through the mount hung")
+    .expect("blocking task panicked");
+
+    mounted.unmount().await.expect("unmount should succeed");
+
+    assert_eq!(content.expect("a slow read must not fail"), b"hello world");
+}

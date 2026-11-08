@@ -357,3 +357,77 @@ async fn removing_an_empty_directory_succeeds() {
     assert_eq!(env.delete_call_count(), 1);
     assert_eq!(fs.lookup(&root, &fname("empty-dir")).await.unwrap_err(), nfsstat3::NFS3ERR_NOENT);
 }
+
+/// A READ the server cannot answer quickly (cold hydration from a slow
+/// Cloudreve server) must be answered with `NFS3ERR_JUKEBOX` ("retry
+/// later") instead of being held open: on a `soft` mount, Apple's NFS
+/// client gives up on an RPC that sees no reply within a few of its
+/// retransmit timeouts and hands the app EIO/ETIMEDOUT, whereas a JUKEBOX
+/// reply makes it sleep and resend the very same READ. The fetch itself
+/// must keep running in the background, and the client's retries must
+/// pick up its result — not start a fresh download each time.
+#[tokio::test]
+async fn a_slow_read_answers_jukebox_then_serves_the_bytes_from_one_download() {
+    let env = VfsTestEnv::new().await;
+    env.set_remote_files(vec![remote_file("slow.txt", 11, "e1")]).await;
+    env.serve_file_content("slow.txt", b"hello world").await;
+    env.slow_down_downloads("slow.txt", Duration::from_millis(1500));
+
+    let (vfs, _rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+    let fs = VfsNfs::new(Arc::new(vfs));
+    let root = fs.root_dir();
+    let id = fs.lookup(&root, &fname("slow.txt")).await.unwrap();
+
+    let started = std::time::Instant::now();
+    let first = fs.read(&id, 0, 11).await;
+    assert_eq!(first.unwrap_err(), nfsstat3::NFS3ERR_JUKEBOX);
+    assert!(
+        started.elapsed() < Duration::from_millis(1000),
+        "the JUKEBOX reply must come back well before the 1.5s download finishes, took {:?}",
+        started.elapsed()
+    );
+
+    // The client's retry loop: resend the same READ until it succeeds.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let data = loop {
+        match fs.read(&id, 0, 11).await {
+            Ok((data, eof)) => {
+                assert!(eof, "an 11-byte read of an 11-byte file is at eof");
+                break data;
+            }
+            Err(nfsstat3::NFS3ERR_JUKEBOX) => {
+                assert!(std::time::Instant::now() < deadline, "read never completed");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(other) => panic!("retried read failed with {other:?}"),
+        }
+    };
+    assert_eq!(data, b"hello world");
+    assert_eq!(
+        env.download_requests("slow.txt").len(),
+        1,
+        "every retry must join the one in-flight download, not start its own"
+    );
+}
+
+/// The counterpart: a read the server CAN answer promptly is answered on
+/// the first try — JUKEBOX is only for genuinely slow fetches, since each
+/// one costs the app a multi-second client-side sleep.
+#[tokio::test]
+async fn a_fast_read_is_answered_directly_without_jukebox() {
+    let env = VfsTestEnv::new().await;
+    env.set_remote_files(vec![remote_file("fast.txt", 11, "e1")]).await;
+    env.serve_file_content("fast.txt", b"hello world").await;
+
+    let (vfs, _rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+    let fs = VfsNfs::new(Arc::new(vfs));
+    let root = fs.root_dir();
+    let id = fs.lookup(&root, &fname("fast.txt")).await.unwrap();
+
+    let (data, _eof) = fs.read(&id, 0, 11).await.expect("a fast read must not be deferred");
+    assert_eq!(data, b"hello world");
+}

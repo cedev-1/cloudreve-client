@@ -67,7 +67,11 @@
 //! `FileHandleConverter`'s doc in `nfs3_server` for the analogous handle
 //! generation number, which is a different mechanism).
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use tokio::task::JoinHandle;
 
 use nfs3_server::nfs3_types::nfs3::{
     createverf3, fattr3, filename3, ftype3, nfspath3, nfsstat3, nfstime3, sattr3, specdata3,
@@ -81,16 +85,69 @@ use crate::frontend_util::{classify_error, to_frontend_attr, FrontendAttr, Front
 use crate::tree::{NodeAttr, NodeId};
 use crate::vfs::Vfs;
 
+/// How long a READ may hold its RPC before the server answers
+/// `NFS3ERR_JUKEBOX` instead (the fetch keeps running in the background;
+/// see [`VfsNfs::read`]).
+///
+/// Why so short: on a `soft` mount Apple's NFS client (`kext/nfs_socket.c`,
+/// `nfs_request_timer`) fails an RPC once it has hit `retrans` timeouts
+/// with no reply, and for READ that timeout is NOT `timeo` — it is the
+/// adaptive RTO learned from past READ replies (floor 62.5 ms, doubling per
+/// consecutive timeout). On a warm loopback mount, where cached reads reply
+/// in a millisecond, three timeouts can add up to well under a second. A
+/// JUKEBOX reply arriving inside that budget is a real reply: it resets the
+/// timeout counters and makes the client sleep (4s, 8s, 16s) and resend the
+/// same READ. A soft mount gives up after the 16s sleep, so a single block
+/// fetch can take ~28s before the app sees EIO — versus a few seconds
+/// before.
+pub const READ_JUKEBOX_AFTER: Duration = Duration::from_millis(250);
+
+/// A READ answered with JUKEBOX whose client never came back (it gave up,
+/// or the app went away) is dropped after this long, so its result does
+/// not sit in [`VfsNfs`]'s in-flight map forever.
+const ABANDONED_READ_TTL: Duration = Duration::from_secs(120);
+
+/// The exact arguments of a READ RPC. The client resends a JUKEBOX'd READ
+/// with the same handle, offset and count (only the xid changes), so this
+/// is what lets a retry find the fetch its first attempt started.
+type ReadKey = (u64, u64, u32);
+type ReadResult = Result<(Vec<u8>, bool), nfsstat3>;
+
 /// NFSv3 adapter over [`Vfs`]. See the module doc for the handle lifecycle
 /// and cookie scheme.
 pub struct VfsNfs {
     vfs: Arc<Vfs>,
+    /// READs that outlived [`READ_JUKEBOX_AFTER`] and were answered with
+    /// JUKEBOX, still running, waiting for the client's resend.
+    slow_reads: Mutex<HashMap<ReadKey, (Instant, JoinHandle<ReadResult>)>>,
 }
 
 impl VfsNfs {
     pub fn new(vfs: Arc<Vfs>) -> Self {
-        Self { vfs }
+        Self { vfs, slow_reads: Mutex::new(HashMap::new()) }
     }
+}
+
+/// One whole READ against the facade: attrs for the eof flag, then an
+/// open/read/close of a facade handle (open-per-operation, see the module
+/// doc). Runs as its own task so it can outlive the RPC that started it.
+async fn read_once(vfs: Arc<Vfs>, node: NodeId, offset: u64, count: u32) -> ReadResult {
+    let attr = vfs
+        .getattr(node)
+        .await
+        .map_err(|e| to_errno(&e))?
+        .ok_or_else(|| to_nfsstat3(FrontendErrno::NotFound))?;
+
+    let handle = vfs.open(node).await.map_err(|e| to_errno(&e))?;
+    let result = vfs.read(handle, offset, count).await;
+    // Best-effort close: a failed read still releases the cache retain
+    // this open() took. `close`'s own error (handle already gone) would
+    // only ever fire if something else raced this exact handle id, which
+    // nothing can — it is local to this call.
+    let _ = vfs.close(handle).await;
+    let data = result.map_err(|e| to_errno(&e))?;
+    let eof = offset.saturating_add(data.len() as u64) >= attr.size;
+    Ok((data.to_vec(), eof))
 }
 
 impl NfsReadFileSystem for VfsNfs {
@@ -132,26 +189,28 @@ impl NfsReadFileSystem for VfsNfs {
         offset: u64,
         count: u32,
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
-        let node = NodeId(id.as_u64());
-        let attr = self
-            .vfs
-            .getattr(node)
-            .await
-            .map_err(|e| to_errno(&e))?
-            .ok_or_else(|| to_nfsstat3(FrontendErrno::NotFound))?;
-
-        // Open-per-operation (D4, see the module doc): this handle never
-        // outlives this one call.
-        let handle = self.vfs.open(node).await.map_err(|e| to_errno(&e))?;
-        let result = self.vfs.read(handle, offset, count).await;
-        // Best-effort close: a failed read still releases the cache retain
-        // this open() took. `close`'s own error (handle already gone) would
-        // only ever fire if something else raced this exact handle id,
-        // which nothing can — it is local to this call.
-        let _ = self.vfs.close(handle).await;
-        let data = result.map_err(|e| to_errno(&e))?;
-        let eof = offset.saturating_add(data.len() as u64) >= attr.size;
-        Ok((data.to_vec(), eof))
+        // A READ that cannot finish within `READ_JUKEBOX_AFTER` (cold
+        // hydration from a slow server) is answered with JUKEBOX and its
+        // task parked here; the client's resend of the same READ picks the
+        // same task back up instead of starting a second download. See
+        // `READ_JUKEBOX_AFTER` for why holding the RPC open instead turns
+        // a slow server into EIO for the app.
+        let key: ReadKey = (id.as_u64(), offset, count);
+        let mut task = {
+            let mut slow = self.slow_reads.lock().unwrap();
+            slow.retain(|_, (since, _)| since.elapsed() < ABANDONED_READ_TTL);
+            match slow.remove(&key) {
+                Some((_, task)) => task,
+                None => tokio::spawn(read_once(self.vfs.clone(), NodeId(key.0), offset, count)),
+            }
+        };
+        match tokio::time::timeout(READ_JUKEBOX_AFTER, &mut task).await {
+            Ok(joined) => joined.unwrap_or(Err(nfsstat3::NFS3ERR_IO)),
+            Err(_) => {
+                self.slow_reads.lock().unwrap().insert(key, (Instant::now(), task));
+                Err(nfsstat3::NFS3ERR_JUKEBOX)
+            }
+        }
     }
 
     async fn readdirplus(
