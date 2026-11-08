@@ -667,3 +667,144 @@ async fn a_lookup_in_a_slowly_listed_folder_does_not_time_out() {
 
     assert_eq!(res.expect("the lookup must wait for the listing, not time out"), 11);
 }
+
+/// Runs `cmd args...` to completion off the executor (bounded like every
+/// other blocking call here), returning whether it exited 0 and its stderr.
+async fn run_tool(cmd: &'static str, args: Vec<std::ffi::OsString>) -> (bool, String) {
+    blocking_with_timeout(move || {
+        let out = std::process::Command::new(cmd).args(&args).output().expect("spawn tool");
+        (out.status.success(), String::from_utf8_lossy(&out.stderr).trim().to_string())
+    })
+    .await
+}
+
+/// The ordinary ways a macOS user copies a file that carries extended
+/// attributes onto the mount (`cp`, `cp -p`, `ditto`), then sets and reads
+/// back an xattr on a file inside it. NFSv3 has no xattrs, so each of
+/// these makes the kernel write an AppleDouble `._name` sidecar. Returns
+/// `(label, exit 0, stderr)` per step.
+async fn macos_copy_matrix(mountpoint: &std::path::Path) -> Vec<(&'static str, bool, String)> {
+    let src_dir = tempfile::tempdir().unwrap();
+    let src = src_dir.path().join("tagged.txt");
+    std::fs::write(&src, b"payload").unwrap();
+    let (ok, err) = run_tool(
+        "/usr/bin/xattr",
+        vec!["-w".into(), "com.apple.metadata:test".into(), "v".into(), src.clone().into()],
+    )
+    .await;
+    assert!(ok, "setting an xattr on the local source failed: {err}");
+
+    let m = |name: &str| mountpoint.join(name).into_os_string();
+    let mut results = Vec::new();
+    let (ok, err) = run_tool("/bin/cp", vec![src.clone().into(), m("cp.txt")]).await;
+    results.push(("cp", ok, err));
+    let (ok, err) = run_tool("/bin/cp", vec!["-p".into(), src.clone().into(), m("cp-p.txt")]).await;
+    results.push(("cp -p", ok, err));
+    let (ok, err) = run_tool("/usr/bin/ditto", vec![src.clone().into(), m("ditto.txt")]).await;
+    results.push(("ditto", ok, err));
+    let (ok, err) = run_tool(
+        "/usr/bin/xattr",
+        vec!["-w".into(), "com.apple.metadata:extra".into(), "v2".into(), m("cp.txt")],
+    )
+    .await;
+    results.push(("xattr -w", ok, err));
+    let (ok, err) =
+        run_tool("/usr/bin/xattr", vec!["-p".into(), "com.apple.metadata:extra".into(), m("cp.txt")]).await;
+    results.push(("xattr -p", ok, err));
+    results
+}
+
+/// The deciding test for the macOS junk policy (see `crate::junk`): every
+/// ordinary copy path must succeed, the real files must reach the server,
+/// and no `._*` sidecar (nor any `.DS_Store`) may ever be uploaded.
+#[tokio::test(flavor = "multi_thread")]
+async fn macos_copies_of_a_file_with_xattrs_succeed_and_never_upload_junk() {
+    let env = VfsTestEnv::new().await;
+    env.expect_uploads().await;
+    env.expect_namespace_ops().await;
+    let vfs = new_test_vfs(&env).await;
+
+    let mp = tempfile::tempdir().unwrap();
+    let mountpoint = mp.path().to_path_buf();
+    let _guard = MountpointGuard(mountpoint.clone());
+    let mounted = mount::mount(vfs.clone(), &mountpoint, "CloudreveTest", env.cache_dir())
+        .await
+        .expect("mount should succeed");
+
+    let results = macos_copy_matrix(&mountpoint).await;
+    let touch_ds = mountpoint.join(".DS_Store");
+    let ds = blocking_with_timeout(move || std::fs::write(&touch_ds, b"Bud1")).await;
+    vfs.wait_for_writeback_idle().await;
+    mounted.unmount().await.expect("unmount should succeed");
+
+    for (label, ok, err) in &results {
+        assert!(ok, "`{label}` through the mount failed: {err}");
+    }
+    assert!(ds.is_ok(), "writing a .DS_Store failed: {ds:?}");
+    for name in ["cp.txt", "cp-p.txt", "ditto.txt"] {
+        assert_eq!(env.uploaded_content(name).as_deref(), Some(&b"payload"[..]), "{name} not uploaded");
+    }
+    let junk: Vec<String> = env
+        .uploaded_names()
+        .into_iter()
+        .filter(|n| n.starts_with("._") || n.eq_ignore_ascii_case(".DS_Store"))
+        .collect();
+    assert!(junk.is_empty(), "macOS metadata reached the server: {junk:?}");
+}
+
+/// `rm -rf` of a folder holding junk (a sidecar written by the kernel, a
+/// Finder `.DS_Store`) must succeed: whatever the policy, the final rmdir
+/// must not trip over junk nobody can see. And a `.DS_Store` that already
+/// sits on the server is not shown in the mount.
+#[tokio::test(flavor = "multi_thread")]
+async fn rm_rf_of_a_folder_holding_junk_succeeds_and_server_junk_stays_hidden() {
+    let env = VfsTestEnv::new().await;
+    env.expect_uploads().await;
+    env.expect_namespace_ops().await;
+    env.set_remote_files(vec![remote_file(".DS_Store", 4, "e1"), remote_file("a.txt", 1, "e2")]).await;
+    env.serve_file_content(".DS_Store", b"Bud1").await;
+    env.serve_file_content("a.txt", b"a").await;
+    let vfs = new_test_vfs(&env).await;
+
+    let mp = tempfile::tempdir().unwrap();
+    let mountpoint = mp.path().to_path_buf();
+    let _guard = MountpointGuard(mountpoint.clone());
+    let mounted = mount::mount(vfs.clone(), &mountpoint, "CloudreveTest", env.cache_dir())
+        .await
+        .expect("mount should succeed");
+
+    let root = mountpoint.clone();
+    let names: Vec<String> = blocking_with_timeout(move || {
+        std::fs::read_dir(&root).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect()
+    })
+    .await;
+
+    let folder = mountpoint.join("folder");
+    let f = folder.clone();
+    blocking_with_timeout(move || std::fs::create_dir(&f).unwrap()).await;
+    let src_dir = tempfile::tempdir().unwrap();
+    let src = src_dir.path().join("x.txt");
+    std::fs::write(&src, b"x").unwrap();
+    let (ok, err) =
+        run_tool("/usr/bin/xattr", vec!["-w".into(), "com.apple.metadata:t".into(), "v".into(), src.clone().into()])
+            .await;
+    assert!(ok, "{err}");
+    let (cp_ok, cp_err) = run_tool("/bin/cp", vec![src.into(), folder.join("x.txt").into()]).await;
+    let ds = folder.join(".DS_Store");
+    let _ = blocking_with_timeout(move || std::fs::write(&ds, b"Bud1")).await;
+    vfs.wait_for_writeback_idle().await;
+    let (rm_ok, rm_err) = run_tool("/bin/rm", vec!["-rf".into(), folder.clone().into()]).await;
+    let f = folder.clone();
+    let still_there = blocking_with_timeout(move || f.exists()).await;
+    mounted.unmount().await.expect("unmount should succeed");
+
+    assert_eq!(names, vec!["a.txt".to_string()], "server-side .DS_Store must not be listed");
+    assert!(cp_ok, "cp into the folder failed: {cp_err}");
+    assert!(rm_ok, "rm -rf failed: {rm_err}");
+    assert!(!still_there, "the folder must be gone");
+    assert!(
+        env.last_deleted_uris().contains(&common::uri_of("folder")),
+        "the folder itself must be deleted on the server, last delete was {:?}",
+        env.last_deleted_uris()
+    );
+}

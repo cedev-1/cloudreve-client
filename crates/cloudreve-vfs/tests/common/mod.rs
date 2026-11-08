@@ -808,6 +808,11 @@ impl VfsTestEnv {
         Some(content)
     }
 
+    /// Every remote file name an upload session was ever created for.
+    pub fn uploaded_names(&self) -> Vec<String> {
+        self.latest_session_for_name.lock().unwrap().keys().cloned().collect()
+    }
+
     /// Total number of `PUT /file/upload` (session-creation) requests
     /// received so far — successes and injected failures alike.
     pub fn upload_session_count(&self) -> usize {
