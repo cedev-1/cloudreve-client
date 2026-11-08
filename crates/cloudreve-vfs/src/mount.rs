@@ -389,6 +389,19 @@ mod macos_impl {
             .await
     }
 
+    /// Test-only: [`mount`] exactly as production does it, plus a log of
+    /// every READ's `count` (see [`VfsNfs::with_read_log`]) — how
+    /// `tests/mounted_macos.rs` checks the read size the client negotiated.
+    #[doc(hidden)]
+    pub async fn mount_with_read_log_for_tests(
+        vfs: Arc<Vfs>,
+        mountpoint: &Path,
+        cache_dir: &Path,
+        read_log: Arc<std::sync::Mutex<Vec<u32>>>,
+    ) -> Result<MountedVfs> {
+        mount_with(VfsNfs::new(vfs).with_read_log(read_log), mountpoint, cache_dir, MOUNT_OPTS).await
+    }
+
     async fn mount_with(fs: VfsNfs, mountpoint: &Path, cache_dir: &Path, mount_opts: &str) -> Result<MountedVfs> {
         if let Err(err) = cleanup_stale_mount(mountpoint, cache_dir).await {
             tracing::warn!(
@@ -679,7 +692,9 @@ mod macos_impl {
 }
 
 #[cfg(target_os = "macos")]
-pub use macos_impl::{cleanup_stale_mount, mount, mount_with_nfs_tuning_for_tests, MountedVfs};
+pub use macos_impl::{
+    cleanup_stale_mount, mount, mount_with_nfs_tuning_for_tests, mount_with_read_log_for_tests, MountedVfs,
+};
 
 #[cfg(target_os = "linux")]
 mod linux_impl {

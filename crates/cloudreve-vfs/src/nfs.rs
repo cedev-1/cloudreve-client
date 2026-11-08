@@ -141,6 +141,9 @@ type ReadResult = Result<(Vec<u8>, bool), nfsstat3>;
 /// and cookie scheme.
 pub struct VfsNfs {
     vfs: Arc<Vfs>,
+    /// Test-only: the `count` of every READ received, see
+    /// [`VfsNfs::with_read_log`].
+    read_log: Option<Arc<Mutex<Vec<u32>>>>,
     /// [`READ_JUKEBOX_AFTER`] in production; see [`VfsNfs::with_read_jukebox_after`].
     read_jukebox_after: Duration,
     /// READs that outlived [`READ_JUKEBOX_AFTER`] and were answered with
@@ -158,7 +161,15 @@ impl VfsNfs {
     /// client's own soft-timeout budget for a held READ.
     #[doc(hidden)]
     pub fn with_read_jukebox_after(vfs: Arc<Vfs>, read_jukebox_after: Duration) -> Self {
-        Self { vfs, read_jukebox_after, slow_reads: Mutex::new(HashMap::new()) }
+        Self { vfs, read_jukebox_after, read_log: None, slow_reads: Mutex::new(HashMap::new()) }
+    }
+
+    /// Test-only: records the `count` of every READ RPC into `log`, so a
+    /// mounted test can see the read size the client actually negotiated.
+    #[doc(hidden)]
+    pub fn with_read_log(mut self, log: Arc<Mutex<Vec<u32>>>) -> Self {
+        self.read_log = Some(log);
+        self
     }
 }
 
@@ -229,6 +240,9 @@ impl NfsReadFileSystem for VfsNfs {
         // same task back up instead of starting a second download. See
         // `READ_JUKEBOX_AFTER` for why holding the RPC open instead turns
         // a slow server into EIO for the app.
+        if let Some(log) = &self.read_log {
+            log.lock().unwrap().push(count);
+        }
         let key: ReadKey = (id.as_u64(), offset, count);
         let mut task = {
             let mut slow = self.slow_reads.lock().unwrap();

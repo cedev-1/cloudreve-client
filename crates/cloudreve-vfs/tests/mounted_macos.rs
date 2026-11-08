@@ -846,3 +846,95 @@ async fn measure_macos_copies_when_sidecars_are_refused() {
         let _ = writeln!(std::io::stderr(), "JUNK-POLICY policy=refuse step={label:?} exit0={ok} stderr={err:?}");
     }
 }
+
+/// The options `/sbin/mount` lists for the mount at `path`, e.g.
+/// `nfs, nodev, nosuid, nobrowse, mounted by runner`.
+fn mount_table_options(path: &std::path::Path) -> Option<String> {
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let canonical = canonical.to_string_lossy().to_string();
+    let output = std::process::Command::new("/sbin/mount").output().expect("run /sbin/mount");
+    String::from_utf8_lossy(&output.stdout).lines().find_map(|line| {
+        let (_, rest) = line.rsplit_once(" on ")?;
+        let (p, opts) = rest.rsplit_once(" (")?;
+        (p == canonical).then(|| opts.trim_end_matches(')').to_string())
+    })
+}
+
+/// Spotlight must stay off the mount: indexing it would download every
+/// file. The mount is `nobrowse` (no Desktop/sidebar volume — the folder
+/// itself stays where the user put it) and its root holds an empty,
+/// read-only `.metadata_never_index`, Apple's documented opt-out.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_mount_is_nobrowse_and_opts_out_of_spotlight() {
+    let env = VfsTestEnv::new().await;
+    env.set_remote_files(vec![remote_file("a.txt", 1, "e1")]).await;
+    let vfs = new_test_vfs(&env).await;
+
+    let mp = tempfile::tempdir().unwrap();
+    let mountpoint = mp.path().to_path_buf();
+    let _guard = MountpointGuard(mountpoint.clone());
+    let mounted = mount::mount(vfs.clone(), &mountpoint, "CloudreveTest", env.cache_dir())
+        .await
+        .expect("mount should succeed");
+
+    let options = mount_table_options(&mountpoint);
+    let marker = mountpoint.join(".metadata_never_index");
+    let m = marker.clone();
+    let meta = blocking_with_timeout(move || std::fs::metadata(&m).map(|m| m.len())).await;
+    let m = marker.clone();
+    let write = blocking_with_timeout(move || std::fs::write(&m, b"x")).await;
+    let root = mountpoint.clone();
+    let names: Vec<String> = blocking_with_timeout(move || {
+        std::fs::read_dir(&root).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect()
+    })
+    .await;
+    let (mdutil_ok, mdutil_out) = blocking_with_timeout({
+        let mp = mountpoint.clone();
+        move || {
+            let out = std::process::Command::new("/usr/bin/mdutil").arg("-s").arg(&mp).output().unwrap();
+            let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            (out.status.success(), text)
+        }
+    })
+    .await;
+    mounted.unmount().await.expect("unmount should succeed");
+
+    let options = options.expect("the mount must be in the mount table");
+    assert!(options.split(", ").any(|o| o == "nobrowse"), "not nobrowse: {options}");
+    assert_eq!(meta.expect(".metadata_never_index must exist at the root"), 0);
+    assert!(write.is_err(), ".metadata_never_index must be read-only");
+    assert_eq!(names, vec!["a.txt".to_string()], ".metadata_never_index must not be listed");
+    assert!(
+        mdutil_ok && mdutil_out.to_lowercase().contains("disabled"),
+        "mdutil -s must report indexing disabled, got (exit0={mdutil_ok}): {mdutil_out}"
+    );
+}
+
+/// `rsize=1048576`: the client reads in 1 MiB chunks — one block of the vfs
+/// cache per READ — instead of the 32 KiB default, which cost 32 READs (and
+/// as many facade calls) per block.
+#[tokio::test(flavor = "multi_thread")]
+async fn reading_a_4_mib_file_through_the_mount_uses_1_mib_reads() {
+    let env = VfsTestEnv::new().await;
+    let body: Vec<u8> = (0..4 * 1_048_576u32).map(|i| (i % 253) as u8).collect();
+    env.set_remote_files(vec![remote_file("big.bin", body.len() as i64, "e1")]).await;
+    env.serve_file_content("big.bin", &body).await;
+    let vfs = new_test_vfs(&env).await;
+
+    let mp = tempfile::tempdir().unwrap();
+    let mountpoint = mp.path().to_path_buf();
+    let _guard = MountpointGuard(mountpoint.clone());
+    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mounted = mount::mount_with_read_log_for_tests(vfs.clone(), &mountpoint, env.cache_dir(), log.clone())
+        .await
+        .expect("mount should succeed");
+
+    let p = mountpoint.join("big.bin");
+    let content = blocking_with_timeout(move || std::fs::read(&p).unwrap()).await;
+    mounted.unmount().await.expect("unmount should succeed");
+
+    assert!(content == body, "wrong bytes read back");
+    let reads = log.lock().unwrap().clone();
+    assert_eq!(reads.iter().max().copied(), Some(1_048_576), "READ sizes: {reads:?}");
+    assert!(reads.len() <= 8, "4 MiB should take about 4 READs, took {}: {reads:?}", reads.len());
+}
