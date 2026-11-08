@@ -723,6 +723,10 @@ async fn macos_copies_of_a_file_with_xattrs_succeed_and_never_upload_junk() {
     env.expect_uploads().await;
     env.expect_namespace_ops().await;
     let vfs = new_test_vfs(&env).await;
+    // The mock upload endpoint does not add what it receives to the
+    // listing, so an uploaded file vanishes from the mount on the next
+    // re-list: hold the uploads back until the whole matrix has run.
+    vfs.set_debounce_for_tests(Duration::from_secs(5));
 
     let mp = tempfile::tempdir().unwrap();
     let mountpoint = mp.path().to_path_buf();
@@ -814,7 +818,12 @@ async fn rm_rf_of_a_folder_holding_junk_succeeds_and_server_junk_stays_hidden() 
 /// the policy hf-mount ships instead — sidecar creation refused with EACCES
 /// (`Vfs::refuse_local_only_junk_for_tests`). Logs `JUNK-POLICY` lines to
 /// the process's stderr; asserts nothing.
+///
+/// Ignored: its result is recorded in `crate::junk`'s module doc. Rerun
+/// with `cargo test -p cloudreve-vfs --test mounted_macos -- --ignored
+/// measure_macos_copies_when_sidecars_are_refused`.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore]
 async fn measure_macos_copies_when_sidecars_are_refused() {
     use std::io::Write;
 

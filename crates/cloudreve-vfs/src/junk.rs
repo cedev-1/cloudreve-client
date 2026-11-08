@@ -16,17 +16,21 @@
 //!   but the bytes live only in the facade's in-memory overlay (see
 //!   `Vfs`'s `junk` field) and are never uploaded. Refusing them instead
 //!   (what hf-mount and fusekit ship: EACCES on create) makes ordinary
-//!   copies fail: macOS `cp` exits 1 ("could not copy extended attributes")
-//!   and `xattr -w` fails whenever the sidecar cannot be created — see
-//!   `tests/mounted_macos.rs`. The cost of the overlay is that xattrs set
+//!   copies fail. Measured on the macos-latest CI runner with a file
+//!   carrying one xattr (`measure_macos_copies_when_sidecars_are_refused`
+//!   in `tests/mounted_macos.rs`): `cp` and `cp -p` exit 1 ("could not copy
+//!   extended attributes to ...: Operation not permitted"), `ditto` exits 1
+//!   on its temp file, `xattr -w` fails with EPERM. With the overlay all
+//!   four succeed. The cost of the overlay is that xattrs set
 //!   through the mount are forgotten when the app quits.
 //! - [`JunkKind::Reserved`] — the macOS volume-level folders (Spotlight
 //!   index, Trash, FSEvents log, `.TemporaryItems`, revisions, AFP
 //!   leftovers) and `__MACOSX` (zip extraction debris): refused with
-//!   EACCES. The overlay holds plain files only, never folders, and none
-//!   of these is needed for a copy or a save to succeed: Finder deletes
-//!   immediately on a network volume instead of using `.Trashes`, and
-//!   fseventsd/Spotlight only write their folders on volumes they manage.
+//!   EACCES. The overlay holds plain files only, never folders; none of
+//!   the copy paths above needs one. Not verified against Finder itself:
+//!   it is expected to delete immediately on a network volume instead of
+//!   using `.Trashes`, and Cocoa safe-saves to fall back to a sibling temp
+//!   file when `.TemporaryItems` cannot be created.
 //!
 //! Both kinds are hidden from listings, including copies that already sit
 //! on the server (uploaded by another client): a Cloudreve-side
