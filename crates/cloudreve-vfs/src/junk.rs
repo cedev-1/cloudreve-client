@@ -66,6 +66,9 @@ const RESERVED_NAMES: &[&str] = &[
     ".AppleDB",
     ".AppleDesktop",
     "__MACOSX",
+    // Served read-only at the volume root by the NFS adapter
+    // (`nfs::NEVER_INDEX_NAME`); reserved everywhere else.
+    ".metadata_never_index",
 ];
 
 /// Classifies one path component (a bare name, never a path).

@@ -334,7 +334,25 @@ mod macos_impl {
     ///     layer: `nolocks` made them fail with ENOTSUP, which breaks
     ///     SQLite, Office and Python's `filelock`. Client-local locks are
     ///     exactly right here — this kernel is the export's only client.
-    const MOUNT_OPTS: &str = "locallocks,mutejukebox,vers=3,tcp,soft,dumbtimer,timeo=30,retrans=2";
+    ///   - `rsize=1048576,wsize=1048576`: one READ per 1 MiB block of the
+    ///     vfs cache instead of 32 KiB RPCs (the TCP default), equal as
+    ///     `mount_nfs(8)` asks ("wsize/rsize ratio is high" warning). 1 MiB
+    ///     is the kext's ceiling and what `VfsNfs::fsinfo` advertises; the
+    ///     client takes the smaller of the two. Same as hf-mount.
+    ///   - `readahead=4`: the client reads ahead this many RPCs past a
+    ///     sequential read — and a first read at offset 0 counts as
+    ///     sequential (`nfs_bio.c`, `nfs_bioread`). The default of 16, at
+    ///     1 MiB per RPC, would download 16 MiB for every file Quick Look or
+    ///     Finder merely peeks at; 4 matches the facade's own
+    ///     `READAHEAD_BLOCKS`.
+    ///   - `nobrowse` (`mount(8)`: "should not be visible via the GUI (i.e.,
+    ///     appear on the Desktop as a separate volume)"): the mount sits on
+    ///     the user's own sync folder, which Finder shows wherever it lives;
+    ///     without it macOS also lists a second, duplicate volume on the
+    ///     Desktop and sidebar. Belt and braces for Spotlight too, with the
+    ///     root's `.metadata_never_index` (see `nfs::NEVER_INDEX_NAME`).
+    const MOUNT_OPTS: &str = "locallocks,mutejukebox,vers=3,tcp,soft,dumbtimer,timeo=30,retrans=2,\
+                              nobrowse,rsize=1048576,wsize=1048576,readahead=4";
 
     /// Mounts `vfs` as a real NFS drive at `mountpoint` (D1). `mountpoint`
     /// must already exist as an empty directory. `volume_name` is advisory

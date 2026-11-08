@@ -467,3 +467,119 @@ async fn junk_names_map_to_acces_and_a_sidecar_renamed_onto_a_real_name_to_xdev(
     );
     assert_eq!(env.upload_session_count() + env.create_file_call_count(), 0);
 }
+
+/// The client reads and writes in chunks of at most the server's FSINFO
+/// `rtmax`/`wtmax`, whatever `rsize`/`wsize` the mount asked for. 1 MiB is
+/// the macOS kext's own ceiling and one block of the vfs cache.
+#[tokio::test]
+async fn fsinfo_advertises_one_mebibyte_reads_and_writes() {
+    let env = VfsTestEnv::new().await;
+    let (vfs, _rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+    let fs = VfsNfs::new(Arc::new(vfs));
+    let root = fs.root_dir();
+
+    let info = fs.fsinfo(&root).await.unwrap();
+    assert_eq!(info.rtmax, 1_048_576);
+    assert_eq!(info.rtpref, 1_048_576);
+    assert_eq!(info.wtmax, 1_048_576);
+    assert_eq!(info.wtpref, 1_048_576);
+}
+
+/// Spotlight: an empty, read-only `.metadata_never_index` sits at the
+/// volume root (Apple DTS's documented way to keep `mds` off a volume). It
+/// is served by the adapter alone: never listed, never uploaded, never
+/// fetched, and a server-side file of the same name stays invisible.
+#[tokio::test]
+async fn the_volume_root_serves_an_empty_read_only_metadata_never_index() {
+    let env = VfsTestEnv::new().await;
+    env.expect_uploads().await;
+    env.expect_namespace_ops().await;
+    env.set_remote_files(vec![remote_file(".metadata_never_index", 5, "e1"), remote_dir("docs")]).await;
+    env.serve_file_content(".metadata_never_index", b"stale").await;
+    env.set_remote_files_at("docs", vec![]).await;
+    env.add_remote_file("a.txt", b"a".to_vec(), "e2").await;
+
+    let (vfs, _rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+    let fs = VfsNfs::new(Arc::new(vfs));
+    let root = fs.root_dir();
+
+    let id = fs.lookup(&root, &fname(".metadata_never_index")).await.expect("must resolve at the root");
+    let attr = fs.getattr(&id).await.unwrap();
+    assert_eq!(attr.size, 0);
+    assert_eq!(attr.type_, nfs3_server::nfs3_types::nfs3::ftype3::NF3REG);
+    assert_eq!(fs.read(&id, 0, 4096).await.unwrap(), (Vec::new(), true));
+
+    assert_eq!(fs.write(&id, 0, b"x", stable_how::FILE_SYNC).await.unwrap_err(), nfsstat3::NFS3ERR_ACCES);
+    assert_eq!(
+        fs.setattr(&id, sattr3 { size: Nfs3Option::Some(0), ..Default::default() }).await.unwrap_err(),
+        nfsstat3::NFS3ERR_ACCES
+    );
+    assert_eq!(fs.remove(&root, &fname(".metadata_never_index")).await.unwrap_err(), nfsstat3::NFS3ERR_ACCES);
+    assert_eq!(
+        fs.rename(&root, &fname(".metadata_never_index"), &root, &fname("x")).await.unwrap_err(),
+        nfsstat3::NFS3ERR_ACCES
+    );
+    assert_eq!(
+        fs.rename(&root, &fname("a.txt"), &root, &fname(".metadata_never_index")).await.unwrap_err(),
+        nfsstat3::NFS3ERR_ACCES
+    );
+    assert_eq!(
+        fs.create(&root, &fname(".metadata_never_index"), sattr3::default()).await.unwrap_err(),
+        nfsstat3::NFS3ERR_EXIST
+    );
+
+    let names: Vec<String> = collect_all(&fs, &root).await.into_iter().map(|(_, n, _)| n).collect();
+    assert!(!names.contains(&".metadata_never_index".to_string()), "never listed: {names:?}");
+    let docs = fs.lookup(&root, &fname("docs")).await.unwrap();
+    assert_eq!(
+        fs.lookup(&docs, &fname(".metadata_never_index")).await.unwrap_err(),
+        nfsstat3::NFS3ERR_NOENT,
+        "only the volume root has one"
+    );
+    assert_eq!(env.file_url_request_count(".metadata_never_index"), 0);
+    assert_eq!(env.upload_session_count() + env.create_file_call_count() + env.delete_call_count(), 0);
+}
+
+/// With `rsize=1048576` every READ covers exactly one 1 MiB cache block, so
+/// the client's resend of a JUKEBOX'd READ (same handle, offset and count)
+/// must join that block's one download.
+#[tokio::test]
+async fn a_one_mebibyte_read_resent_after_jukebox_joins_the_one_block_download() {
+    let env = VfsTestEnv::new().await;
+    let body: Vec<u8> = (0..2 * 1_048_576u32).map(|i| (i % 251) as u8).collect();
+    env.set_remote_files(vec![remote_file("big.bin", body.len() as i64, "e1")]).await;
+    env.serve_file_content("big.bin", &body).await;
+    env.slow_down_downloads("big.bin", Duration::from_millis(3000));
+
+    let (vfs, _rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+    let fs = VfsNfs::new(Arc::new(vfs));
+    let root = fs.root_dir();
+    let id = fs.lookup(&root, &fname("big.bin")).await.unwrap();
+
+    assert_eq!(fs.read(&id, 1_048_576, 1_048_576).await.unwrap_err(), nfsstat3::NFS3ERR_JUKEBOX);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let (data, eof) = loop {
+        match fs.read(&id, 1_048_576, 1_048_576).await {
+            Ok(res) => break res,
+            Err(nfsstat3::NFS3ERR_JUKEBOX) => {
+                assert!(std::time::Instant::now() < deadline, "read never completed");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(other) => panic!("retried read failed with {other:?}"),
+        }
+    };
+    assert!(eof);
+    assert!(data == body[1_048_576..], "wrong bytes for the second block");
+    let block_fetches = env
+        .download_requests("big.bin")
+        .into_iter()
+        .filter(|r| r.as_deref().is_some_and(|r| r.starts_with("bytes=1048576-")))
+        .count();
+    assert_eq!(block_fetches, 1, "the resends must join the one download of that block");
+}

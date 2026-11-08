@@ -74,14 +74,18 @@ use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 
 use nfs3_server::nfs3_types::nfs3::{
-    createverf3, fattr3, filename3, ftype3, nfspath3, nfsstat3, nfstime3, sattr3, specdata3,
-    stable_how, Nfs3Option,
+    createverf3, fattr3, filename3, ftype3, nfspath3, nfsstat3, nfstime3, post_op_attr, sattr3,
+    specdata3, stable_how, Nfs3Option, FSF3_CANSETTIME, FSF3_HOMOGENEOUS, FSF3_SYMLINK,
+    FSINFO3resok,
 };
 use nfs3_server::vfs::{
     DirEntryPlus, FileHandleU64, NextResult, NfsFileSystem, NfsReadFileSystem, ReadDirPlusIterator,
 };
 
-use crate::frontend_util::{classify_error, to_frontend_attr, FrontendAttr, FrontendErrno};
+use crate::frontend_util::{
+    classify_error, process_gid, process_uid, to_frontend_attr, FrontendAttr, FrontendErrno,
+};
+use crate::cache::BLOCK_SIZE;
 use crate::tree::{NodeAttr, NodeId};
 use crate::vfs::Vfs;
 
@@ -137,6 +141,19 @@ const ABANDONED_READ_TTL: Duration = Duration::from_secs(120);
 type ReadKey = (u64, u64, u32);
 type ReadResult = Result<(Vec<u8>, bool), nfsstat3>;
 
+/// Spotlight opt-out: an empty, read-only file of this name at the volume
+/// root is how Apple DTS tells `mds` to leave a volume alone (Apple
+/// Developer Forums thread 820931, 2026). Served by this adapter alone —
+/// Spotlight is a macOS concern, so the FUSE frontend has none: never
+/// listed, never uploaded, never fetched. `crate::junk` reserves the name,
+/// so a server-side file called that stays invisible and the facade
+/// refuses to create one.
+pub const NEVER_INDEX_NAME: &str = ".metadata_never_index";
+
+/// The fileid of [`NEVER_INDEX_NAME`]: the tree allocates `NodeId`s upward
+/// from 2, so it can never hand this one out.
+const NEVER_INDEX_FILEID: u64 = u64::MAX;
+
 /// NFSv3 adapter over [`Vfs`]. See the module doc for the handle lifecycle
 /// and cookie scheme.
 pub struct VfsNfs {
@@ -171,6 +188,27 @@ impl VfsNfs {
         self.read_log = Some(log);
         self
     }
+
+    fn is_never_index(&self, dir: &FileHandleU64, name: &str) -> bool {
+        dir.as_u64() == self.vfs.tree().root().0 && name == NEVER_INDEX_NAME
+    }
+}
+
+/// [`NEVER_INDEX_NAME`]'s attributes: an empty read-only file whose times
+/// never move.
+fn never_index_attr() -> fattr3 {
+    to_fattr3(&FrontendAttr {
+        fileid: NEVER_INDEX_FILEID,
+        is_dir: false,
+        size: 0,
+        mode: 0o444,
+        uid: process_uid(),
+        gid: process_gid(),
+        nlink: 1,
+        mtime_secs: 0,
+        atime_secs: 0,
+        ctime_secs: 0,
+    })
 }
 
 /// One whole READ against the facade: attrs for the eof flag, then an
@@ -209,6 +247,9 @@ impl NfsReadFileSystem for VfsNfs {
     ) -> Result<FileHandleU64, nfsstat3> {
         let parent = NodeId(dirid.as_u64());
         let name = name_str(filename)?;
+        if self.is_never_index(dirid, &name) {
+            return Ok(FileHandleU64::new(NEVER_INDEX_FILEID));
+        }
         match self.vfs.lookup(parent, &name).await {
             Ok(Some((id, _attr))) => Ok(FileHandleU64::new(id.0)),
             // Lookup miss: the facade's `Ok(None)`, not an error — routed
@@ -220,6 +261,9 @@ impl NfsReadFileSystem for VfsNfs {
     }
 
     async fn getattr(&self, id: &FileHandleU64) -> Result<fattr3, nfsstat3> {
+        if id.as_u64() == NEVER_INDEX_FILEID {
+            return Ok(never_index_attr());
+        }
         let node = NodeId(id.as_u64());
         match self.vfs.getattr(node).await {
             Ok(Some(attr)) => Ok(to_fattr3(&to_frontend_attr(node.0, &attr))),
@@ -242,6 +286,9 @@ impl NfsReadFileSystem for VfsNfs {
         // a slow server into EIO for the app.
         if let Some(log) = &self.read_log {
             log.lock().unwrap().push(count);
+        }
+        if id.as_u64() == NEVER_INDEX_FILEID {
+            return Ok((Vec::new(), true));
         }
         let key: ReadKey = (id.as_u64(), offset, count);
         let mut task = {
@@ -278,6 +325,33 @@ impl NfsReadFileSystem for VfsNfs {
         Ok(VfsReadDirIter { listing, index: start })
     }
 
+    /// The client clamps its `rsize`/`wsize` to `rtmax`/`wtmax` (and to
+    /// `rtpref`/`wtpref` when smaller, `kext/nfs_vfsops.c`), so these are
+    /// what makes `MOUNT_OPTS`' `rsize=1048576,wsize=1048576` real: one READ
+    /// is one block of the vfs cache, and 1 MiB is also the macOS kext's own
+    /// ceiling (`NFS_MAXDATA`). Same values `nfs3_server`'s default answers
+    /// with today, stated here so they cannot drift with the crate.
+    async fn fsinfo(&self, root_fileid: &FileHandleU64) -> Result<FSINFO3resok, nfsstat3> {
+        let io_size = BLOCK_SIZE as u32;
+        let obj_attributes = match self.getattr(root_fileid).await {
+            Ok(attr) => post_op_attr::Some(attr),
+            Err(_) => post_op_attr::None,
+        };
+        Ok(FSINFO3resok {
+            obj_attributes,
+            rtmax: io_size,
+            rtpref: io_size,
+            rtmult: io_size,
+            wtmax: io_size,
+            wtpref: io_size,
+            wtmult: io_size,
+            dtpref: io_size,
+            maxfilesize: 128 * 1024 * 1024 * 1024,
+            time_delta: nfstime3 { seconds: 0, nseconds: 1_000_000 },
+            properties: FSF3_SYMLINK | FSF3_HOMOGENEOUS | FSF3_CANSETTIME,
+        })
+    }
+
     async fn readlink(&self, _id: &FileHandleU64) -> Result<nfspath3<'_>, nfsstat3> {
         // The facade has no symlink concept at all.
         Err(nfsstat3::NFS3ERR_NOTSUPP)
@@ -286,6 +360,14 @@ impl NfsReadFileSystem for VfsNfs {
 
 impl NfsFileSystem for VfsNfs {
     async fn setattr(&self, id: &FileHandleU64, setattr: sattr3) -> Result<fattr3, nfsstat3> {
+        if id.as_u64() == NEVER_INDEX_FILEID {
+            // Read-only: a resize is refused, a mode/time change is a no-op
+            // like everywhere else on this mount.
+            return match setattr.size {
+                Nfs3Option::Some(_) => Err(nfsstat3::NFS3ERR_ACCES),
+                Nfs3Option::None => Ok(never_index_attr()),
+            };
+        }
         let node = NodeId(id.as_u64());
         // D4: the only `sattr3` field this facade can act on is `size`
         // (truncate) — mode/uid/gid/atime/mtime have no server-side
@@ -314,6 +396,9 @@ impl NfsFileSystem for VfsNfs {
         data: &[u8],
         _stable: stable_how,
     ) -> Result<(fattr3, stable_how), nfsstat3> {
+        if id.as_u64() == NEVER_INDEX_FILEID {
+            return Err(nfsstat3::NFS3ERR_ACCES);
+        }
         let node = NodeId(id.as_u64());
         let handle = self.vfs.open(node).await.map_err(|e| to_errno(&e))?;
         let result = self.vfs.write(handle, offset, data).await;
@@ -339,6 +424,9 @@ impl NfsFileSystem for VfsNfs {
     ) -> Result<(FileHandleU64, fattr3), nfsstat3> {
         let parent = NodeId(dirid.as_u64());
         let name = name_str(filename)?;
+        if self.is_never_index(dirid, &name) {
+            return Err(nfsstat3::NFS3ERR_EXIST);
+        }
         // The `sattr3` the client may pass (mode, etc.) is ignored — see
         // `setattr`'s doc: the facade has nowhere to persist it, and D7
         // fixes every entry's reported mode regardless.
@@ -366,6 +454,9 @@ impl NfsFileSystem for VfsNfs {
         // so this just reuses it; the verifier is accepted and ignored.
         let parent = NodeId(dirid.as_u64());
         let name = name_str(filename)?;
+        if self.is_never_index(dirid, &name) {
+            return Err(nfsstat3::NFS3ERR_EXIST);
+        }
         let (node, handle) = self.vfs.create(parent, &name).await.map_err(|e| to_errno(&e))?;
         let _ = self.vfs.close(handle).await;
         Ok(FileHandleU64::new(node.0))
@@ -378,6 +469,9 @@ impl NfsFileSystem for VfsNfs {
     ) -> Result<(FileHandleU64, fattr3), nfsstat3> {
         let parent = NodeId(dirid.as_u64());
         let name = name_str(dirname)?;
+        if self.is_never_index(dirid, &name) {
+            return Err(nfsstat3::NFS3ERR_EXIST);
+        }
         let node = self.vfs.mkdir(parent, &name).await.map_err(|e| to_errno(&e))?;
         let attr = self
             .vfs
@@ -391,6 +485,9 @@ impl NfsFileSystem for VfsNfs {
     async fn remove(&self, dirid: &FileHandleU64, filename: &filename3<'_>) -> Result<(), nfsstat3> {
         let parent = NodeId(dirid.as_u64());
         let name = name_str(filename)?;
+        if self.is_never_index(dirid, &name) {
+            return Err(nfsstat3::NFS3ERR_ACCES);
+        }
         self.vfs.unlink(parent, &name).await.map_err(|e| to_errno(&e))
     }
 
@@ -405,6 +502,9 @@ impl NfsFileSystem for VfsNfs {
         let to_parent = NodeId(to_dirid.as_u64());
         let from_name = name_str(from_filename)?;
         let to_name = name_str(to_filename)?;
+        if self.is_never_index(from_dirid, &from_name) || self.is_never_index(to_dirid, &to_name) {
+            return Err(nfsstat3::NFS3ERR_ACCES);
+        }
         self.vfs
             .rename(from_parent, &from_name, to_parent, &to_name)
             .await
