@@ -1071,6 +1071,11 @@ async fn mount_and_browse_docs(
         Err(_) => mount::mount(vfs.clone(), &mp, "CloudreveTest", env.cache_dir()).await,
     }
     .expect("mount should succeed");
+    // `VFS_TEST_NO_NUDGE` turns the folder refresh off: how CI shows the
+    // kqueue/FSEvents checks go red without it.
+    if std::env::var_os("VFS_TEST_NO_NUDGE").is_some() {
+        vfs.stop_nudging().await;
+    }
     let docs = mp.join("docs");
     let root = mp.clone();
     let d = docs.clone();
@@ -1429,4 +1434,153 @@ async fn measure_rpc_and_http_cost_of_mount_options() {
 
         mounted.unmount().await.expect("unmount should succeed");
     }
+}
+
+/// Minimal FSEvents binding for the Finder-level check below.
+mod fsevents {
+    use std::ffi::{c_char, c_void, CString};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[repr(C)]
+    struct StreamContext {
+        version: isize,
+        info: *mut c_void,
+        retain: *const c_void,
+        release: *const c_void,
+        copy_description: *const c_void,
+    }
+
+    type Callback = extern "C" fn(*const c_void, *mut c_void, usize, *mut c_void, *const u32, *const u64);
+
+    #[link(name = "CoreServices", kind = "framework")]
+    extern "C" {
+        fn FSEventStreamCreate(
+            allocator: *const c_void,
+            callback: Callback,
+            context: *const StreamContext,
+            paths: *const c_void,
+            since_when: u64,
+            latency: f64,
+            flags: u32,
+        ) -> *mut c_void;
+        fn FSEventStreamSetDispatchQueue(stream: *mut c_void, queue: *mut c_void);
+        fn FSEventStreamStart(stream: *mut c_void) -> u8;
+        fn FSEventStreamStop(stream: *mut c_void);
+        fn FSEventStreamInvalidate(stream: *mut c_void);
+        fn FSEventStreamRelease(stream: *mut c_void);
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        static kCFTypeArrayCallBacks: c_void;
+        fn CFStringCreateWithCString(alloc: *const c_void, s: *const c_char, encoding: u32) -> *const c_void;
+        fn CFArrayCreate(alloc: *const c_void, values: *const *const c_void, n: isize, cb: *const c_void) -> *const c_void;
+    }
+
+    extern "C" {
+        fn dispatch_queue_create(label: *const c_char, attr: *const c_void) -> *mut c_void;
+    }
+
+    extern "C" fn on_events(_: *const c_void, info: *mut c_void, n: usize, _: *mut c_void, _: *const u32, _: *const u64) {
+        if n > 0 {
+            // SAFETY: `info` is the `AtomicBool` `Watch` keeps alive.
+            unsafe { &*(info as *const AtomicBool) }.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// An FSEvents stream on one directory, the API Finder's own folder
+    /// views refresh from.
+    pub struct Watch {
+        stream: *mut c_void,
+        seen: Box<AtomicBool>,
+    }
+
+    // SAFETY: the stream is only started/stopped from the owning thread;
+    // events arrive on its own dispatch queue and only touch `seen`.
+    unsafe impl Send for Watch {}
+
+    impl Watch {
+        pub fn start(dir: &std::path::Path) -> Self {
+            let seen = Box::new(AtomicBool::new(false));
+            let path = CString::new(dir.to_str().unwrap()).unwrap();
+            let ctx = StreamContext {
+                version: 0,
+                info: &*seen as *const AtomicBool as *mut c_void,
+                retain: std::ptr::null(),
+                release: std::ptr::null(),
+                copy_description: std::ptr::null(),
+            };
+            // SAFETY: plain CoreFoundation/FSEvents calls with valid,
+            // NUL-terminated strings; the context outlives the call (it is
+            // copied by FSEventStreamCreate).
+            let stream = unsafe {
+                let s = CFStringCreateWithCString(std::ptr::null(), path.as_ptr(), 0x0800_0100);
+                let paths = CFArrayCreate(std::ptr::null(), &s, 1, &kCFTypeArrayCallBacks as *const c_void);
+                // kFSEventStreamEventIdSinceNow; NoDefer | FileEvents.
+                let stream =
+                    FSEventStreamCreate(std::ptr::null(), on_events, &ctx, paths, u64::MAX, 0.05, 0x02 | 0x10);
+                let queue = dispatch_queue_create(c"cloudreve.test.fsevents".as_ptr(), std::ptr::null());
+                FSEventStreamSetDispatchQueue(stream, queue);
+                assert_eq!(FSEventStreamStart(stream), 1, "FSEventStreamStart failed");
+                stream
+            };
+            Self { stream, seen }
+        }
+
+        pub fn seen(&self) -> bool {
+            self.seen.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for Watch {
+        fn drop(&mut self) {
+            // SAFETY: the stream was created and started by `start`.
+            unsafe {
+                FSEventStreamStop(self.stream);
+                FSEventStreamInvalidate(self.stream);
+                FSEventStreamRelease(self.stream);
+            }
+        }
+    }
+}
+
+/// The same refresh seen through FSEvents, the API Finder's folder views
+/// listen to: an event for the open folder must arrive within 3 s of a
+/// remote change, with no local action.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_remote_change_reaches_an_fsevents_stream_on_the_open_folder_within_3s() {
+    let env = VfsTestEnv::new().await;
+    let (vfs, mounted, mp, _guard) =
+        mount_and_browse_docs(&env, vec![file_in("docs", "a.txt", 1, "e1", "2026-01-02T00:00:00Z")]).await;
+    let docs = std::fs::canonicalize(mp.join("docs")).unwrap();
+    let watch = fsevents::Watch::start(&docs);
+    // FSEvents only delivers events newer than the stream's start.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let spurious = watch.seen();
+
+    env.set_remote_files_at(
+        "docs",
+        vec![
+            file_in("docs", "a.txt", 1, "e1", "2026-01-02T00:00:00Z"),
+            file_in("docs", "b.txt", 2, "e2", "2026-03-01T10:00:00Z"),
+        ],
+    )
+    .await;
+    vfs.remote_changed(&format!("{}/docs/b.txt", common::REMOTE_BASE)).await;
+    let start = std::time::Instant::now();
+    let mut took = None;
+    while start.elapsed() < Duration::from_secs(5) {
+        if watch.seen() {
+            took = Some(start.elapsed());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    drop(watch);
+    mounted.unmount().await.expect("unmount should succeed");
+
+    report_latency("FSEvents on docs/", took);
+    assert!(!spurious, "an event arrived before any change: the check would prove nothing");
+    let took = took.expect("no FSEvents event for the open folder: Finder would never refresh it");
+    assert!(took <= REMOTE_CHANGE_VISIBLE_WITHIN, "FSEvents took {took:?}");
 }
