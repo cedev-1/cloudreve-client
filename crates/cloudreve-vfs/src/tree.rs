@@ -70,6 +70,12 @@ struct Inner {
     /// Ids assigned to (parent, name) pairs, kept even if the directory is
     /// ever re-listed, so a node's id never changes for the tree's lifetime.
     known_children: HashMap<(NodeId, String), NodeId>,
+    /// Files whose own path was invalidated (SSE, write-back), mapped to
+    /// the directory that lists them. Their `attrs` entry is kept — the
+    /// kernel keeps addressing the file by this NodeId — but the next
+    /// `getattr` re-lists that directory before answering, so it never
+    /// serves the stale copy either. Cleared by that re-list.
+    stale_files: HashMap<NodeId, NodeId>,
     next_id: u64,
 }
 
@@ -99,6 +105,7 @@ impl VfsTree {
                 children: HashMap::new(),
                 listed_at: HashMap::new(),
                 known_children: HashMap::new(),
+                stale_files: HashMap::new(),
                 next_id: 2, // NodeId(1) is the root.
             }),
         }
@@ -136,9 +143,20 @@ impl VfsTree {
         }))
     }
 
-    /// Reads a node's own attributes. Never triggers a listing: `node` must
-    /// already be known, e.g. from an earlier `readdir`/`lookup`.
+    /// Reads a node's own attributes. `node` must already be known, e.g.
+    /// from an earlier `readdir`/`lookup`. Triggers a listing only for a
+    /// file whose own path was invalidated (see `stale_files`): its parent
+    /// is re-listed first, so the answer is the server's current view under
+    /// the SAME NodeId — or `None` if the file is gone. A failed re-list
+    /// (offline) falls back to the last known attributes rather than making
+    /// a file the kernel holds open vanish.
     pub async fn getattr(&self, node: NodeId) -> Result<Option<NodeAttr>> {
+        let stale_parent = self.inner.read().await.stale_files.get(&node).copied();
+        if let Some(parent) = stale_parent {
+            if let Err(err) = self.ensure_listed(parent).await {
+                tracing::debug!(?err, "vfs tree: re-list for a stale file failed, serving last known attrs");
+            }
+        }
         Ok(self.inner.read().await.attrs.get(&node).cloned())
     }
 
@@ -233,7 +251,7 @@ impl VfsTree {
                 inner.known_children.insert(key, id);
                 id
             };
-            let attr = NodeAttr {
+            let mut attr = NodeAttr {
                 name: f.name,
                 remote_path: f.path,
                 size: f.size.max(0) as u64,
@@ -241,8 +259,40 @@ impl VfsTree {
                 is_dir: f.file_type == file_type::FOLDER,
                 etag: f.primary_entity.unwrap_or_default(),
             };
+            // Same content version (etag) as already known: keep the size
+            // and mtime the kernel has already been told. They only change
+            // when the content does — never flap on a re-list. This is what
+            // keeps `record_upload`'s attrs (the bytes we just uploaded,
+            // stamped with the draft's mtime) from being replaced by a
+            // listing whose clock is older or that still lags the upload.
+            if let Some(old) = inner.attrs.get(&id) {
+                if !attr.is_dir && !old.is_dir && !attr.etag.is_empty() && old.etag == attr.etag {
+                    attr.size = old.size;
+                    attr.mtime_secs = old.mtime_secs;
+                }
+            }
             inner.attrs.insert(id, attr);
+            inner.stale_files.remove(&id);
             child_ids.push(id);
+        }
+
+        // A stale file of `dir` (see `stale_files`) absent from this
+        // listing is gone remotely. Ghost-pruning below only covers
+        // server-listed children; this also covers a local-only entry
+        // (`insert_local_entry`) whose path was invalidated, e.g. renamed
+        // away — dropped exactly as `invalidate_path` used to drop it.
+        let vanished: Vec<NodeId> = inner
+            .stale_files
+            .iter()
+            .filter(|(_, parent)| **parent == dir)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in vanished {
+            inner.stale_files.remove(&id);
+            if let Some(name) = inner.attrs.get(&id).map(|attr| attr.name.clone()) {
+                inner.known_children.remove(&(dir, name));
+            }
+            remove_subtree(&mut inner, id);
         }
 
         // Prune ghosts: any previously known child of `dir` absent from the
@@ -319,23 +369,26 @@ impl VfsTree {
         // listing against when pruning ghosts (see its `old_children`
         // snapshot). Removing `children` here too would erase that
         // snapshot before the re-list ever runs.
-        if let Some(dir_id) = inner
+        let parent_id = inner
             .attrs
             .iter()
             .find(|(_, attr)| attr.is_dir && attr.remote_path == parent_path)
-            .map(|(id, _)| *id)
-        {
+            .map(|(id, _)| *id);
+        if let Some(dir_id) = parent_id {
             inner.listed_at.remove(&dir_id);
         }
 
-        // The entry's own attributes, if already known: drop them too, so a
-        // direct getattr can't serve a stale copy before the parent is
-        // relisted (getattr never triggers a listing on its own). Skipped
-        // when `remote_path` was itself the directory handled above: that
-        // node's own `NodeAttr` must survive (see that block's doc) — this
-        // branch exists for files (and any other case the block above did
-        // not already handle), whose immediate removal here is exactly what
-        // `invalidating_a_deleted_files_own_path_removes_it` pins.
+        // The entry's own attributes, if already known: a direct getattr
+        // must not serve a stale copy before the parent is relisted. They
+        // are NOT dropped, though (they used to be): the kernel keeps
+        // addressing an open file by its NodeId without a fresh LOOKUP, so
+        // a dropped entry made every GETATTR/READ/WRITE on it fail until
+        // something happened to re-list the parent — a lost WRITE, and a
+        // file that blinks out and back under the same fileid. Instead the
+        // file is marked stale and `getattr` re-lists the parent first
+        // (see `stale_files`). Skipped when `remote_path` was itself the
+        // directory handled above: that node's own `NodeAttr` must survive
+        // (see that block's doc).
         if self_dir_id.is_none() {
             if let Some(entry_id) = inner
                 .attrs
@@ -343,7 +396,16 @@ impl VfsTree {
                 .find(|(_, attr)| attr.remote_path == remote_path)
                 .map(|(id, _)| *id)
             {
-                inner.attrs.remove(&entry_id);
+                match parent_id {
+                    Some(dir_id) => {
+                        inner.stale_files.insert(entry_id, dir_id);
+                    }
+                    // No known parent to re-list it from: nothing could
+                    // ever refresh it, so drop it as before.
+                    None => {
+                        inner.attrs.remove(&entry_id);
+                    }
+                }
             }
         }
     }
@@ -444,6 +506,36 @@ impl VfsTree {
         Ok(self.lookup(parent_id, name).await?.map(|(_, attr)| attr))
     }
 
+    /// Write-back (NFS hardening): a draft of `remote_path` was just
+    /// uploaded — the server now holds exactly `size` bytes, last written
+    /// locally at `mtime_secs`. Records those as the file's attributes, so
+    /// dropping the draft (whose overlay the kernel has been seeing) does
+    /// not flip them to whatever the listing says: a listing that still
+    /// lags the upload, or a server clock older than ours, would otherwise
+    /// make size/mtime jump backwards — the attribute instability Apple's
+    /// NFS client can panic on (fuse-t #109). `etag`, when non-empty, is
+    /// the new version's; `ensure_listed` then keeps these size/mtime for
+    /// as long as the listing reports that same etag. The mtime never moves
+    /// backwards from what the tree already had.
+    pub async fn record_upload(&self, remote_path: &str, size: u64, mtime_secs: i64, etag: &str) {
+        let mut inner = self.inner.write().await;
+        let Some(id) = inner
+            .attrs
+            .iter()
+            .find(|(_, attr)| !attr.is_dir && attr.remote_path == remote_path)
+            .map(|(id, _)| *id)
+        else {
+            return;
+        };
+        if let Some(attr) = inner.attrs.get_mut(&id) {
+            attr.size = size;
+            attr.mtime_secs = attr.mtime_secs.max(mtime_secs);
+            if !etag.is_empty() {
+                attr.etag = etag.to_string();
+            }
+        }
+    }
+
     /// D5 (write-back conflict check): the etag-only projection of
     /// [`refresh_attrs`] — see its doc for the full behavior.
     pub async fn refresh_etag(&self, remote_path: &str) -> Result<Option<String>> {
@@ -484,6 +576,7 @@ fn remove_subtree(inner: &mut Inner, id: NodeId) {
         }
     }
     inner.listed_at.remove(&id);
+    inner.stale_files.remove(&id);
     inner.attrs.remove(&id);
 }
 

@@ -204,10 +204,10 @@ async fn invalidating_a_deleted_files_own_path_removes_it() {
     env.set_remote_files(vec![remote_file("keep.txt", 1, "e1")]).await;
     tree.invalidate_path(&common::uri_of("gone.txt")).await;
 
-    // Checked BEFORE any lookup/readdir on the parent: this must be
-    // `invalidate_path`'s own targeted removal taking effect immediately,
-    // not a side effect of the general re-list prune (which only runs once
-    // the parent is actually re-listed).
+    // Checked BEFORE any lookup/readdir on the parent: `getattr` on the
+    // invalidated file must itself re-list the parent (the file is marked
+    // stale, not dropped — see `VfsTree::stale_files`) and find it gone,
+    // rather than serving its stale attrs until something else re-lists.
     assert!(
         tree.getattr(gone_id).await.unwrap().is_none(),
         "invalidate_path did not remove the entry's own attrs immediately"

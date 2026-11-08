@@ -1083,6 +1083,13 @@ impl WriteBackQueue {
                     // re-armed if written again mid-flight.
                     let new_etag =
                         self.tree.refresh_etag(remote_path).await.ok().flatten().unwrap_or_default();
+                    // Before the draft (and its size/mtime overlay) goes
+                    // away: the tree must already report what was uploaded,
+                    // or getattr flips back to the listing's view — see
+                    // `VfsTree::record_upload`.
+                    self.tree
+                        .record_upload(remote_path, size, mtime.unwrap_or(0), &new_etag)
+                        .await;
                     if let Err(err) = self.cache.lock().await.purge(remote_path) {
                         tracing::warn!(
                             remote_path,

@@ -456,11 +456,15 @@ async fn a_closed_draft_uploads_and_the_server_receives_the_exact_bytes() {
         env.download_requests("doc.txt").is_empty(),
         "no ranged download should have happened before this point"
     );
+    // The mock keeps serving the pre-upload bytes, which is what makes a
+    // server-sourced read distinguishable from the removed draft. The file's
+    // size is the uploaded one (19 bytes, see `VfsTree::record_upload`), so
+    // the read is the server's bytes clipped to it.
     let h2 = vfs.open(node).await.unwrap();
     let back = vfs.read(h2, 0, original.len() as u32).await.unwrap();
     assert_eq!(
         back.as_ref(),
-        &original[..],
+        &original[..saved.len()],
         "the draft is gone: a fresh read must come from the server, not the removed draft"
     );
     assert!(
