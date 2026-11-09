@@ -289,7 +289,9 @@ fn a_mirror_drive_folder_resolves_to_the_cloudreve_logo() {
 /// Plays Finder on the drive folder: lists it the moment it appears,
 /// before the app gets to set its icon — what Finder does to a Favorites
 /// entry whose volume just mounted, and to any window showing it.
-struct BrowsedFirst(Arc<dyn SidebarBackend>);
+/// Also records the icon the folder resolves to at that moment: what
+/// Finder draws before the app has written anything through the mount.
+struct BrowsedFirst(Arc<dyn SidebarBackend>, std::sync::Mutex<Vec<f64>>);
 
 impl SidebarBackend for BrowsedFirst {
     fn contains(&self, folder: &Path) -> anyhow::Result<bool> {
@@ -303,7 +305,9 @@ impl SidebarBackend for BrowsedFirst {
     }
     fn set_icon(&self, folder: &Path) -> anyhow::Result<()> {
         let listed = std::fs::read_dir(folder).map(|d| d.count());
-        eprintln!("RESOLVED listed the folder before set_icon: {listed:?}");
+        let distance = resolved_icon_distance_to_logo(folder);
+        eprintln!("RESOLVED listed the folder before set_icon: {listed:?}, its icon is {distance} from the logo");
+        self.1.lock().unwrap().push(distance);
         self.0.set_icon(folder)
     }
     fn clear_icon(&self, folder: &Path) -> anyhow::Result<()> {
@@ -317,6 +321,7 @@ impl SidebarBackend for BrowsedFirst {
 /// The on-demand drive's folder (the NFS mount root) resolves to the
 /// Cloudreve logo even though Finder listed it before the app set the
 /// icon, and again after a relaunch (new server, empty in-memory overlay).
+/// It does from the moment it is mounted, before `set_icon` runs.
 /// The root's FinderInfo lives in an AppleDouble `._.` inside the root;
 /// once the client holds a listing of the root without it, Apple's NFS
 /// client answers every `._.` lookup with ENOENT on its own (see
@@ -326,7 +331,8 @@ impl SidebarBackend for BrowsedFirst {
 #[ignore]
 async fn an_on_demand_drive_folder_resolves_to_the_cloudreve_logo_even_once_finder_listed_it() {
     let real = sidebar::platform_backend();
-    let backend: Arc<dyn SidebarBackend> = Arc::new(BrowsedFirst(real.clone()));
+    let browsed = Arc::new(BrowsedFirst(real.clone(), Default::default()));
+    let backend: Arc<dyn SidebarBackend> = browsed.clone();
     let mut env = TestEnv::with_real_mount_and_sidebar(backend.clone()).await;
     let folder = env.sync_dir.clone();
     let _unmount = UnmountGuard(folder.clone());
@@ -349,6 +355,11 @@ async fn an_on_demand_drive_folder_resolves_to_the_cloudreve_logo_even_once_find
     drop(cleanup);
 
     eprintln!("RESOLVED distances to the logo: first {first:?}, after a relaunch {after_relaunch}");
+    // Before `set_icon`, at both starts: the seeded root alone shows the
+    // logo, so Finder never gets to cache the generic icon first.
+    let before_set_icon = browsed.1.lock().unwrap().clone();
+    assert_eq!(before_set_icon.len(), 2, "set_icon did not run at both starts: {before_set_icon:?}");
+    assert!(before_set_icon.iter().all(|d| *d < SAME_ICON), "the folder showed another icon before set_icon ran: {before_set_icon:?}");
     assert!(first.0 < SAME_ICON, "the mounted drive folder does not resolve to the logo: distance {}", first.0);
     assert!(first.1 < SAME_ICON, "the logo was lost once the folder was browsed again: distance {}", first.1);
     assert!(after_relaunch < SAME_ICON, "the logo is gone after a relaunch: distance {after_relaunch}");

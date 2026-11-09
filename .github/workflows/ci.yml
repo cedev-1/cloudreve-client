@@ -132,7 +132,8 @@ jobs:
             echo "=== MUTATION $1"
             eval "$2"
             git diff --stat
-            cargo test -q -p cloudreve-sync --test finder_sidebar_macos -- --ignored --exact $T --test-threads=1 2>&1 | grep -E "RESOLVED distances|test result" || true
+            cargo test -q -p cloudreve-sync --test finder_sidebar_macos -- --ignored --exact $T --test-threads=1 2>&1 | grep -E "RESOLVED|test result" || true
+            cargo test -q -p cloudreve-vfs --test mounted_macos the_mount_root_finder_info 2>&1 | grep -E "panicked|assertion|test result" || true
             git checkout -- crates
           }
           run "baseline" "true"

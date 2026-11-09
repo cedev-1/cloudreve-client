@@ -999,6 +999,60 @@ async fn the_drive_folder_icon_set_on_the_mount_root_reads_back_and_is_never_upl
     );
 }
 
+/// The root's FinderInfo (the drive folder's custom-icon bit) stays readable
+/// and writable once the root has been listed, which Finder does the moment
+/// it shows the folder. It lives in the root's `._.` sidecar, seeded before
+/// mounting the way the app does (`Vfs::put_local_only`); unlisted, the
+/// client answered its lookup with ENOENT on its own after a listing: the
+/// bit read as absent and `xattr -w` failed with EPERM (measured on CI,
+/// see `cloudreve_vfs::appledouble`).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_mount_root_finder_info_is_still_read_and_written_once_the_root_was_listed() {
+    let env = VfsTestEnv::new().await;
+    env.expect_uploads().await;
+    env.expect_namespace_ops().await;
+    env.set_remote_files(vec![remote_file("a.txt", 1, "e1")]).await;
+    let vfs = new_test_vfs(&env).await;
+    let mut finder_info = [0u8; 32];
+    finder_info[8] = 0x04;
+    let sidecar = cloudreve_vfs::appledouble::finder_info_sidecar(finder_info);
+    vfs.put_local_only(vfs.tree().root(), cloudreve_vfs::appledouble::ROOT_SIDECAR_NAME, sidecar).await.unwrap();
+
+    let mp = tempfile::tempdir().unwrap();
+    let mountpoint = mp.path().to_path_buf();
+    let _guard = MountpointGuard(mountpoint.clone());
+    let mounted = mount::mount(vfs.clone(), &mountpoint, "CloudreveTest", env.cache_dir())
+        .await
+        .expect("mount should succeed");
+
+    let mp2 = mountpoint.clone();
+    let (listed, seeded, written, rewritten) = blocking_with_timeout(move || {
+        let read = |p: &std::path::Path| {
+            let out = std::process::Command::new("/usr/bin/xattr").args(["-px", "com.apple.FinderInfo"]).arg(p).output().unwrap();
+            String::from_utf8_lossy(&out.stdout).split_whitespace().collect::<String>()
+        };
+        let listed = std::fs::read_dir(&mp2).unwrap().count();
+        let seeded = read(&mp2);
+        // A label (bits 1-3 of byte 9) on top of the custom-icon bit.
+        let written = std::process::Command::new("/usr/bin/xattr")
+            .args(["-wx", "com.apple.FinderInfo", "0000000000000000040c00000000000000000000000000000000000000000000"])
+            .arg(&mp2)
+            .status()
+            .unwrap()
+            .success();
+        let _ = std::fs::read_dir(&mp2).unwrap().count();
+        (listed, seeded, written, read(&mp2))
+    })
+    .await;
+    mounted.unmount().await.expect("unmount should succeed");
+
+    assert!(listed >= 1, "the root listing came back empty");
+    assert_eq!(seeded, format!("{:0<16}04{:0<46}", "", ""), "the seeded FinderInfo is not read back after a listing");
+    assert!(written, "setting the root's FinderInfo after a listing failed");
+    assert_eq!(rewritten, format!("{:0<16}040c{:0<44}", "", ""), "the new FinderInfo did not stick");
+    assert_eq!(env.uploaded_names(), Vec::<String>::new(), "the sidecar reached the server");
+}
+
 /// `rsize=1048576`: the client reads in 1 MiB chunks — one block of the vfs
 /// cache per READ — instead of the 32 KiB default, which cost 32 READs (and
 /// as many facade calls) per block.
