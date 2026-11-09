@@ -186,3 +186,32 @@ async fn a_persistent_download_error_surfaces_after_bounded_retries() {
         "expected exactly FETCH_RETRIES total attempts before giving up"
     );
 }
+
+/// A server (or a proxy/CDN in front of it) that ignores `Range` answers
+/// `200` with the whole file. Its bytes start at offset 0, not at the
+/// offset that was asked for: storing them as-is would put the file's
+/// beginning into the middle blocks of the cache, and a later partial
+/// write would upload that corruption back to the server.
+#[tokio::test]
+async fn a_server_that_ignores_range_still_serves_the_right_bytes() {
+    let env = VfsTestEnv::new().await;
+    let body: Vec<u8> = (0..=250u8).cycle().take(6 * 1024 * 1024 + 123).collect();
+    env.set_remote_files(vec![remote_file("movie.mkv", body.len() as i64, "e1")]).await;
+    env.ignore_range_requests("movie.mkv", &body).await;
+
+    let (vfs, _rx) = Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(),
+                       DEFAULT_CACHE_MAX_BYTES).unwrap();
+    let node = vfs.tree().lookup(vfs.tree().root(), "movie.mkv").await.unwrap().unwrap().0;
+    let h = vfs.open(node).await.unwrap();
+
+    let offset = 3 * 1024 * 1024 + 4567;
+    let middle = vfs.read(h, offset as u64, 70_000).await.unwrap();
+    assert_eq!(middle.as_ref(), &body[offset..offset + 70_000], "a read in the middle got the wrong bytes");
+
+    let tail = vfs.read(h, (body.len() - 100) as u64, 4096).await.unwrap();
+    assert_eq!(tail.as_ref(), &body[body.len() - 100..], "the tail read got the wrong bytes");
+
+    let head = vfs.read(h, 0, 1000).await.unwrap();
+    assert_eq!(head.as_ref(), &body[..1000]);
+    vfs.close(h).await.unwrap();
+}

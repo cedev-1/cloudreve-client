@@ -2428,9 +2428,20 @@ async fn fetch_range(http: &reqwest::Client, url: &str, start: u64, end: u64) ->
         .await
         .with_context(|| format!("range GET failed for {url}"))?;
     match resp.status().as_u16() {
-        200 | 206 => {
+        206 => {
             let bytes = resp.bytes().await.context("failed to read range response body")?;
             Ok(FetchOutcome::Data(bytes))
+        }
+        // The server (or a proxy/CDN in front of it) ignored `Range` and
+        // sent the whole file, which starts at offset 0, not at `start`:
+        // cut the asked-for slice out, or the cache would store the
+        // file's head under the blocks of `start`.
+        200 => {
+            let bytes = resp.bytes().await.context("failed to read range response body")?;
+            let len = bytes.len() as u64;
+            let from = start.min(len) as usize;
+            let to = end.saturating_add(1).min(len) as usize;
+            Ok(FetchOutcome::Data(bytes.slice(from..to)))
         }
         416 => Ok(FetchOutcome::RangeNotSatisfiable),
         403 => Ok(FetchOutcome::Forbidden),

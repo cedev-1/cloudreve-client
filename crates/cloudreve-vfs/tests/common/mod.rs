@@ -967,6 +967,20 @@ impl VfsTestEnv {
             .await;
     }
 
+    /// Makes `name`'s download endpoint ignore `Range` entirely and answer
+    /// every request with `200 OK` and the WHOLE body — what a storage
+    /// backend, CDN or reverse proxy without range support does (RFC 9110
+    /// allows a server to ignore `Range`).
+    pub async fn ignore_range_requests(&self, name: &str, content: &[u8]) {
+        let content = content.to_vec();
+        Mock::given(method("GET"))
+            .and(path(format!("/vfs-download/{name}")))
+            .respond_with(move |_req: &Request| ResponseTemplate::new(200).set_body_bytes(content.clone()))
+            .with_priority(1)
+            .mount(&self.server)
+            .await;
+    }
+
     /// Like `fail_downloads_n_times`, but each successive call against
     /// `name`'s download endpoint answers with the next status in
     /// `statuses` instead of a single repeated one — used to exercise a
