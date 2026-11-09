@@ -40,7 +40,7 @@ pub const WRITEBACK_DEBOUNCE: Duration = Duration::from_secs(2);
 /// Where a draft is in its life. `Editing`: locally modified, not yet
 /// queued. `Pending`: queued for upload, not yet in flight. `Uploading`: an
 /// upload attempt is currently in progress. See `DraftStore::open` for why
-/// `Uploading` never survives a restart.
+/// neither `Editing` nor `Uploading` survives a restart.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum DraftState {
     Editing,
@@ -153,7 +153,12 @@ impl DraftStore {
                 }
             };
 
-            let demoted = meta.state == DraftState::Uploading;
+            // `Editing` too: no handle survives a restart, so a draft still
+            // `Editing` here was being written when the app quit or crashed
+            // with the file open (a FUSE handle stays open as long as the
+            // editor keeps the document). Its bytes are already in the
+            // draft; no `close` will ever come to queue them.
+            let demoted = matches!(meta.state, DraftState::Uploading | DraftState::Editing);
             if demoted {
                 meta.state = DraftState::Pending;
             }
@@ -1569,7 +1574,9 @@ mod tests {
         // from in-memory state.
         let s = DraftStore::open(dir.path()).unwrap();
         assert_eq!(s.size("a.txt"), Some(12));
-        assert_eq!(s.state("a.txt"), Some(DraftState::Editing));
+        // Still `Editing` at the "crash": no handle survives a restart, so
+        // it comes back queued (`Pending`), never stranded.
+        assert_eq!(s.state("a.txt"), Some(DraftState::Pending));
         assert_eq!(s.base_etag("a.txt"), Some("etag-a".to_string()));
 
         assert_eq!(s.size("b.txt"), Some(7));

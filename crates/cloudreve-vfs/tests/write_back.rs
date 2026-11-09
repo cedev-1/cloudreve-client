@@ -939,6 +939,51 @@ async fn pending_drafts_upload_after_a_restart() {
     );
 }
 
+/// The app quits (or crashes) while an editor still holds the file open:
+/// on Linux a FUSE handle stays open for as long as the editor keeps the
+/// document, so the draft is still `Editing` on disk with no `close` ever
+/// coming. The written bytes are already in the draft; the next launch
+/// must upload them instead of showing the edit locally forever while the
+/// server never receives it.
+#[tokio::test]
+async fn an_edit_still_open_when_the_app_quit_uploads_after_the_restart() {
+    let env = VfsTestEnv::new().await;
+    env.expect_uploads().await;
+    env.set_remote_files(vec![remote_file("open.txt", 5, "e1")]).await;
+    env.serve_file_content("open.txt", b"abcde").await;
+
+    let saved = b"typed, saved, app quit with the file still open".to_vec();
+    {
+        let (vfs, _rx) = Vfs::new(
+            env.client(),
+            common::REMOTE_BASE.into(),
+            env.cache_dir(),
+            DEFAULT_CACHE_MAX_BYTES,
+        )
+        .unwrap();
+        let node = vfs.tree().lookup(vfs.tree().root(), "open.txt").await.unwrap().unwrap().0;
+        let h = vfs.open(node).await.unwrap();
+        vfs.write(h, 0, &saved).await.unwrap();
+        // No close: `vfs` drops with the handle still open.
+    }
+    assert_eq!(env.uploaded_content("open.txt"), None);
+
+    let (vfs2, _rx2) = Vfs::new(
+        env.client(),
+        common::REMOTE_BASE.into(),
+        env.cache_dir(),
+        DEFAULT_CACHE_MAX_BYTES,
+    )
+    .unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(5), vfs2.wait_for_writeback_idle()).await;
+
+    assert_eq!(
+        env.uploaded_content("open.txt"),
+        Some(saved),
+        "an edit left open at the last quit must upload after the next launch"
+    );
+}
+
 // ---------------------------------------------------------------------
 // Promoted fix from Task 8's review: `open()` of a Pending LOCAL-ONLY
 // created draft must not fail trying to fetch a download URL for a path
