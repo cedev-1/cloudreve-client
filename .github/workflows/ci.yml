@@ -8,6 +8,8 @@ on:
       - 'src-tauri/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'ui/**'
+      - 'locales/**'
       - '.github/workflows/ci.yml'
   pull_request:
     paths:
@@ -15,9 +17,36 @@ on:
       - 'src-tauri/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'ui/**'
+      - 'locales/**'
       - '.github/workflows/ci.yml'
 
 jobs:
+  frontend:
+    name: Frontend type-check
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ui
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Install Node.js
+        uses: actions/setup-node@v6.4.0
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+
+      - name: Type-check
+        # Not a bare "tsc --noEmit": tsconfig.json only holds project
+        # references ("files": []), so that checks nothing at all.
+        run: |
+          yarn tsc -p tsconfig.app.json --noEmit
+          yarn tsc -p tsconfig.node.json --noEmit
+
   test:
     name: Rust tests
     runs-on: ubuntu-latest
