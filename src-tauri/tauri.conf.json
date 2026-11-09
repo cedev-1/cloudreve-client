@@ -52,6 +52,18 @@
       "frameworks": [],
       "providerShortName": null,
       "signingIdentity": null
+    },
+    "linux": {
+      "deb": {
+        "recommends": [
+          "fuse3"
+        ]
+      },
+      "rpm": {
+        "recommends": [
+          "fuse3"
+        ]
+      }
     }
   },
   "plugins": {
