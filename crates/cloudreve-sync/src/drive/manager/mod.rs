@@ -9,6 +9,7 @@ use crate::drive::heartbeat::HeartbeatManager;
 use crate::drive::mounts::{Credentials, DriveConfig, DriveMode, Mount};
 use crate::{EventBroadcaster, SummaryNotifier};
 use crate::inventory::InventoryDb;
+use crate::sidebar::{self, SidebarBackend};
 use crate::tasks::TaskProgress;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -28,6 +29,8 @@ pub struct DriveManager {
     pub(super) event_broadcaster: Arc<EventBroadcaster>,
     pub(super) summary_notifier: Arc<SummaryNotifier>,
     heartbeat_manager: HeartbeatManager,
+    /// The platform "show in sidebar" backend, handed to every `Mount`.
+    sidebar_backend: Arc<dyn SidebarBackend>,
 }
 
 impl DriveManager {
@@ -59,6 +62,7 @@ impl DriveManager {
             event_broadcaster: event_broadcaster,
             summary_notifier,
             heartbeat_manager,
+            sidebar_backend: sidebar::platform_backend(),
         })
     }
 
@@ -114,6 +118,24 @@ impl DriveManager {
 
         if count == 0 {
             self.event_broadcaster.no_drive();
+        }
+
+        // `start()` may have added a drive to the sidebar: remember it, or
+        // an entry the user later removes comes back at the next launch.
+        // Only when every drive loaded — `persist` writes the drives in the
+        // map, and would drop the one that failed from `drives.json`.
+        if count == state.drives.len() {
+            let mut sidebar_changed = false;
+            for config in state.drives.iter() {
+                if let Some(mount) = self.get_drive(&config.id).await {
+                    sidebar_changed |= mount.get_config().await.sidebar != config.sidebar;
+                }
+            }
+            if sidebar_changed
+                && let Err(e) = self.persist().await
+            {
+                tracing::warn!(target: "drive", error = ?e, "Failed to persist the sidebar state");
+            }
         }
 
         tracing::info!(target: "drive", count = count, "Loaded drive(s) from config");
@@ -221,6 +243,7 @@ impl DriveManager {
             self.summary_notifier.clone(),
         )
         .await;
+        mount.set_sidebar_backend(self.sidebar_backend.clone());
         if let Err(e) = mount.start().await {
             tracing::error!(target: "drive", error = ?e, "Failed to start drive");
             return Err(e).context("Failed to start drive");
@@ -506,6 +529,21 @@ impl DriveManager {
         config.max_file_size_mb = max_mb;
         drop(config);
         drop(read_guard);
+        self.persist().await
+    }
+
+    /// Whether the drive's folder shows in the file manager sidebar (the
+    /// drive settings toggle).
+    pub async fn get_drive_sidebar(&self, id: &str) -> Result<bool> {
+        let mount = self.get_drive(id).await.ok_or_else(|| anyhow::anyhow!("Drive not found: {}", id))?;
+        Ok(mount.is_shown_in_sidebar().await)
+    }
+
+    /// Adds the drive's folder to (or removes it from) the file manager
+    /// sidebar, and persists the choice.
+    pub async fn set_drive_sidebar(&self, id: &str, enabled: bool) -> Result<()> {
+        let mount = self.get_drive(id).await.ok_or_else(|| anyhow::anyhow!("Drive not found: {}", id))?;
+        mount.set_show_in_sidebar(enabled).await?;
         self.persist().await
     }
 
@@ -1088,6 +1126,7 @@ mod tests {
             event_broadcaster,
             summary_notifier,
             heartbeat_manager,
+            sidebar_backend: Arc::new(crate::sidebar::NoSidebar),
         };
 
         (manager, drive_id, hook, tmp)
@@ -1186,5 +1225,21 @@ mod tests {
             Some(1),
             "a queued-but-not-yet-uploaded draft must count as one pending upload"
         );
+    }
+
+    /// The settings toggle survives a relaunch: it is written to
+    /// `drives.json`, which is what the next `load()` reads.
+    #[tokio::test]
+    async fn the_sidebar_toggle_is_saved_in_drives_json() {
+        let (manager, drive_id, _hook, _tmp) = manager_with_one_on_demand_drive_at("http://127.0.0.1:9").await;
+        std::fs::create_dir_all(&manager.config_dir).unwrap();
+
+        manager.set_drive_sidebar(&drive_id, false).await.expect("toggle off");
+
+        let saved: super::DriveState =
+            serde_json::from_str(&std::fs::read_to_string(manager.get_config_file()).unwrap()).unwrap();
+        let drive = saved.drives.iter().find(|d| d.id == drive_id).expect("drive saved");
+        assert!(!drive.sidebar.enabled, "the choice was not saved");
+        assert!(!manager.get_drive_sidebar(&drive_id).await.unwrap());
     }
 }

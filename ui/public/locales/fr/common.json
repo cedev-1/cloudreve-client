@@ -123,6 +123,9 @@
     "driveSettingsTitle": "Paramètres du drive",
     "maxFileSize": "Taille max du fichier (Mo)",
     "maxFileSizeDescription": "0 = illimité. Les fichiers plus gros ne seront pas synchronisés.",
+    "showInFinderSidebar": "Afficher dans la barre latérale du Finder",
+    "showInFileManagerSidebar": "Afficher dans la barre latérale du gestionnaire de fichiers",
+    "showInSidebarDescription": "Ajoute le dossier de ce disque à la barre latérale, avec l'icône Cloudreve, pour l'ouvrir en un clic.",
     "save": "Enregistrer",
     "cancel": "Annuler",
     "driveStatus": {

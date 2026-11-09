@@ -123,6 +123,9 @@
     "driveSettingsTitle": "Drive Settings",
     "maxFileSize": "Max file size (MB)",
     "maxFileSizeDescription": "0 = unlimited. Files larger than this will not be synced.",
+    "showInFinderSidebar": "Show in Finder sidebar",
+    "showInFileManagerSidebar": "Show in file manager sidebar",
+    "showInSidebarDescription": "Adds this drive's folder to the sidebar with the Cloudreve icon, so you can open it in one click.",
     "save": "Save",
     "cancel": "Cancel",
     "driveStatus": {

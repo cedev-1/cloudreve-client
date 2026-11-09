@@ -36,6 +36,11 @@ tokio-util = { version = "0.7" }
 globset = "0.4"
 fs4 = { version = "1", default-features = false }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData", "NSString"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSWorkspace", "NSImage"] }
+
 [dependencies.uuid]
 version = "1.6"
 features = ["v4", "serde"]

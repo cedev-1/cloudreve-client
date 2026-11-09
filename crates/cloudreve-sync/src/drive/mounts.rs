@@ -5,6 +5,7 @@ use crate::drive::sync::group_fs_events;
 use crate::drive::vfs_mode::{self, MountTestHook};
 use crate::events::SummaryNotifier;
 use crate::inventory::{DrivePropsUpdate, InventoryDb};
+use crate::sidebar::{self, DriveFolder, NoSidebar, SidebarBackend, SidebarSettings};
 use crate::tasks::{TaskQueue, TaskQueueConfig};
 use crate::utils::toast;
 
@@ -74,6 +75,13 @@ pub struct DriveConfig {
     /// defaulting every existing drive to `FullMirror`.
     #[serde(default)]
     pub mode: DriveMode,
+
+    /// "Show in sidebar" (see `crate::sidebar`). Declared before `extra`
+    /// for the same reason as `mode`; an old `drives.json` without it gets
+    /// the default: on, not added yet — so an existing drive appears in the
+    /// sidebar once, at the first launch of a version that has it.
+    #[serde(default)]
+    pub sidebar: SidebarSettings,
 
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
@@ -220,6 +228,10 @@ pub struct Mount {
     /// Test-only: see `vfs_mode::MountTestHook`'s doc. `None` on every
     /// production path.
     vfs_mount_test_hook: Mutex<Option<Arc<MountTestHook>>>,
+    /// Where "show in sidebar" lands. [`NoSidebar`] until the `DriveManager`
+    /// installs the platform one (`set_sidebar_backend`) before `start()`:
+    /// a `Mount` built anywhere else (tests) never edits the real sidebar.
+    sidebar_backend: std::sync::RwLock<Arc<dyn SidebarBackend>>,
     pub(crate) sync_lock: Mutex<()>,
     pub cr_client: Arc<Client>,
     pub inventory: Arc<InventoryDb>,
@@ -327,6 +339,7 @@ impl Mount {
             vfs_pending_uploads: std::sync::atomic::AtomicU64::new(0),
             vfs_failed_uploads: std::sync::atomic::AtomicU64::new(0),
             vfs_mount_test_hook: Mutex::new(None),
+            sidebar_backend: std::sync::RwLock::new(Arc::new(NoSidebar)),
             sync_lock: Mutex::new(()),
             cr_client,
             inventory,
@@ -366,8 +379,74 @@ impl Mount {
             }
         }
 
+        // After the mount: an on-demand folder only takes its icon once its
+        // volume is attached (see `crate::sidebar`).
+        self.apply_sidebar_at_start().await;
+
         tracing::info!(target: "drive::mounts", id = %self.id, path = %sync_path.display(), "Mount started");
         Ok(())
+    }
+
+    /// Installs the backend "show in sidebar" edits go through. Called by
+    /// the `DriveManager` before `start()`.
+    pub fn set_sidebar_backend(&self, backend: Arc<dyn SidebarBackend>) {
+        *self.sidebar_backend.write().unwrap() = backend;
+    }
+
+    fn sidebar_backend(&self) -> Arc<dyn SidebarBackend> {
+        self.sidebar_backend.read().unwrap().clone()
+    }
+
+    /// `(folder, label, icon_writable, settings)` for `crate::sidebar`.
+    /// Writable: a mirror folder always; an on-demand one only while its
+    /// volume is attached — never the bare mountpoint.
+    async fn sidebar_state(&self) -> (PathBuf, String, bool, SidebarSettings) {
+        let config = self.config.read().await.clone();
+        // Config guard released first: never held across another lock.
+        let writable = match config.mode {
+            DriveMode::FullMirror => true,
+            DriveMode::OnDemand => self.mounted_vfs.lock().await.is_some(),
+        };
+        (config.sync_path, config.name, writable, config.sidebar)
+    }
+
+    /// The `start()` half of "show in sidebar": adds the folder the first
+    /// time, re-applies its icon every time. Never fails the start.
+    async fn apply_sidebar_at_start(&self) {
+        let (path, label, icon_writable, settings) = self.sidebar_state().await;
+        let backend = self.sidebar_backend();
+        let result = tokio::task::spawn_blocking(move || {
+            let folder = DriveFolder { path: &path, label: &label, icon_writable };
+            sidebar::at_start(backend.as_ref(), &folder, settings)
+        })
+        .await;
+        match result {
+            Ok(updated) => self.config.write().await.sidebar = updated,
+            Err(err) => tracing::warn!(target: "drive::mounts", id = %self.id, ?err, "sidebar update panicked"),
+        }
+    }
+
+    /// The drive settings toggle. The caller persists the config.
+    pub async fn set_show_in_sidebar(&self, enabled: bool) -> Result<()> {
+        let (path, label, icon_writable, _) = self.sidebar_state().await;
+        let backend = self.sidebar_backend();
+        let updated = tokio::task::spawn_blocking(move || {
+            let folder = DriveFolder { path: &path, label: &label, icon_writable };
+            sidebar::set_enabled(backend.as_ref(), &folder, enabled)
+        })
+        .await
+        .context("sidebar update panicked")??;
+        self.config.write().await.sidebar = updated;
+        Ok(())
+    }
+
+    /// What the drive settings toggle shows (see `sidebar::is_shown`).
+    pub async fn is_shown_in_sidebar(&self) -> bool {
+        let (path, _, _, settings) = self.sidebar_state().await;
+        let backend = self.sidebar_backend();
+        tokio::task::spawn_blocking(move || sidebar::is_shown(backend.as_ref(), &path, settings))
+            .await
+            .unwrap_or(settings.enabled)
     }
 
     /// D2/D5: mounts `mountpoint` as an on-demand virtual volume — computes
@@ -1057,6 +1136,17 @@ impl Mount {
 
     pub async fn delete(&self) -> Result<()> {
         self.shutdown().await;
+
+        // After `shutdown()`: an on-demand volume is detached by now, so
+        // `sidebar_state` reports its bare mountpoint as not writable and
+        // no icon is cleared through (or written into) it.
+        let (path, label, icon_writable, settings) = self.sidebar_state().await;
+        let backend = self.sidebar_backend();
+        let _ = tokio::task::spawn_blocking(move || {
+            let folder = DriveFolder { path: &path, label: &label, icon_writable };
+            sidebar::on_drive_removed(backend.as_ref(), &folder, settings);
+        })
+        .await;
 
         // D5: an on-demand drive's cache dir is this crate's own, not
         // anything the user put there — remove it on delete the same way a

@@ -94,6 +94,8 @@ fn build_drive_config(
         max_file_size_mb: 3072,
         sse_client_id,
         mode: config.mode,
+        // On by default, not added yet: `Mount::start` adds it.
+        sidebar: Default::default(),
         extra: Default::default(),
     }
 }
@@ -198,6 +200,29 @@ pub async fn set_drive_max_file_size(
 ) -> CommandResult<()> {
     let app_state = state.get().ok_or_else(|| "App not yet initialized".to_string())?;
     app_state.drive_manager.set_drive_max_file_size(&drive_id, max_mb).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_drive_sidebar(
+    state: State<'_, AppStateHandle>,
+    drive_id: String,
+) -> CommandResult<bool> {
+    let app_state = state.get().ok_or_else(|| "App not yet initialized".to_string())?;
+    app_state.drive_manager.get_drive_sidebar(&drive_id).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn set_drive_sidebar(
+    state: State<'_, AppStateHandle>,
+    drive_id: String,
+    enabled: bool,
+) -> CommandResult<()> {
+    let app_state = state.get().ok_or_else(|| "App not yet initialized".to_string())?;
+    app_state
+        .drive_manager
+        .set_drive_sidebar(&drive_id, enabled)
+        .await
+        .map_err(|e| t!("sidebarUpdateFailed", error = format!("{e:#}")).to_string())
 }
 
 #[tauri::command]
@@ -660,6 +685,9 @@ mod tests {
             credentials,
         );
         assert_eq!(mirror_config.mode, DriveMode::FullMirror);
+        // Every new drive shows in the sidebar until the user says otherwise.
+        assert!(mirror_config.sidebar.enabled && !mirror_config.sidebar.added);
+        assert!(on_demand_config.sidebar.enabled && !on_demand_config.sidebar.added);
     }
 
     /// The Settings dialog displays whatever this command returns, and nothing

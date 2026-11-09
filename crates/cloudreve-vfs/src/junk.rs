@@ -11,7 +11,7 @@
 //!
 //! Two kinds, decided per name:
 //!
-//! - [`JunkKind::LocalOnly`] — `._*`, `.DS_Store`, `.VolumeIcon.icns`, and
+//! - [`JunkKind::LocalOnly`] — `._*`, `.DS_Store`, `.VolumeIcon.icns`, `Icon\r`, and
 //!   the app's own `.cloudreve-refresh` (`crate::nudge`):
 //!   creating, writing, reading, renaming and deleting them all SUCCEED,
 //!   but the bytes live only in the facade's in-memory overlay (see
@@ -56,7 +56,9 @@ pub enum JunkKind {
 }
 
 // `crate::nudge::NUDGE_NAME`: the app's own folder-refresh probe.
-const LOCAL_ONLY_NAMES: &[&str] = &[".DS_Store", ".VolumeIcon.icns", ".cloudreve-refresh"];
+// `Icon\r`: a folder's custom icon (`NSWorkspace.setIcon` on the drive
+// root, see `cloudreve_sync::sidebar`), its bytes in the `._Icon\r` sidecar.
+const LOCAL_ONLY_NAMES: &[&str] = &[".DS_Store", ".VolumeIcon.icns", ".cloudreve-refresh", "Icon\r"];
 
 const RESERVED_NAMES: &[&str] = &[
     ".Spotlight-V100",
@@ -98,7 +100,7 @@ mod tests {
 
     #[test]
     fn appledouble_sidecars_and_finder_files_are_local_only() {
-        for name in ["._photo.jpg", "._.DS_Store", "._", ".DS_Store", ".ds_store", ".VolumeIcon.icns"] {
+        for name in ["._photo.jpg", "._.DS_Store", "._", ".DS_Store", ".ds_store", ".VolumeIcon.icns", "Icon\r"] {
             assert_eq!(classify(name), Some(JunkKind::LocalOnly), "{name}");
         }
     }
@@ -112,7 +114,7 @@ mod tests {
 
     #[test]
     fn ordinary_and_lookalike_names_are_not_junk() {
-        for name in ["photo.jpg", ".gitignore", "_photo.jpg", ".DS_Store.txt", "My.DS_Store", "Trashes", ".env"] {
+        for name in ["photo.jpg", ".gitignore", "_photo.jpg", ".DS_Store.txt", "My.DS_Store", "Trashes", ".env", "Icon", "Icon.png"] {
             assert_eq!(classify(name), None, "{name}");
         }
     }

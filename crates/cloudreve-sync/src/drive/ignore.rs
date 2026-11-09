@@ -26,6 +26,9 @@ const DEFAULT_FILE_PATTERNS: &[&str] = &[
     ".DS_Store",
     "._*",
     ".localized",
+    // A folder's custom icon, e.g. the Cloudreve logo `crate::sidebar` puts
+    // on the drive folder itself (the name ends in a carriage return).
+    "Icon\r",
     // Linux desktops
     ".directory",
     ".nfs*",
@@ -371,6 +374,9 @@ mod tests {
         ".DS_Store",
         "._report.pdf",
         ".localized",
+        // A folder's custom icon (the drive folder's Cloudreve logo): the
+        // name ends in a carriage return.
+        "Icon\r",
         ".Spotlight-V100/Store-V2/abc/0.indexHead",
         ".Trashes/501/deleted.txt",
         ".fseventsd/0000000000123456",
@@ -427,6 +433,8 @@ mod tests {
         for kept in [
             "report.pdf",
             "DS_Store.txt",
+            "Icon",
+            "Icon.png",
             "my.desktop.ini.backup",
             "Trashes.md",
             "directory.json",

@@ -3,6 +3,7 @@ pub mod drive;
 pub mod events;
 pub mod inventory;
 pub mod logging;
+pub mod sidebar;
 pub mod tasks;
 pub mod utils;
 

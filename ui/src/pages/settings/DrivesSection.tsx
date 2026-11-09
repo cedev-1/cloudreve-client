@@ -15,6 +15,8 @@ import {
   Tooltip,
   Link,
   Divider,
+  FormControlLabel,
+  Switch,
 } from "@mui/material";
 import {
   FolderOpen as FolderOpenIcon,
@@ -35,6 +37,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import type { DriveInfo, DriveMode } from "./types";
 import {  SecondaryButton, SecondaryErrorButton } from "../../common/StyledComponent";
 import { ask } from '@tauri-apps/plugin-dialog';
+import { platform } from "@tauri-apps/plugin-os";
 
 interface DriveInfoResponse {
   id: string;
@@ -63,6 +66,12 @@ export default function DrivesSection() {
   const [editingDriveId, setEditingDriveId] = useState<string | null>(null);
   const [patternsText, setPatternsText] = useState("");
   const [maxFileSize, setMaxFileSize] = useState<number>(3072);
+  // Drive folder in the Finder / file manager sidebar. `initial` tells the
+  // save whether the toggle actually changed.
+  const [showInSidebar, setShowInSidebar] = useState(true);
+  const [initialShowInSidebar, setInitialShowInSidebar] = useState(true);
+  // Already localized by the backend (`sidebarUpdateFailed`).
+  const [sidebarError, setSidebarError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [patternsError, setPatternsError] = useState<string | null>(null);
   const [defaultPatterns, setDefaultPatterns] = useState<string[]>([]);
@@ -145,9 +154,11 @@ export default function DrivesSection() {
 
   const handleEditIgnorePatterns = async (driveId: string) => {
     try {
-      const [patterns, maxMb] = await Promise.all([
+      const [patterns, maxMb, inSidebar] = await Promise.all([
         invoke<string[]>("get_ignore_patterns", { driveId }),
         invoke<number>("get_drive_max_file_size", { driveId }),
+        // Informational like the built-in list: never blocks the dialog.
+        invoke<boolean>("get_drive_sidebar", { driveId }).catch(() => true),
       ]);
       // The built-in list is informational: failing to fetch it must not
       // keep the dialog from opening.
@@ -156,6 +167,8 @@ export default function DrivesSection() {
         .catch(() => setDefaultPatterns([]));
       setPatternsText(patterns.join("\n"));
       setMaxFileSize(Number(maxMb) || 3072);
+      setShowInSidebar(inSidebar);
+      setInitialShowInSidebar(inSidebar);
       setPatternsError(null);
       setEditingDriveId(driveId);
     } catch (error) {
@@ -167,6 +180,7 @@ export default function DrivesSection() {
     if (!editingDriveId) return;
     setSaving(true);
     setPatternsError(null);
+    setSidebarError(null);
     try {
       const patterns = patternsText
         .split("\n")
@@ -180,6 +194,17 @@ export default function DrivesSection() {
         driveId: editingDriveId,
         maxMb: Math.max(0, Math.floor(maxFileSize)),
       });
+      if (showInSidebar !== initialShowInSidebar) {
+        try {
+          await invoke("set_drive_sidebar", {
+            driveId: editingDriveId,
+            enabled: showInSidebar,
+          });
+        } catch (error) {
+          setSidebarError(String(error));
+          return;
+        }
+      }
       setEditingDriveId(null);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -193,6 +218,7 @@ export default function DrivesSection() {
     setEditingDriveId(null);
     setPatternsText("");
     setPatternsError(null);
+    setSidebarError(null);
     setSaving(false);
   };
 
@@ -563,6 +589,28 @@ export default function DrivesSection() {
               },
             }}
           />
+          <FormControlLabel
+            sx={{ mt: 2 }}
+            control={
+              <Switch
+                checked={showInSidebar}
+                onChange={(e) => setShowInSidebar(e.target.checked)}
+              />
+            }
+            label={
+              platform() === "macos"
+                ? t("settings.showInFinderSidebar", "Show in Finder sidebar")
+                : t("settings.showInFileManagerSidebar", "Show in file manager sidebar")
+            }
+          />
+          <Typography variant="body2" color="text.secondary">
+            {t("settings.showInSidebarDescription")}
+          </Typography>
+          {sidebarError && (
+            <Alert severity="error" sx={{ mt: 1 }}>
+              {sidebarError}
+            </Alert>
+          )}
         </DialogContent>
         <DialogActions>
           <Button onClick={handleCloseDialog}>

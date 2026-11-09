@@ -916,6 +916,75 @@ async fn the_mount_is_nobrowse_and_opts_out_of_spotlight() {
     );
 }
 
+/// The Cloudreve logo `cloudreve_sync::sidebar` puts on the drive folder,
+/// set the way the app sets it (`NSWorkspace.setIcon(_:forFile:options:)`,
+/// through JXA here) on the mounted root. AppKit writes an `Icon\r` file
+/// whose resource fork holds the image, and sets the custom-icon bit in the
+/// root's `com.apple.FinderInfo`; NFSv3 has no xattrs, so both land in
+/// AppleDouble sidecars. All of it must work (Finder reads the icon back
+/// from there) and none of it may reach the server.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_drive_folder_icon_set_on_the_mount_root_reads_back_and_is_never_uploaded() {
+    let env = VfsTestEnv::new().await;
+    env.expect_uploads().await;
+    env.expect_namespace_ops().await;
+    env.set_remote_files(vec![remote_file("a.txt", 1, "e1")]).await;
+    let vfs = new_test_vfs(&env).await;
+
+    let mp = tempfile::tempdir().unwrap();
+    let mountpoint = mp.path().to_path_buf();
+    let _guard = MountpointGuard(mountpoint.clone());
+    let mounted = mount::mount(vfs.clone(), &mountpoint, "CloudreveTest", env.cache_dir())
+        .await
+        .expect("mount should succeed");
+
+    let icns = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../src-tauri/icons/icon.icns");
+    let mp2 = mountpoint.clone();
+    let (set_out, finder_info, fork_len, names) = blocking_with_timeout(move || {
+        let script = "ObjC.import('AppKit'); function run(a) { \
+            var img = $.NSImage.alloc.initWithContentsOfFile(a[1]); \
+            return $.NSWorkspace.sharedWorkspace.setIconForFileOptions(img, a[0], 0); }";
+        let out = std::process::Command::new("/usr/bin/osascript")
+            .args(["-l", "JavaScript", "-e", script])
+            .arg(&mp2)
+            .arg(&icns)
+            .output()
+            .unwrap();
+        let set_out = format!("{}{}", String::from_utf8_lossy(&out.stdout).trim(), String::from_utf8_lossy(&out.stderr).trim());
+        let info = std::process::Command::new("/usr/bin/xattr")
+            .args(["-px", "com.apple.FinderInfo"])
+            .arg(&mp2)
+            .output()
+            .unwrap();
+        let finder_info = String::from_utf8_lossy(&info.stdout).split_whitespace().map(str::to_string).collect::<Vec<_>>();
+        let fork_len = std::process::Command::new("/usr/bin/xattr")
+            .args(["-px", "com.apple.ResourceFork"])
+            .arg(mp2.join("Icon\r"))
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).split_whitespace().count())
+            .unwrap_or(0);
+        let names: Vec<String> =
+            std::fs::read_dir(&mp2).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        (set_out, finder_info, fork_len, names)
+    })
+    .await;
+    vfs.wait_for_writeback_idle().await;
+    mounted.unmount().await.expect("unmount should succeed");
+
+    assert_eq!(set_out, "true", "NSWorkspace refused the icon on the mount root");
+    // FinderInfo bytes 8-9 are the Finder flags; 0x0400 = kHasCustomIcon.
+    assert_eq!(finder_info.len(), 32, "no FinderInfo on the root: {finder_info:?}");
+    let flags = u8::from_str_radix(&finder_info[8], 16).unwrap();
+    assert!(flags & 0x04 != 0, "the custom-icon bit is not set: {finder_info:?}");
+    assert!(fork_len > 1000, "Icon\\r has no icon in its resource fork ({fork_len} bytes)");
+    assert_eq!(names, vec!["a.txt".to_string()], "the icon file must stay hidden like any junk");
+    assert!(
+        env.uploaded_names().is_empty() && env.create_file_call_count() == 0,
+        "the folder icon reached the server: {:?}",
+        env.uploaded_names()
+    );
+}
+
 /// `rsize=1048576`: the client reads in 1 MiB chunks — one block of the vfs
 /// cache per READ — instead of the 32 KiB default, which cost 32 READs (and
 /// as many facade calls) per block.
