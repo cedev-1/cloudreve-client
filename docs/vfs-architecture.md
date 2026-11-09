@@ -1,9 +1,7 @@
 # On-demand drives: architecture
 
 How "Files on demand" works inside the client. For what users see, read the
-[README](../README.md#files-on-demand). The original design and the phase plans
-are in `docs/superpowers/specs/` and `docs/superpowers/plans/`; this page
-describes the code as it is.
+[README](../README.md#files-on-demand). This page describes the code as it is.
 
 ## The idea
 
