@@ -1,5 +1,5 @@
-//! macOS metadata junk: names the OS writes on its own and that must never
-//! reach the Cloudreve server.
+//! OS metadata junk (macOS, plus Linux desktops and office suites): names
+//! the OS or an app writes on its own and that must never reach the Cloudreve server.
 //!
 //! NFSv3 has no extended attributes, so whenever macOS sets one on a file
 //! of the mount (quarantine and provenance on every download, Finder tags,
@@ -58,7 +58,38 @@ pub enum JunkKind {
 // `crate::nudge::NUDGE_NAME`: the app's own folder-refresh probe.
 // `Icon\r`: a folder's custom icon (`NSWorkspace.setIcon` on the drive
 // root, see `cloudreve_sync::sidebar`), its bytes in the `._Icon\r` sidecar.
-const LOCAL_ONLY_NAMES: &[&str] = &[".DS_Store", ".VolumeIcon.icns", ".cloudreve-refresh", "Icon\r"];
+// `.directory`: KDE Dolphin's per-folder view settings.
+const LOCAL_ONLY_NAMES: &[&str] =
+    &[".DS_Store", ".VolumeIcon.icns", ".cloudreve-refresh", "Icon\r", ".directory"];
+
+/// Lock files an office suite keeps next to an open document and deletes
+/// on close: LibreOffice's `.~lock.<name>#` and MS Office's `~$<name>`.
+/// They are never renamed onto a real name, unlike the `~WRL*.tmp`,
+/// `lu*.tmp` and `.goutputstream-*` temp files Word, LibreOffice and GTK
+/// apps save through: those must stay ordinary files (junk cannot be
+/// renamed onto a real name, so classifying them would break every save).
+fn is_office_lock_file(name: &str) -> bool {
+    (name.starts_with(".~lock.") && name.ends_with('#') && name.len() > ".~lock.#".len())
+        || (name.starts_with("~$") && name.len() > 2)
+}
+
+/// GNOME (gio) and KDE trash a file that lives on another volume by moving
+/// it into `<volume root>/.Trash-<uid>` (or a pre-existing `.Trash/<uid>`).
+/// Refused like macOS's `.Trashes`: the file manager then offers to delete
+/// permanently, instead of "trashing" into a hidden cloud folder that
+/// keeps using quota and shows up on every other device.
+fn is_linux_trash_dir(name: &str) -> bool {
+    if name.eq_ignore_ascii_case(".Trash") {
+        return true;
+    }
+    match name.get(..7) {
+        Some(prefix) if prefix.eq_ignore_ascii_case(".Trash-") => {
+            let uid = &name[7..];
+            !uid.is_empty() && uid.bytes().all(|b| b.is_ascii_digit())
+        }
+        _ => false,
+    }
+}
 
 const RESERVED_NAMES: &[&str] = &[
     ".Spotlight-V100",
@@ -77,10 +108,13 @@ const RESERVED_NAMES: &[&str] = &[
 
 /// Classifies one path component (a bare name, never a path).
 pub fn classify(name: &str) -> Option<JunkKind> {
-    if name.starts_with("._") || LOCAL_ONLY_NAMES.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+    if name.starts_with("._")
+        || LOCAL_ONLY_NAMES.iter().any(|n| n.eq_ignore_ascii_case(name))
+        || is_office_lock_file(name)
+    {
         return Some(JunkKind::LocalOnly);
     }
-    if RESERVED_NAMES.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+    if RESERVED_NAMES.iter().any(|n| n.eq_ignore_ascii_case(name)) || is_linux_trash_dir(name) {
         return Some(JunkKind::Reserved);
     }
     None
@@ -115,6 +149,55 @@ mod tests {
     #[test]
     fn ordinary_and_lookalike_names_are_not_junk() {
         for name in ["photo.jpg", ".gitignore", "_photo.jpg", ".DS_Store.txt", "My.DS_Store", "Trashes", ".env", "Icon", "Icon.png"] {
+            assert_eq!(classify(name), None, "{name}");
+        }
+    }
+
+    /// Linux desktops: KDE folder view settings, LibreOffice and MS Office
+    /// lock files are written while a document is open and must never reach
+    /// the cloud (every other device would see them appear and vanish).
+    #[test]
+    fn linux_desktop_and_office_lock_files_are_local_only() {
+        for name in [
+            ".directory",
+            ".~lock.Budget 2026.ods#",
+            ".~lock.report.docx#",
+            "~$report.docx",
+            "~$Q3 slides.pptx",
+        ] {
+            assert_eq!(classify(name), Some(JunkKind::LocalOnly), "{name}");
+        }
+    }
+
+    /// GNOME (gio) and KDE trash a file on another volume by moving it into
+    /// `.Trash-<uid>` at the volume root. Refusing that folder makes the
+    /// file manager offer to delete permanently instead of silently keeping
+    /// the "trashed" file in the cloud under a hidden folder.
+    #[test]
+    fn volume_trash_folders_of_linux_desktops_are_reserved() {
+        for name in [".Trash", ".Trash-1000", ".Trash-1001", ".trash-1000"] {
+            assert_eq!(classify(name), Some(JunkKind::Reserved), "{name}");
+        }
+    }
+
+    /// Temp files that editors rename ONTO the real name when saving must
+    /// stay ordinary files: junk can never be renamed onto a real name, so
+    /// classifying them would make every save fail.
+    #[test]
+    fn atomic_save_temp_files_and_lookalikes_are_not_junk() {
+        for name in [
+            ".goutputstream-ABC123",
+            "~WRL0001.tmp",
+            "lu12345abc.tmp",
+            ".report.txt.swp",
+            "notes.txt~",
+            ".hidden",
+            ".~lock.ods",
+            "~report.docx",
+            ".Trash-files",
+            ".Trash-",
+            "Trash-1000",
+        ] {
             assert_eq!(classify(name), None, "{name}");
         }
     }
