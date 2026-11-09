@@ -91,6 +91,7 @@ impl SidebarBackend for Spy {
     fn remove(&self, _: &Path) -> anyhow::Result<()> { Ok(()) }
     fn set_icon(&self, folder: &Path) -> anyhow::Result<()> {
         measure_fresh("nfs: before set_icon", folder);
+        sh(&format!("ls -la '{}'", folder.display()));
         let r = self.0.set_icon(folder);
         eprintln!("set_icon -> {r:?}");
         measure("nfs: after set_icon (in-proc)", &folder.to_string_lossy());
