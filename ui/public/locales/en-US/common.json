@@ -14,11 +14,14 @@
     "localPath": "Local Path",
     "localDriveName": "Mount Name",
     "modeChoice": {
-      "title": "Sync Mode",
-      "mirror": "Full Mirror",
-      "mirrorHint": "Every file is downloaded and kept in sync locally.",
-      "onDemand": "On-Demand",
-      "onDemandHint": "Files download only when you open them. The local folder must be empty to start."
+      "title": "How should your files be kept on this computer?",
+      "mirror": "Download everything",
+      "mirrorHint": "Every file is copied to this computer and kept in sync. Files open without internet, but use as much disk space as your cloud.",
+      "onDemand": "Files on demand",
+      "onDemandHint": "Your files show up in the folder right away but use no disk space until you open them. Opening a file for the first time needs an internet connection; files you opened recently stay available.",
+      "fixedNote": "This choice can't be changed later. To switch, remove the drive and add it again.",
+      "macNote": "The first time, macOS may ask whether Cloudreve can access files on a network volume: click Allow.",
+      "linuxNote": "Needs FUSE (the \"fuse3\" package, already installed on most Linux systems)."
     },
     "localPathPlaceholder": "/Users/username/CloudDrive",
     "browse": "Browse",
@@ -67,7 +70,9 @@
     "conflictKeepRemoteHint": "Overwrites the local file",
     "conflictKeepBoth": "Keep both",
     "conflictKeepBothHint": "Renames the local copy",
-    "pendingUploads": "{{count}} pending upload(s)"
+    "pendingUploads": "{{count}} file(s) waiting to upload",
+    "mountFailed": "\"{{name}}\" is not available",
+    "retry": "Retry"
   },
   "settings": {
     "title": "Settings",
@@ -132,11 +137,14 @@
       "active": "Active",
       "eventPushLost": "Real time event push lost",
       "offline": "Offline",
-      "credentialExpired": "Credential Expired"
+      "credentialExpired": "Credential Expired",
+      "mountFailed": "Not available"
     },
     "driveMode": {
-      "mirror": "Full Mirror",
-      "onDemand": "On-Demand"
+      "mirror": "Download everything",
+      "onDemand": "Files on demand",
+      "mirrorHint": "All files are kept on this computer",
+      "onDemandHint": "Files download when you open them"
     },
     "networkSettings": "Network",
     "heartbeatInterval": "Heartbeat interval",
@@ -145,7 +153,10 @@
     "checkUpdatesOnStartup": "Check for updates on startup",
     "checkUpdatesOnStartupDescription": "Automatically check for new versions when the app starts",
     "autoInstallUpdates": "Auto-install updates",
-    "autoInstallUpdatesDescription": "Download and install updates automatically without prompting"
+    "autoInstallUpdatesDescription": "Download and install updates automatically without prompting",
+    "retryMount": "Retry",
+    "deleteOnDemandDriveConfirm": "Remove \"{{name}}\" from this computer? Your files stay in the cloud; the folder on this computer will be empty.",
+    "deleteOnDemandDriveUnsynced": "\"{{name}}\" has {{count}} file(s) with changes that are not uploaded yet. If you remove the drive now, these changes will be lost. Remove it anyway?"
   },
   "about": {
     "homepage": "Homepage",

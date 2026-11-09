@@ -1,5 +1,7 @@
 import {
+  Alert,
   Box,
+  Button,
   IconButton,
   List,
   Typography,
@@ -226,6 +228,39 @@ export default function Popup() {
           onAddDrive={handleAddDrive}
           pendingUploads={summary?.pending_uploads}
         />
+
+        {/* On-demand drives whose folder could not be mounted: the reason and
+            a Retry, right where the user looks first. */}
+        {Object.entries(summary?.mount_errors ?? {}).map(([driveId, message]) => {
+          const name = summary?.drives.find((d) => d.id === driveId)?.name ?? "";
+          return (
+            <Alert
+              key={driveId}
+              severity="error"
+              sx={{ mt: 1, py: 0, "& .MuiAlert-message": { fontSize: 12 } }}
+              action={
+                <Button
+                  color="inherit"
+                  size="small"
+                  onClick={async () => {
+                    try {
+                      await invoke("resume_sync", { driveId });
+                    } catch (error) {
+                      console.error("Retry mount failed:", error);
+                    }
+                    fetchSummary();
+                  }}
+                >
+                  {t("popup.retry")}
+                </Button>
+              }
+            >
+              <strong>{t("popup.mountFailed", { name })}</strong>
+              <br />
+              {message}
+            </Alert>
+          );
+        })}
       </Box>
 
       {/* Task List */}

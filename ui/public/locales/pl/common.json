@@ -14,11 +14,14 @@
     "localPath": "Ścieżka lokalna",
     "localDriveName": "Nazwa montowania",
     "modeChoice": {
-      "title": "Tryb synchronizacji",
-      "mirror": "Pełne lustro",
-      "mirrorHint": "Każdy plik jest pobierany i synchronizowany lokalnie.",
-      "onDemand": "Na żądanie",
-      "onDemandHint": "Pliki są pobierane dopiero po ich otwarciu. Aby rozpocząć, folder lokalny musi być pusty."
+      "title": "Jak przechowywać pliki na tym komputerze?",
+      "mirror": "Pobierz wszystko",
+      "mirrorHint": "Każdy plik jest kopiowany na ten komputer i synchronizowany. Pliki otwierają się bez internetu, ale zajmują tyle miejsca na dysku, co twoja chmura.",
+      "onDemand": "Pliki na żądanie",
+      "onDemandHint": "Pliki od razu pojawiają się w folderze, ale nie zajmują miejsca na dysku, dopóki ich nie otworzysz. Pierwsze otwarcie pliku wymaga połączenia z internetem; ostatnio otwierane pliki pozostają dostępne.",
+      "fixedNote": "Tego wyboru nie można później zmienić. Aby go zmienić, usuń dysk i dodaj go ponownie.",
+      "macNote": "Za pierwszym razem macOS może zapytać, czy Cloudreve może uzyskać dostęp do plików na woluminie sieciowym: kliknij Zezwól.",
+      "linuxNote": "Wymaga FUSE (pakietu „fuse3”, zainstalowanego w większości systemów Linux)."
     },
     "localPathPlaceholder": "/Users/username/CloudDrive",
     "browse": "Przeglądaj",
@@ -67,7 +70,9 @@
     "conflictKeepRemoteHint": "Nadpisuje plik lokalny",
     "conflictKeepBoth": "Zachowaj oba",
     "conflictKeepBothHint": "Zmienia nazwę lokalnej kopii",
-    "pendingUploads": "Przesyłania w kolejce: {{count}}"
+    "pendingUploads": "{{count}} plik(ów) czeka na wysłanie",
+    "mountFailed": "„{{name}}” jest niedostępny",
+    "retry": "Ponów"
   },
   "settings": {
     "title": "Ustawienia",
@@ -126,11 +131,14 @@
       "active": "Aktywny",
       "eventPushLost": "Utracono połączenie z powiadomieniami w czasie rzeczywistym",
       "offline": "Offline",
-      "credentialExpired": "Dane uwierzytelniające wygasły"
+      "credentialExpired": "Dane uwierzytelniające wygasły",
+      "mountFailed": "Niedostępny"
     },
     "driveMode": {
-      "mirror": "Pełne lustro",
-      "onDemand": "Na żądanie"
+      "mirror": "Pobierz wszystko",
+      "onDemand": "Pliki na żądanie",
+      "mirrorHint": "Wszystkie pliki są na tym komputerze",
+      "onDemandHint": "Pliki pobierają się przy otwarciu"
     },
     "networkSettings": "Sieć",
     "heartbeatInterval": "Interwał heartbeat",
@@ -145,7 +153,10 @@
     "checkUpdatesOnStartup": "Sprawdź aktualizacje przy uruchamianiu",
     "checkUpdatesOnStartupDescription": "Automatycznie sprawdzaj nowe wersje przy uruchamianiu aplikacji",
     "autoInstallUpdates": "Automatycznie instaluj aktualizacje",
-    "autoInstallUpdatesDescription": "Automatycznie pobieraj i instaluj aktualizacje bez pytania"
+    "autoInstallUpdatesDescription": "Automatycznie pobieraj i instaluj aktualizacje bez pytania",
+    "retryMount": "Ponów",
+    "deleteOnDemandDriveConfirm": "Usunąć „{{name}}” z tego komputera? Twoje pliki pozostaną w chmurze; folder na tym komputerze będzie pusty.",
+    "deleteOnDemandDriveUnsynced": "„{{name}}” ma {{count}} plik(ów) ze zmianami, które nie zostały jeszcze wysłane. Jeśli usuniesz dysk teraz, te zmiany zostaną utracone. Usunąć mimo to?"
   },
   "about": {
     "homepage": "Strona główna",

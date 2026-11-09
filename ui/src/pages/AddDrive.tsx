@@ -2,6 +2,7 @@ import { Alert, Box, Button, CircularProgress, Container, IconButton, InputAdorn
 import CloseIcon from "@mui/icons-material/Close";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { platform } from "@tauri-apps/plugin-os";
 import { invoke } from '@tauri-apps/api/core';
 import confetti from "canvas-confetti";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -96,7 +97,12 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
   const [error, setError] = useState("");
   const [snackbarOpen, setSnackbarOpen] = useState(false);
   const [logo, setLogo] = useState(defaultLogo);
-  const [authorizeUrl, setAuthorizeUrl] = useState<string | null>(null);
+  const [authorizeUrl, setAuthorizeUrl] = useState<string |  const pkceSessionRef = useRef<PKCESession | null>(null);
+  const os = platform();
+  const tokensRef = useRef<TokenResponse | null>(null);
+  // The backend's plain-language reason a drive could not be added (shown
+  // on the final step, which the user can retry from).
+  const [finishError, setFinishError] = useState("");
   const [pageState, setPageState] = useState<PageState>(isReauthorize ? "url_input" : "url_input");
   const [localPath, setLocalPath] = useState("");
   const [folderNotEmpty, setFolderNotEmpty] = useState(false);
@@ -282,6 +288,8 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
     setLocalPath("");
     setFolderNotEmpty(false);
     setDriveMode("full_mirror");
+    tokensRef.current = null;
+    setFinishError("");
     pkceSessionRef.current = null;
   };
 
@@ -312,15 +320,20 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
 
   const handleFinish = async (e: React.FormEvent) => {
     e.preventDefault();
+    setFinishError("");
     setPageState("setting_up");
 
+    // The authorization code is single-use: keep the tokens, so a failed
+    // add (e.g. on-demand mode needing FUSE) can be retried from this same
+    // step after fixing the cause, without signing in again.
     let tokens: TokenResponse;
     try {
-      tokens = await exchangeTokens(
+      tokens = tokensRef.current ?? await exchangeTokens(
         pkceSessionRef.current!.siteUrl,
         pkceSessionRef.current!.callbackData!.code,
         pkceSessionRef.current!.codeVerifier
       );
+      tokensRef.current = tokens;
     } catch (error) {
       if (isValidationError(error)) {
         setError(t(`addDrive.errors.${error.type}`, error.params));
@@ -356,9 +369,8 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
       setPageState("success");
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      setError(t("addDrive.errors.addDriveFailed", { message }));
-      setPageState("url_input");
-      setSnackbarOpen(true);
+      setFinishError(message);
+      setPageState("final_setup");
     }
   }
 
@@ -548,6 +560,26 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
                           ? t("addDrive.modeChoice.onDemandHint")
                           : t("addDrive.modeChoice.mirrorHint")}
                       </Typography>
+                      {driveMode === "on_demand" && (
+                        <Typography
+                          variant="caption"
+                          color="text.secondary"
+                          sx={{ mt: 0.5, display: "block" }}
+                        >
+                          {os === "macos"
+                            ? t("addDrive.modeChoice.macNote")
+                            : os === "linux"
+                              ? t("addDrive.modeChoice.linuxNote")
+                              : null}
+                        </Typography>
+                      )}
+                      <Typography
+                        variant="caption"
+                        color="text.secondary"
+                        sx={{ mt: 0.5, display: "block", fontStyle: "italic" }}
+                      >
+                        {t("addDrive.modeChoice.fixedNote")}
+                      </Typography>
                     </Box>
 
                     <FilledTextField
@@ -584,6 +616,12 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
                       </Alert>
                     )}
                   </>
+                )}
+
+                {finishError && (
+                  <Alert severity="error" sx={{ width: "100%" }}>
+                    {finishError}
+                  </Alert>
                 )}
 
                 <Button

@@ -14,11 +14,14 @@
     "localPath": "Chemin local",
     "localDriveName": "Nom du montage",
     "modeChoice": {
-      "title": "Mode de synchronisation",
-      "mirror": "Miroir complet",
-      "mirrorHint": "Tous les fichiers sont téléchargés et synchronisés localement.",
-      "onDemand": "À la demande",
-      "onDemandHint": "Les fichiers ne sont téléchargés qu'à l'ouverture. Le dossier local doit être vide pour commencer."
+      "title": "Comment garder vos fichiers sur cet ordinateur ?",
+      "mirror": "Tout télécharger",
+      "mirrorHint": "Chaque fichier est copié sur cet ordinateur et tenu à jour. Les fichiers s'ouvrent sans internet, mais occupent autant d'espace disque que votre cloud.",
+      "onDemand": "Fichiers à la demande",
+      "onDemandHint": "Vos fichiers apparaissent tout de suite dans le dossier mais n'occupent aucun espace disque tant que vous ne les ouvrez pas. Ouvrir un fichier pour la première fois demande une connexion internet ; les fichiers ouverts récemment restent disponibles.",
+      "fixedNote": "Ce choix ne peut pas être modifié ensuite. Pour changer, supprimez le disque puis ajoutez-le à nouveau.",
+      "macNote": "La première fois, macOS peut demander si Cloudreve peut accéder aux fichiers d'un volume réseau : cliquez sur Autoriser.",
+      "linuxNote": "Nécessite FUSE (le paquet « fuse3 », déjà installé sur la plupart des systèmes Linux)."
     },
     "localPathPlaceholder": "/Users/username/CloudDrive",
     "browse": "Parcourir",
@@ -67,7 +70,9 @@
     "conflictKeepRemoteHint": "Écrase le fichier local",
     "conflictKeepBoth": "Garder les deux",
     "conflictKeepBothHint": "Renomme la copie locale",
-    "pendingUploads": "{{count}} envoi(s) en attente"
+    "pendingUploads": "{{count}} fichier(s) en attente d'envoi",
+    "mountFailed": "« {{name}} » est indisponible",
+    "retry": "Réessayer"
   },
   "settings": {
     "title": "Paramètres",
@@ -132,11 +137,14 @@
       "active": "Actif",
       "eventPushLost": "Perte du push d'événements en temps réel",
       "offline": "Hors ligne",
-      "credentialExpired": "Identifiants expirés"
+      "credentialExpired": "Identifiants expirés",
+      "mountFailed": "Indisponible"
     },
     "driveMode": {
-      "mirror": "Miroir complet",
-      "onDemand": "À la demande"
+      "mirror": "Tout télécharger",
+      "onDemand": "Fichiers à la demande",
+      "mirrorHint": "Tous les fichiers sont gardés sur cet ordinateur",
+      "onDemandHint": "Les fichiers se téléchargent à l'ouverture"
     },
     "networkSettings": "Réseau",
     "heartbeatInterval": "Intervalle de heartbeat",
@@ -145,7 +153,10 @@
     "checkUpdatesOnStartup": "Vérifier les mises à jour au démarrage",
     "checkUpdatesOnStartupDescription": "Vérifier automatiquement les nouvelles versions au lancement de l'application",
     "autoInstallUpdates": "Installer automatiquement les mises à jour",
-    "autoInstallUpdatesDescription": "Télécharger et installer les mises à jour automatiquement sans demander"
+    "autoInstallUpdatesDescription": "Télécharger et installer les mises à jour automatiquement sans demander",
+    "retryMount": "Réessayer",
+    "deleteOnDemandDriveConfirm": "Retirer « {{name}} » de cet ordinateur ? Vos fichiers restent dans le cloud ; le dossier sur cet ordinateur sera vide.",
+    "deleteOnDemandDriveUnsynced": "« {{name}} » a {{count}} fichier(s) dont les modifications ne sont pas encore envoyées. Si vous retirez le disque maintenant, ces modifications seront perdues. Le retirer quand même ?"
   },
   "about": {
     "homepage": "Page d'accueil",

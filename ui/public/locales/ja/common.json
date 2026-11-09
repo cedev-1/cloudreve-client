@@ -14,11 +14,14 @@
     "localPath": "ローカルパス",
     "localDriveName": "マウント名",
     "modeChoice": {
-      "title": "同期モード",
-      "mirror": "完全ミラー",
-      "mirrorHint": "すべてのファイルがダウンロードされ、ローカルで同期された状態が保たれます。",
-      "onDemand": "オンデマンド",
-      "onDemandHint": "ファイルは開いたときにのみダウンロードされます。開始するにはローカルフォルダが空である必要があります。"
+      "title": "このコンピューターでファイルをどのように保持しますか？",
+      "mirror": "すべてダウンロード",
+      "mirrorHint": "すべてのファイルをこのコンピューターにコピーして同期します。インターネットなしで開けますが、クラウドと同じだけのディスク容量を使います。",
+      "onDemand": "オンデマンドファイル",
+      "onDemandHint": "ファイルはすぐにフォルダーに表示されますが、開くまでディスク容量を使いません。初めて開くときはインターネット接続が必要です。最近開いたファイルは引き続き利用できます。",
+      "fixedNote": "この選択は後から変更できません。切り替えるには、ドライブを削除してからもう一度追加してください。",
+      "macNote": "初回に、Cloudreve がネットワークボリューム上のファイルにアクセスしてよいか macOS が確認することがあります。「許可」をクリックしてください。",
+      "linuxNote": "FUSE（ほとんどの Linux に既にインストールされている「fuse3」パッケージ）が必要です。"
     },
     "localPathPlaceholder": "/Users/username/CloudDrive",
     "browse": "参照",
@@ -67,7 +70,9 @@
     "conflictKeepRemoteHint": "ローカルファイルを上書きします",
     "conflictKeepBoth": "両方を保持",
     "conflictKeepBothHint": "ローカルコピーの名前を変更します",
-    "pendingUploads": "{{count}} 件のアップロードが保留中です"
+    "pendingUploads": "{{count}} 件のファイルがアップロード待ち",
+    "mountFailed": "「{{name}}」は利用できません",
+    "retry": "再試行"
   },
   "settings": {
     "title": "設定",
@@ -126,11 +131,14 @@
       "active": "アクティブ",
       "eventPushLost": "リアルタイムイベントプッシュが切断",
       "offline": "オフライン",
-      "credentialExpired": "認証期限切れ"
+      "credentialExpired": "認証期限切れ",
+      "mountFailed": "利用できません"
     },
     "driveMode": {
-      "mirror": "完全ミラー",
-      "onDemand": "オンデマンド"
+      "mirror": "すべてダウンロード",
+      "onDemand": "オンデマンドファイル",
+      "mirrorHint": "すべてのファイルをこのコンピューターに保存",
+      "onDemandHint": "開いたときにダウンロード"
     },
     "networkSettings": "ネットワーク",
     "heartbeatInterval": "ハートビート間隔",
@@ -145,7 +153,10 @@
     "checkUpdatesOnStartup": "起動時にアップデートを確認",
     "checkUpdatesOnStartupDescription": "アプリ起動時に新しいバージョンを自動的に確認します",
     "autoInstallUpdates": "アップデートを自動インストール",
-    "autoInstallUpdatesDescription": "確認なしでアップデートを自動的にダウンロードしてインストールします"
+    "autoInstallUpdatesDescription": "確認なしでアップデートを自動的にダウンロードしてインストールします",
+    "retryMount": "再試行",
+    "deleteOnDemandDriveConfirm": "このコンピューターから「{{name}}」を削除しますか？ファイルはクラウドに残り、このコンピューター上のフォルダーは空になります。",
+    "deleteOnDemandDriveUnsynced": "「{{name}}」には、まだアップロードされていない変更があるファイルが {{count}} 件あります。今ドライブを削除すると、これらの変更は失われます。それでも削除しますか？"
   },
   "about": {
     "homepage": "ホームページ",

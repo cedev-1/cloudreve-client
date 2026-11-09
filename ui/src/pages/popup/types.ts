@@ -64,6 +64,9 @@ export interface StatusSummary {
   // `DriveMode::OnDemand` drives (see `StatusSummary::pending_uploads` in
   // crates/cloudreve-sync/src/drive/manager/types.rs).
   pending_uploads?: Record<string, number>;
+  // On-demand drives whose folder is not mounted: drive id -> localized,
+  // plain-language reason (`StatusSummary::mount_errors`).
+  mount_errors?: Record<string, string>;
 }
 
 export interface FileIconResponse {

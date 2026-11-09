@@ -14,11 +14,14 @@
     "localPath": "Percorso locale",
     "localDriveName": "Nome montaggio",
     "modeChoice": {
-      "title": "Modalità di sincronizzazione",
-      "mirror": "Mirror completo",
-      "mirrorHint": "Ogni file viene scaricato e mantenuto sincronizzato localmente.",
-      "onDemand": "Su richiesta",
-      "onDemandHint": "I file vengono scaricati solo quando li apri. La cartella locale deve essere vuota per iniziare."
+      "title": "Come vuoi conservare i tuoi file su questo computer?",
+      "mirror": "Scarica tutto",
+      "mirrorHint": "Ogni file viene copiato su questo computer e mantenuto sincronizzato. I file si aprono senza internet, ma occupano tanto spazio su disco quanto il tuo cloud.",
+      "onDemand": "File su richiesta",
+      "onDemandHint": "I tuoi file compaiono subito nella cartella ma non occupano spazio su disco finché non li apri. Aprire un file la prima volta richiede una connessione internet; i file aperti di recente restano disponibili.",
+      "fixedNote": "Questa scelta non può essere cambiata in seguito. Per cambiarla, rimuovi l'unità e aggiungila di nuovo.",
+      "macNote": "La prima volta macOS potrebbe chiedere se Cloudreve può accedere ai file di un volume di rete: fai clic su Consenti.",
+      "linuxNote": "Richiede FUSE (il pacchetto \"fuse3\", già installato sulla maggior parte dei sistemi Linux)."
     },
     "localPathPlaceholder": "/Users/username/CloudDrive",
     "browse": "Sfoglia",
@@ -67,7 +70,9 @@
     "conflictKeepRemoteHint": "Sovrascrive il file locale",
     "conflictKeepBoth": "Mantieni entrambi",
     "conflictKeepBothHint": "Rinomina la copia locale",
-    "pendingUploads": "{{count}} caricamento/i in attesa"
+    "pendingUploads": "{{count}} file in attesa di caricamento",
+    "mountFailed": "\"{{name}}\" non è disponibile",
+    "retry": "Riprova"
   },
   "settings": {
     "title": "Impostazioni",
@@ -126,11 +131,14 @@
       "active": "Attivo",
       "eventPushLost": "Connessione push eventi in tempo reale persa",
       "offline": "Offline",
-      "credentialExpired": "Credenziali scadute"
+      "credentialExpired": "Credenziali scadute",
+      "mountFailed": "Non disponibile"
     },
     "driveMode": {
-      "mirror": "Mirror completo",
-      "onDemand": "Su richiesta"
+      "mirror": "Scarica tutto",
+      "onDemand": "File su richiesta",
+      "mirrorHint": "Tutti i file sono su questo computer",
+      "onDemandHint": "I file si scaricano quando li apri"
     },
     "networkSettings": "Rete",
     "heartbeatInterval": "Intervallo heartbeat",
@@ -145,7 +153,10 @@
     "checkUpdatesOnStartup": "Controlla aggiornamenti all'avvio",
     "checkUpdatesOnStartupDescription": "Controlla automaticamente le nuove versioni all'avvio dell'app",
     "autoInstallUpdates": "Installa aggiornamenti automaticamente",
-    "autoInstallUpdatesDescription": "Scarica e installa aggiornamenti automaticamente senza chiedere"
+    "autoInstallUpdatesDescription": "Scarica e installa aggiornamenti automaticamente senza chiedere",
+    "retryMount": "Riprova",
+    "deleteOnDemandDriveConfirm": "Rimuovere \"{{name}}\" da questo computer? I tuoi file restano nel cloud; la cartella su questo computer sarà vuota.",
+    "deleteOnDemandDriveUnsynced": "\"{{name}}\" ha {{count}} file con modifiche non ancora caricate. Se rimuovi l'unità ora, queste modifiche andranno perse. Rimuoverla comunque?"
   },
   "about": {
     "homepage": "Home page",

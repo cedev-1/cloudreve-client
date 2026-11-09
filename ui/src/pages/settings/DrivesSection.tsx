@@ -56,6 +56,8 @@ interface DriveInfoResponse {
     label: string;
   };
   mode: DriveMode;
+  mount_error?: string | null;
+  unsynced_files?: number;
 }
 
 export default function DrivesSection() {
@@ -100,8 +102,17 @@ export default function DrivesSection() {
     fetchDrives();
   }, [fetchDrives]);
 
-  const handleDelete = async (driveId: string, driveName: string) => {
-    const confirmed = await ask(t("settings.deleteDriveConfirm", { name: driveName }), {
+  const handleDelete = async (drive: DriveInfo) => {
+    const unsynced = drive.unsynced_files ?? 0;
+    // On-demand: say what happens to the files (they stay in the cloud, the
+    // folder empties) and warn loudly about changes not uploaded yet.
+    const message =
+      drive.mode !== "on_demand"
+        ? t("settings.deleteDriveConfirm", { name: drive.name })
+        : unsynced > 0
+          ? t("settings.deleteOnDemandDriveUnsynced", { name: drive.name, count: unsynced })
+          : t("settings.deleteOnDemandDriveConfirm", { name: drive.name });
+    const confirmed = await ask(message, {
       title: t("settings.deleteDrive"),
       kind: "warning",
     });
@@ -109,10 +120,25 @@ export default function DrivesSection() {
     if (!confirmed) return;
 
     try {
-      await invoke("remove_drive", { driveId });
+      await invoke("remove_drive", { driveId: drive.id });
       await fetchDrives();
     } catch (error) {
       console.error("Failed to delete drive:", error);
+    }
+  };
+
+  // "Retry" for an on-demand drive that could not be mounted. The backend
+  // answers with the same plain-language explanation when it fails again.
+  const [retrying, setRetrying] = useState<string | null>(null);
+  const handleRetryMount = async (driveId: string) => {
+    setRetrying(driveId);
+    try {
+      await invoke("resume_sync", { driveId });
+    } catch (error) {
+      console.error("Retry mount failed:", error);
+    } finally {
+      setRetrying(null);
+      await fetchDrives();
     }
   };
 
@@ -232,6 +258,8 @@ export default function DrivesSection() {
         return "#ff9800"; // orange
       case "credential_expired":
         return "#f44336"; // red
+      case "mount_failed":
+        return "#f44336"; // red
       default:
         return "#9e9e9e"; // grey
     }
@@ -257,6 +285,8 @@ export default function DrivesSection() {
         return t("settings.driveStatus.offline");
       case "credential_expired":
         return t("settings.driveStatus.credentialExpired");
+      case "mount_failed":
+        return t("settings.driveStatus.mountFailed");
       default:
         return status;
     }
@@ -429,8 +459,31 @@ export default function DrivesSection() {
                       )}
                       <Typography variant="caption" color="text.secondary">
                         {getModeLabel(drive.mode)}
+                        {" · "}
+                        {drive.mode === "on_demand"
+                          ? t("settings.driveMode.onDemandHint")
+                          : t("settings.driveMode.mirrorHint")}
                       </Typography>
                     </Box>
+
+                    {drive.mount_error && (
+                      <Alert
+                        severity="error"
+                        sx={{ mb: 1.5 }}
+                        action={
+                          <Button
+                            color="inherit"
+                            size="small"
+                            disabled={retrying === drive.id}
+                            onClick={() => handleRetryMount(drive.id)}
+                          >
+                            {t("settings.retryMount")}
+                          </Button>
+                        }
+                      >
+                        {drive.mount_error}
+                      </Alert>
+                    )}
 
                     {/* Storage Usage */}
                     {drive.capacity && (
@@ -499,7 +552,7 @@ export default function DrivesSection() {
                     size="small"
                     color="error"
                     startIcon={<DeleteOutlineRounded />}
-                    onClick={() => handleDelete(drive.id, drive.name)}
+                    onClick={() => handleDelete(drive)}
                   >
                     {t("settings.deleteDrive")}
                   </SecondaryErrorButton>

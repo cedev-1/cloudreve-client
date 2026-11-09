@@ -14,11 +14,14 @@
     "localPath": "本機路徑",
     "localDriveName": "掛載名稱",
     "modeChoice": {
-      "title": "同步模式",
-      "mirror": "完整鏡像",
-      "mirrorHint": "所有檔案都會下載並保持本機同步。",
-      "onDemand": "按需同步",
-      "onDemandHint": "檔案僅在開啟時才會下載。開始前本機資料夾必須為空。"
+      "title": "檔案要如何保存在這台電腦上？",
+      "mirror": "全部下載",
+      "mirrorHint": "所有檔案都會複製到這台電腦並保持同步。無需連網即可開啟，但佔用的磁碟空間與雲端相同。",
+      "onDemand": "隨選檔案",
+      "onDemandHint": "檔案會立即顯示在資料夾中，但在開啟之前不佔用磁碟空間。首次開啟檔案需要連網；最近開啟過的檔案仍可使用。",
+      "fixedNote": "此選擇之後無法變更。如需切換，請移除該雲端硬碟後重新新增。",
+      "macNote": "首次使用時，macOS 可能會詢問是否允許 Cloudreve 取用網路卷宗上的檔案：請點選「允許」。",
+      "linuxNote": "需要 FUSE（「fuse3」套件，大多數 Linux 系統已預裝）。"
     },
     "localPathPlaceholder": "/Users/username/CloudDrive",
     "browse": "瀏覽",
@@ -67,7 +70,9 @@
     "conflictKeepRemoteHint": "將覆寫本機檔案",
     "conflictKeepBoth": "兩者都保留",
     "conflictKeepBothHint": "將重新命名本機副本",
-    "pendingUploads": "{{count}} 個待上傳檔案"
+    "pendingUploads": "{{count}} 個檔案等待上傳",
+    "mountFailed": "「{{name}}」無法使用",
+    "retry": "重試"
   },
   "settings": {
     "title": "設定",
@@ -126,11 +131,14 @@
       "active": "活躍",
       "eventPushLost": "即時事件推送中斷",
       "offline": "離線",
-      "credentialExpired": "憑證已過期"
+      "credentialExpired": "憑證已過期",
+      "mountFailed": "無法使用"
     },
     "driveMode": {
-      "mirror": "完整鏡像",
-      "onDemand": "按需同步"
+      "mirror": "全部下載",
+      "onDemand": "隨選檔案",
+      "mirrorHint": "所有檔案都保存在這台電腦上",
+      "onDemandHint": "開啟時才下載檔案"
     },
     "networkSettings": "網路",
     "heartbeatInterval": "心跳間隔",
@@ -145,7 +153,10 @@
     "checkUpdatesOnStartup": "啟動時檢查更新",
     "checkUpdatesOnStartupDescription": "應用啟動時自動檢查新版本",
     "autoInstallUpdates": "自動安裝更新",
-    "autoInstallUpdatesDescription": "自動下載並安裝更新，無需提示"
+    "autoInstallUpdatesDescription": "自動下載並安裝更新，無需提示",
+    "retryMount": "重試",
+    "deleteOnDemandDriveConfirm": "要從這台電腦移除「{{name}}」嗎？你的檔案仍保留在雲端；這台電腦上的資料夾將變為空。",
+    "deleteOnDemandDriveUnsynced": "「{{name}}」中有 {{count}} 個檔案的變更尚未上傳。如果現在移除該雲端硬碟，這些變更將會遺失。仍要移除嗎？"
   },
   "about": {
     "homepage": "首頁",
