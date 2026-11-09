@@ -64,6 +64,9 @@
         }
       );
 
+      # `homeModules` is the name newer tooling expects; same module.
+      homeModules = self.homeManagerModules;
+
       homeManagerModules = {
         default = self.homeManagerModules.cloudreve-client;
         cloudreve-client = import ./nix/modules/home-manager.nix { inherit self; };
