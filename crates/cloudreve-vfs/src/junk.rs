@@ -33,10 +33,11 @@
 //!   using `.Trashes`, and Cocoa safe-saves to fall back to a sibling temp
 //!   file when `.TemporaryItems` cannot be created.
 //!
-//! Both kinds are hidden from listings, including copies that already sit
-//! on the server (uploaded by another client): a Cloudreve-side
-//! `.DS_Store` is never shown, never resolved by name, and never
-//! overwritten by the local one. A folder holding nothing but junk
+//! Both kinds are hidden from listings (the NFS adapter lists one: the
+//! volume root's own `._.`, see `crate::appledouble`), including copies
+//! that already sit on the server (uploaded by another client): a
+//! Cloudreve-side `.DS_Store` is never shown, never resolved by name, and
+//! never overwritten by the local one. A folder holding nothing but junk
 //! therefore lists as empty and `rmdir` deletes it (the server takes the
 //! junk with it) instead of failing with ENOTEMPTY on a folder that looks
 //! empty to every tool.

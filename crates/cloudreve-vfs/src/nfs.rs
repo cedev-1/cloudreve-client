@@ -86,6 +86,7 @@ use nfs3_server::vfs::{
 use crate::frontend_util::{
     classify_error, process_gid, process_uid, to_frontend_attr, FrontendAttr, FrontendErrno,
 };
+use crate::appledouble::ROOT_SIDECAR_NAME;
 use crate::cache::BLOCK_SIZE;
 use crate::tree::{NodeAttr, NodeId};
 use crate::vfs::Vfs;
@@ -359,7 +360,18 @@ impl NfsReadFileSystem for VfsNfs {
     ) -> Result<impl ReadDirPlusIterator<FileHandleU64>, nfsstat3> {
         self.count(|c| &c.readdirplus);
         let dir = NodeId(dirid.as_u64());
-        let listing = self.vfs.readdir(dir).await.map_err(|e| to_errno(&e))?;
+        let mut listing = self.vfs.readdir(dir).await.map_err(|e| to_errno(&e))?;
+        // The root's own sidecar, the one junk file listed: otherwise the
+        // client, holding this listing, answers every lookup of it with
+        // ENOENT without asking, and the root's FinderInfo (the drive
+        // folder's custom icon) can be neither set nor read once Finder
+        // has listed the folder. See `crate::appledouble`. Last, so the
+        // cookies of the real entries do not move.
+        if dir == self.vfs.tree().root() {
+            if let Ok(Some(sidecar)) = self.vfs.lookup(dir, ROOT_SIDECAR_NAME).await {
+                listing.push(sidecar);
+            }
+        }
         let start = cookie as usize;
         if start > listing.len() {
             // Per the module doc: a directory reshuffle between two paged

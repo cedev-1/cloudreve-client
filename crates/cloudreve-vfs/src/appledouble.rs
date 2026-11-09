@@ -6,15 +6,17 @@
 //! root made the overlay hold `._.`, and nothing else).
 //!
 //! The root's sidecar is what carries its custom-icon bit, so the drive
-//! folder's logo depends on it, and it must already exist when the client
-//! first lists the root: once it has, Apple's NFS client refuses to create
-//! a `._` name the listing lacks (`crate::nudge::NUDGE_NAME`). Measured on
-//! CI: after a listing of a root without `._.`, setting its FinderInfo
-//! failed with EPERM and the bit read as absent — and Finder lists a drive
-//! folder the moment it shows it. So the app seeds this file before
-//! mounting (`Vfs::put_local_only`). Once it exists it stays hidden like
-//! any junk: measured on CI, a seeded `._.` missing from the listings is
-//! still read and rewritten after one.
+//! folder's logo depends on it. It must already exist, and be listed, when
+//! the client first lists the root: Apple's NFS client answers a lookup of
+//! a `._` name absent from a listing it holds with ENOENT on its own
+//! (`crate::nudge::NUDGE_NAME`). Measured on CI: once the root was listed,
+//! setting its FinderInfo failed with EPERM and reading it gave ENOATTR —
+//! and Finder lists a drive folder the moment it shows it. So the app
+//! seeds this file before mounting (`Vfs::put_local_only`) and the NFS
+//! adapter lists it (`nfs::VfsNfs::readdirplus`). Both are needed, measured
+//! on CI: seeded but unlisted, the root's FinderInfo read as absent after
+//! a listing (one run passed anyway, something having looked the sidecar
+//! up before the listing: unlisted, it only works by luck).
 
 /// The root's sidecar name, see the module doc.
 pub const ROOT_SIDECAR_NAME: &str = "._.";
