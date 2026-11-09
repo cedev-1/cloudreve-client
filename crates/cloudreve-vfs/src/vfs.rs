@@ -100,6 +100,11 @@ struct OpenFile {
     /// reads fail loudly with [`StaleHandleError`] rather than falling
     /// through to the (purged) block cache — see `Vfs::read`.
     download_url: RwLock<Option<String>>,
+    /// Opened while a draft existed (or created here): its bytes were the
+    /// draft's, never the server's — see the stale-handle check in `read`.
+    /// Distinct from `download_url` being `None`, which can also mean
+    /// `open` could not get a URL (offline).
+    opened_on_draft: bool,
 }
 
 /// Outcome of one ranged GET, distinguishing the two response shapes this
@@ -872,7 +877,7 @@ impl Vfs {
                 Some(file) => file.data.len() as u64,
                 None => bail!("open: {} no longer exists", key.remote_path),
             };
-            let open_file = Arc::new(OpenFile { key, size, download_url: RwLock::new(None) });
+            let open_file = Arc::new(OpenFile { key, size, download_url: RwLock::new(None), opened_on_draft: true });
             let handle_id = self.next_handle.fetch_add(1, Ordering::SeqCst);
             self.open_files.write().await.insert(handle_id, open_file);
             return Ok(FileHandle(handle_id));
@@ -892,10 +897,20 @@ impl Vfs {
         // flip just below — see that block's doc for why the ordering
         // concern from review finding 1 (Task 8) no longer applies.
         let has_draft = self.drafts.lock().await.state(&attr.remote_path).is_some();
+        // Offline: a file whose blocks are already cached must still open
+        // (its reads never need a URL). On failure the URL is fetched later,
+        // by the first read that actually has to download something —
+        // which then fails with the real error.
         let download_url = if has_draft {
             None
         } else {
-            Some(fetch_download_url(&self.client, &key).await?)
+            match fetch_download_url(&self.client, &key).await {
+                Ok(url) => Some(url),
+                Err(err) => {
+                    tracing::warn!(remote_path = %key.remote_path, %err, "vfs: no download url at open, deferring to the first read");
+                    None
+                }
+            }
         };
 
         // Task 8: a reopen within the write-back debounce window cancels
@@ -968,7 +983,7 @@ impl Vfs {
         }
 
         let open_file =
-            Arc::new(OpenFile { key, size: attr.size, download_url: RwLock::new(download_url) });
+            Arc::new(OpenFile { key, size: attr.size, download_url: RwLock::new(download_url), opened_on_draft: has_draft });
 
         let handle_id = self.next_handle.fetch_add(1, Ordering::SeqCst);
         self.open_files.write().await.insert(handle_id, open_file);
@@ -1013,7 +1028,7 @@ impl Vfs {
         // BEFORE `read_from_cache`'s EOF clamp on purpose: that clamp would
         // otherwise answer a created-file handle's reads with clean empty
         // results forever.
-        if of.download_url.read().await.is_none() {
+        if of.opened_on_draft {
             return Err(anyhow::Error::new(StaleHandleError {
                 remote_path: of.key.remote_path.clone(),
             }));
@@ -1284,7 +1299,7 @@ impl Vfs {
                 .insert(remote_path.clone(), JunkFile { data: Vec::new(), mtime_secs: unix_now() });
             let node = self.tree.insert_local_entry(parent, name).await?;
             let key = FileKey { remote_path, etag: String::new() };
-            let open_file = Arc::new(OpenFile { key, size: 0, download_url: RwLock::new(None) });
+            let open_file = Arc::new(OpenFile { key, size: 0, download_url: RwLock::new(None), opened_on_draft: true });
             let handle_id = self.next_handle.fetch_add(1, Ordering::SeqCst);
             self.open_files.write().await.insert(handle_id, open_file);
             return Ok((node, FileHandle(handle_id)));
@@ -1320,7 +1335,7 @@ impl Vfs {
         self.cache.lock().await.retain(&key);
         // No remote counterpart exists yet, so there is nothing to fetch a
         // download URL for — see `download_url`'s field doc.
-        let open_file = Arc::new(OpenFile { key, size: 0, download_url: RwLock::new(None) });
+        let open_file = Arc::new(OpenFile { key, size: 0, download_url: RwLock::new(None), opened_on_draft: true });
         let handle_id = self.next_handle.fetch_add(1, Ordering::SeqCst);
         self.open_files.write().await.insert(handle_id, open_file);
         Ok((node, FileHandle(handle_id)))
@@ -2446,10 +2461,17 @@ async fn fetch_range_with_retry(
     start: u64,
     end: u64,
 ) -> Result<Bytes> {
-    let url = of.download_url.read().await.clone().context(
-        "attempted a ranged fetch on a handle with no download url — drafted/local-only reads \
-         must never reach this path (see `download_url`'s field doc)",
-    )?;
+    // `None`: `open` could not get a URL (offline), or never asked for one.
+    // Drafted/local-only reads never get here (they read the draft).
+    let cached_url = of.download_url.read().await.clone();
+    let url = match cached_url {
+        Some(url) => url,
+        None => {
+            let url = fetch_download_url(client, &of.key).await?;
+            *of.download_url.write().await = Some(url.clone());
+            url
+        }
+    };
     match fetch_range_with_backoff(http, &url, start, end).await? {
         FetchOutcome::Data(bytes) => return Ok(bytes),
         FetchOutcome::RangeNotSatisfiable => return Ok(Bytes::new()),

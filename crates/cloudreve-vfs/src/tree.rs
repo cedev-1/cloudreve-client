@@ -222,21 +222,43 @@ impl VfsTree {
                 .clone()
         };
 
-        let mut files = Vec::new();
-        let mut previous: Option<ListAllRes<ListResponse>> = None;
-        loop {
-            let mut page = self
-                .client
-                .list_files_all(previous.as_ref(), &remote_path, PAGE_SIZE)
-                .await
-                .context("failed to list remote directory")?;
-            files.extend(std::mem::take(&mut page.res.files));
-            let more = page.more;
-            previous = Some(page);
-            if !more {
-                break;
+        let listed: Result<Vec<_>> = async {
+            let mut files = Vec::new();
+            let mut previous: Option<ListAllRes<ListResponse>> = None;
+            loop {
+                let mut page = self
+                    .client
+                    .list_files_all(previous.as_ref(), &remote_path, PAGE_SIZE)
+                    .await
+                    .context("failed to list remote directory")?;
+                files.extend(std::mem::take(&mut page.res.files));
+                let more = page.more;
+                previous = Some(page);
+                if !more {
+                    break;
+                }
             }
+            Ok(files)
         }
+        .await;
+        let mut files = match listed {
+            Ok(files) => files,
+            Err(err) => {
+                // Offline (or the server is down): a folder already listed
+                // keeps its last known content instead of becoming
+                // unbrowsable, and the files in it stay openable from the
+                // cache. Treated as fresh for another `LISTING_TTL`, so an
+                // unreachable server is retried at that pace rather than
+                // on every lookup.
+                let mut inner = self.inner.write().await;
+                if inner.children.contains_key(&dir) {
+                    tracing::warn!(remote_path, %err, "vfs: listing failed, serving the last known content");
+                    inner.listed_at.insert(dir, Instant::now());
+                    return Ok(());
+                }
+                return Err(err);
+            }
+        };
 
         // macOS metadata junk the server holds (another client uploaded a
         // `.DS_Store`, say) never enters the tree: it is not listed, not
