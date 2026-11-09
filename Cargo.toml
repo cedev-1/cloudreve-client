@@ -8,9 +8,16 @@ members = [
     "crates/cloudreve-finder-sync",
     "src-tauri",
 ]
+exclude = ["vendor"]
 
 # Single source of truth for the Rust side. `CARGO_PKG_VERSION` is baked into the
 # User-Agent sent to every Cloudreve server (crates/cloudreve-sync/src/lib.rs), so
 # a crate left behind quietly reports the wrong client version.
 [workspace.package]
 version = "0.3.0"
+
+# vendor/nfs3_server is a fork of nfs3_server 0.11.0 (BSD-3-Clause) — see
+# vendor/nfs3_server/CLOUDREVE-FORK.md for what changed and why. Kept out of
+# the workspace so its own pedantic clippy config and tests stay its own.
+[patch.crates-io]
+nfs3_server = { path = "vendor/nfs3_server" }
