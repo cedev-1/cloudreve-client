@@ -99,8 +99,14 @@ pub fn gtk_remove(content: &str, folder: &Path) -> Option<String> {
     )
 }
 
+/// Escapes markup, and drops the characters XML 1.0 forbids altogether
+/// (C0 controls but tab, newline and carriage return): no escape exists
+/// for them, and a single one makes the whole document unparsable.
 fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    s.chars()
+        .filter(|c| *c >= ' ' || matches!(c, '\t' | '\n' | '\r'))
+        .collect::<String>()
+        .replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
 fn xml_unescape(s: &str) -> String {
@@ -330,6 +336,16 @@ sftp://nas.local/srv/share NAS\n";
         let (head, tail) = XBEL_FILE.rsplit_once("</xbel>").unwrap();
         assert_eq!(out, format!("{head}{expected_entry}</xbel>{tail}"));
         assert!(xbel_contains(&out, Path::new("/home/ana/My Cloud")));
+    }
+
+    /// XML 1.0 forbids most control characters outright: one in a drive
+    /// name (pasted from somewhere, or sent by the server) would make KDE
+    /// reject the WHOLE places file, every other bookmark with it.
+    #[test]
+    fn control_characters_in_a_drive_name_never_reach_the_places_file() {
+        let out = xbel_add(XBEL_FILE, Path::new("/home/ana/Work"), "Work\u{1}\u{8}\u{1b}[31m\tDrive", "cloudreve", "1/2").unwrap();
+        assert!(out.contains("<title>Work[31m\tDrive</title>"), "{out}");
+        assert!(!out.chars().any(|c| matches!(c, '\u{1}' | '\u{8}' | '\u{1b}')));
     }
 
     #[test]

@@ -277,7 +277,7 @@ pub fn build_vfs(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MountSeamCall {
     PreClean { mountpoint: PathBuf },
-    Mount { mountpoint: PathBuf, cache_max_bytes: u64 },
+    Mount { mountpoint: PathBuf, cache_max_bytes: u64, volume_name: String },
     Unmount { mountpoint: PathBuf },
 }
 
@@ -351,6 +351,7 @@ pub async fn attach(
     cache_max_bytes: u64,
     hook: Option<&Arc<MountTestHook>>,
 ) -> Result<Option<MountedVfs>> {
+    let volume_name = &mount_safe_volume_name(volume_name);
     if let Some(hook) = hook {
         hook.record(MountSeamCall::PreClean { mountpoint: mountpoint.to_path_buf() });
     }
@@ -366,7 +367,11 @@ pub async fn attach(
     ensure_mountpoint_ready(mountpoint)?;
 
     if let Some(hook) = hook {
-        hook.record(MountSeamCall::Mount { mountpoint: mountpoint.to_path_buf(), cache_max_bytes });
+        hook.record(MountSeamCall::Mount {
+            mountpoint: mountpoint.to_path_buf(),
+            cache_max_bytes,
+            volume_name: volume_name.to_string(),
+        });
         return Ok(None);
     }
 
@@ -377,6 +382,22 @@ pub async fn attach(
         .await
         .with_context(|| format!("failed to mount the on-demand vfs at {}", mountpoint.display()))?;
     Ok(Some(mounted))
+}
+
+/// `name` reduced to what is safe as a single mount option value. Linux
+/// passes it to fusermount as `-o fsname=<name>` inside a comma-separated
+/// option list, so a drive named `Work,allow_other` would add an option of
+/// its own. Anything but letters, digits, space, `-`, `_` and `.` becomes
+/// `_`; an empty result falls back to "Cloudreve". The name is only a label
+/// there (stale-mount detection keys on the mountpoint and the `cloudreve`
+/// subtype, never on it).
+fn mount_safe_volume_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| if c.is_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.') { c } else { '_' })
+        .collect();
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() { "Cloudreve".to_string() } else { cleaned.to_string() }
 }
 
 /// Detaches an on-demand mount (D5: pause/shutdown/delete). `mounted` is
@@ -468,11 +489,13 @@ mod tests {
         hook.record(MountSeamCall::Mount {
             mountpoint: PathBuf::from("/tmp/a"),
             cache_max_bytes: GIB,
+            volume_name: "Cloud".into(),
         });
         hook.record(MountSeamCall::Unmount { mountpoint: PathBuf::from("/tmp/a") });
         hook.record(MountSeamCall::Mount {
             mountpoint: PathBuf::from("/tmp/a"),
             cache_max_bytes: GIB,
+            volume_name: "Cloud".into(),
         });
 
         assert_eq!(hook.mount_count(), 2);
@@ -624,5 +647,38 @@ mod tests {
         // The OS mount itself must never be attempted once the emptiness
         // check failed.
         assert_eq!(hook.mount_count(), 0);
+    }
+
+    /// Linux hands the volume name to fusermount as `-o fsname=<name>`, in a
+    /// comma-separated option list: a drive named `Cloud,allow_other` would
+    /// smuggle in an option of its own. Whatever the drive is called, the
+    /// name that reaches the OS is a single plain option value.
+    #[tokio::test]
+    async fn a_drive_name_cannot_smuggle_mount_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let mountpoint = dir.path().join("mnt");
+        let cache_dir = dir.path().join("cache");
+        let client = Arc::new(cloudreve_api::Client::new(cloudreve_api::ClientConfig::new(
+            "http://127.0.0.1:1",
+        )));
+        let (vfs, _events) =
+            build_vfs(client, "cloudreve://my/sync".to_string(), &cache_dir, DEFAULT_CACHE_MAX_BYTES)
+                .expect("build the vfs facade");
+
+        let hook = MountTestHook::new();
+        attach(vfs, &mountpoint, "Work,allow_other,dev=1 \\x", &cache_dir, DEFAULT_CACHE_MAX_BYTES, Some(&hook))
+            .await
+            .expect("attach");
+
+        let name = hook
+            .calls()
+            .into_iter()
+            .find_map(|c| match c {
+                MountSeamCall::Mount { volume_name, .. } => Some(volume_name),
+                _ => None,
+            })
+            .expect("a mount request");
+        assert!(!name.contains(',') && !name.contains('=') && !name.contains('\\'), "unsafe name reached the OS: {name:?}");
+        assert!(name.starts_with("Work"), "the readable part of the name is kept: {name:?}");
     }
 }

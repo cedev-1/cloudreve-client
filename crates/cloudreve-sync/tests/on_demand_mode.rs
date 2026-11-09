@@ -194,7 +194,7 @@ async fn adding_an_on_demand_drive_requests_a_mount_at_sync_path() {
         "pre-clean must run before the mount is requested"
     );
     match &calls[1] {
-        MountSeamCall::Mount { mountpoint, cache_max_bytes } => {
+        MountSeamCall::Mount { mountpoint, cache_max_bytes, .. } => {
             assert_eq!(mountpoint, &env.sync_dir, "must mount at the drive's sync_path");
             assert!(*cache_max_bytes > 0, "the effective cache cap must be a real, positive size");
         }
