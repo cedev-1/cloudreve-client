@@ -132,9 +132,14 @@ impl Drop for UnmountGuard {
 /// `(listed in Favorites, custom icon on the folder)`, read off the async
 /// runtime: the NFS server answering those reads runs on it.
 async fn observe(backend: Arc<dyn SidebarBackend>, folder: PathBuf) -> (bool, bool) {
-    tokio::task::spawn_blocking(move || (backend.contains(&folder).unwrap_or(false), has_custom_icon(&folder)))
-        .await
-        .unwrap()
+    tokio::task::spawn_blocking(move || {
+        eprintln!("E2E   resolving Favorites");
+        let listed = backend.contains(&folder).unwrap_or(false);
+        eprintln!("E2E   listed={listed}, reading FinderInfo");
+        (listed, has_custom_icon(&folder))
+    })
+    .await
+    .unwrap()
 }
 
 /// The production path end to end on a REAL on-demand mount: `Mount::start`
@@ -162,13 +167,18 @@ async fn an_on_demand_drive_keeps_its_favorite_and_logo_across_a_relaunch() {
     eprintln!("E2E first observed {first:?}");
 
     env.mount.shutdown().await;
+    eprintln!("E2E shut down (unmounted)");
     let while_unmounted = observe(backend.clone(), folder.clone()).await;
+    eprintln!("E2E observed while unmounted {while_unmounted:?}");
     let mountpoint_entries = std::fs::read_dir(&folder).map(|d| d.count()).unwrap_or(usize::MAX);
+    eprintln!("E2E mountpoint holds {mountpoint_entries} entries, relaunching");
     env.restart_mount().await;
     let after_relaunch = observe(backend.clone(), folder.clone()).await;
     eprintln!("E2E relaunched, observed {after_relaunch:?}");
 
+    eprintln!("E2E deleting the drive");
     env.mount.delete().await.unwrap();
+    eprintln!("E2E deleted");
     let after_delete = observe(backend.clone(), folder.clone()).await;
     drop(cleanup);
 
