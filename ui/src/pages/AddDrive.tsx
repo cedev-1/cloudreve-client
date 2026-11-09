@@ -97,7 +97,7 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
   const [error, setError] = useState("");
   const [snackbarOpen, setSnackbarOpen] = useState(false);
   const [logo, setLogo] = useState(defaultLogo);
-  const [authorizeUrl, setAuthorizeUrl] = useState<string |  const pkceSessionRef = useRef<PKCESession | null>(null);
+  const [authorizeUrl, setAuthorizeUrl] = useState<string | null>(null);
   const os = platform();
   const tokensRef = useRef<TokenResponse | null>(null);
   // The backend's plain-language reason a drive could not be added (shown
