@@ -209,24 +209,6 @@ fn remove_mount_marker(cache_dir: &Path) {
     }
 }
 
-/// Decides whether a mount-table match at some path should be treated as
-/// stale, given what's known about OUR recorded identity marker for it —
-/// the pure decision core of this task's two-instance fix, deliberately
-/// factored out from any real OS call (`is_our_nfs_mount`/
-/// `is_our_fuse_mount` are the only callers) so it can be pinned by a
-/// deterministic unit test independent of any real mount.
-///
-/// - No mount-table match at all: never stale — nothing to clean.
-/// - A match, but no marker was ever recorded for this cache_dir (`None`):
-///   NOT treated as stale. Conservative on purpose: without a positive
-///   record of having mounted here ourselves, this match cannot be
-///   attributed to a dead instance of ours, so leaving it alone beats
-///   risking a force-unmount of someone else's live mount.
-/// - A match, a marker WAS recorded, and its owner (the process on the
-///   other end — a TCP listener on macOS, a pid on Linux) is still alive:
-///   NOT stale. This is the two-instance false positive itself: a
-///   currently-alive sibling still legitimately owns this mountpoint.
-/// - A match, a marker WAS recorded, and its owner is dead: stale.
 /// Decodes the octal escapes `/proc/mounts` writes for whitespace and
 /// backslashes in a path field (proc(5): a space is `\040`, a tab `\011`,
 /// a newline `\012`, a backslash `\134`). Anything that is not a full
@@ -254,6 +236,25 @@ fn unescape_proc_mounts_field(field: &str) -> String {
     }
     String::from_utf8_lossy(&out).into_owned()
 }
+
+/// Decides whether a mount-table match at some path should be treated as
+/// stale, given what's known about OUR recorded identity marker for it —
+/// the pure decision core of this task's two-instance fix, deliberately
+/// factored out from any real OS call (`is_our_nfs_mount`/
+/// `is_our_fuse_mount` are the only callers) so it can be pinned by a
+/// deterministic unit test independent of any real mount.
+///
+/// - No mount-table match at all: never stale — nothing to clean.
+/// - A match, but no marker was ever recorded for this cache_dir (`None`):
+///   NOT treated as stale. Conservative on purpose: without a positive
+///   record of having mounted here ourselves, this match cannot be
+///   attributed to a dead instance of ours, so leaving it alone beats
+///   risking a force-unmount of someone else's live mount.
+/// - A match, a marker WAS recorded, and its owner (the process on the
+///   other end — a TCP listener on macOS, a pid on Linux) is still alive:
+///   NOT stale. This is the two-instance false positive itself: a
+///   currently-alive sibling still legitimately owns this mountpoint.
+/// - A match, a marker WAS recorded, and its owner is dead: stale.
 
 fn is_stale(mount_table_match: bool, marker_owner_alive: Option<bool>) -> bool {
     if !mount_table_match {
