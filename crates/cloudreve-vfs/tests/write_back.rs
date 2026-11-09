@@ -1794,3 +1794,50 @@ async fn a_residual_40004_against_a_directory_settles_as_a_terminal_failure() {
         "the directory's name must never actually receive an upload"
     );
 }
+
+/// Delete a brand-new file while its upload is already running (a big
+/// file, a slow connection): the running upload must not bring the file
+/// back on the server. Before the fix, the draft vanished from under the
+/// upload, the upload finished anyway and the server kept the "deleted"
+/// file — it reappeared on every other device and in the web UI.
+#[tokio::test]
+async fn deleting_a_new_file_while_its_upload_runs_leaves_nothing_on_the_server() {
+    let env = VfsTestEnv::new().await;
+    env.expect_uploads().await;
+    env.expect_namespace_ops().await;
+    env.set_remote_files(vec![]).await;
+    env.slow_down_chunk_uploads(Duration::from_millis(400));
+
+    let (vfs, mut rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+    vfs.set_debounce_for_tests(Duration::from_millis(20));
+
+    let root = vfs.tree().root();
+    let (_node, h) = vfs.create(root, "draft.txt").await.unwrap();
+    vfs.write(h, 0, b"never meant to stay").await.unwrap();
+    vfs.close(h).await.unwrap();
+
+    let uri = uri_of("draft.txt");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    // The bytes reached the server; the upload is about to finish.
+    while env.uploaded_content("draft.txt").is_none() {
+        assert!(std::time::Instant::now() < deadline, "the upload never started");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    vfs.unlink(root, "draft.txt").await.expect("deleting a file being uploaded must succeed");
+    vfs.wait_for_writeback_idle().await;
+
+    let events = collect_events(&mut rx, 2).await;
+    assert!(
+        matches!(&events[..], [VfsEvent::UploadQueued { .. }, VfsEvent::UploadCancelled { .. }]),
+        "the cycle must end as cancelled, not succeeded: {events:?}"
+    );
+    assert!(
+        env.last_deleted_uris().iter().any(|u| u == &uri),
+        "whatever the running upload created must be deleted again; deleted: {:?}",
+        env.last_deleted_uris()
+    );
+    assert!(vfs.lookup(root, "draft.txt").await.unwrap().is_none());
+}

@@ -653,6 +653,11 @@ pub struct WriteBackQueue {
     /// pin the `in_flight` scope-guard fix above: `Vfs::
     /// panic_next_upload_for_tests`/`tests/write_back.rs`'s panic test.
     panic_next_upload: Arc<StdMutex<bool>>,
+    /// Paths deleted (`Vfs::unlink`) while their upload was in flight —
+    /// see [`WriteBackQueue::discard_in_flight`]. `process` checks it at
+    /// the end of the cycle and undoes whatever the upload put on the
+    /// server instead of settling the (already removed) draft.
+    discarded: Arc<StdMutex<HashSet<String>>>,
 }
 
 /// Scope guard for `WriteBackQueue::run` (phase 4, this task): removes
@@ -669,6 +674,7 @@ struct RunGuard<'a> {
 impl Drop for RunGuard<'_> {
     fn drop(&mut self) {
         self.queue.in_flight.lock().unwrap().remove(self.remote_path);
+        self.queue.discarded.lock().unwrap().remove(self.remote_path);
         self.queue.busy.fetch_sub(1, Ordering::SeqCst);
     }
 }
@@ -694,6 +700,7 @@ impl WriteBackQueue {
             retry_backoff: Arc::new(StdMutex::new(UPLOAD_RETRY_BACKOFF)),
             in_flight: Arc::new(StdMutex::new(HashSet::new())),
             panic_next_upload: Arc::new(StdMutex::new(false)),
+            discarded: Arc::new(StdMutex::new(HashSet::new())),
         }
     }
 
@@ -739,6 +746,51 @@ impl WriteBackQueue {
             this.run(path_for_timer).await;
         });
         self.timers.lock().unwrap().insert(remote_path, handle);
+    }
+
+    /// Marks `remote_path` as deleted while its upload is in flight
+    /// (`Vfs::unlink` of a file being uploaded). Returns whether an upload
+    /// was actually in flight. The running cycle cannot be stopped midway
+    /// (its bytes may already be on the server), so it finishes and then
+    /// deletes whatever it created and ends as `UploadCancelled` — instead
+    /// of bringing the deleted file back on the server, or reporting a
+    /// failure for a file the user no longer has.
+    pub fn discard_in_flight(&self, remote_path: &str) -> bool {
+        let in_flight = self.in_flight.lock().unwrap();
+        if !in_flight.contains(remote_path) {
+            return false;
+        }
+        self.discarded.lock().unwrap().insert(remote_path.to_string());
+        true
+    }
+
+    fn is_discarded(&self, remote_path: &str) -> bool {
+        self.discarded.lock().unwrap().contains(remote_path)
+    }
+
+    /// End of a cycle whose file was deleted mid-upload (see
+    /// [`Self::discard_in_flight`]): best-effort removal of what the upload
+    /// may have created at `uploaded_uri`, then `UploadCancelled`.
+    async fn finish_discarded(&self, remote_path: &str, uploaded_uri: &str) {
+        use cloudreve_api::api::ExplorerApi;
+        if let Err(err) = self
+            .client
+            .delete_files(&cloudreve_api::models::explorer::DeleteFileService {
+                uris: vec![uploaded_uri.to_string()],
+                unlink: None,
+                skip_soft_delete: None,
+            })
+            .await
+        {
+            // Nothing landed (the upload failed before finishing): there
+            // was nothing to delete.
+            tracing::debug!(remote_path, %err, "writeback: nothing to undo for a file deleted mid-upload");
+        }
+        self.tree.invalidate_path(uploaded_uri).await;
+        self.tree.invalidate_path(remote_path).await;
+        let _ = self
+            .events
+            .send(crate::vfs::VfsEvent::UploadCancelled { remote_path: remote_path.to_string() });
     }
 
     /// Cancels a still-armed debounce timer for `remote_path` (a reopen
@@ -1053,6 +1105,15 @@ impl WriteBackQueue {
         // deterministic name first guessed.
         let conflict_copy = conflict_copy.map(|_| final_uri);
 
+        // Deleted while this upload ran (`Vfs::unlink`, see
+        // `discard_in_flight`): its draft is gone, so there is nothing to
+        // settle or retry — only to undo what may have landed.
+        if self.is_discarded(remote_path) {
+            let uploaded = conflict_copy.unwrap_or(upload_uri);
+            self.finish_discarded(remote_path, &uploaded).await;
+            return;
+        }
+
         match last_err {
             None => match conflict_copy {
                 Some(conflict_path) => {
@@ -1323,12 +1384,13 @@ async fn upload_plain_with_adoption(
     backoff: [Duration; 2],
     uploader: &Uploader,
 ) -> (Option<anyhow::Error>, bool) {
-    let err = match retry_plain_upload(uploader, &params, backoff).await {
+    let err = match retry_plain_upload(uploader, &params, backoff, || queue.is_discarded(remote_path)).await {
         Ok(()) => return (None, false),
         Err(err) => err,
     };
 
-    if !is_object_existed_error(&err) {
+    // Deleted mid-upload: no adoption, nothing more to land.
+    if !is_object_existed_error(&err) || queue.is_discarded(remote_path) {
         return (Some(err), false);
     }
 
@@ -1347,7 +1409,7 @@ async fn upload_plain_with_adoption(
             }
             params.overwrite = true;
             params.previous_version = dest_attr.etag;
-            match retry_plain_upload(uploader, &params, backoff).await {
+            match retry_plain_upload(uploader, &params, backoff, || queue.is_discarded(remote_path)).await {
                 Ok(()) => (None, false),
                 Err(second_err) => (Some(second_err), false),
             }
@@ -1368,10 +1430,13 @@ async fn upload_plain_with_adoption(
 /// `UPLOAD_RETRIES` attempts of the exact same request, sleeping `backoff`
 /// between failures. Used both by `upload_plain_with_adoption`'s original
 /// attempt and its one adopted retry.
+/// `stop` ends the loop early after a failure (the file was deleted
+/// mid-upload, see `WriteBackQueue::discard_in_flight`).
 async fn retry_plain_upload(
     uploader: &Uploader,
     params: &UploadParams,
     backoff: [Duration; 2],
+    stop: impl Fn() -> bool,
 ) -> Result<()> {
     let mut last_err = None;
     for attempt in 0..UPLOAD_RETRIES {
@@ -1379,6 +1444,9 @@ async fn retry_plain_upload(
             Ok(()) => return Ok(()),
             Err(err) => {
                 last_err = Some(err);
+                if stop() {
+                    break;
+                }
                 if attempt + 1 < UPLOAD_RETRIES {
                     tokio::time::sleep(backoff[attempt as usize]).await;
                 }

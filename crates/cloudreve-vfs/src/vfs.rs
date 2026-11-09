@@ -1485,6 +1485,11 @@ impl Vfs {
                         let _ = self
                             .events
                             .send(VfsEvent::UploadCancelled { remote_path: remote_path.clone() });
+                    } else {
+                        // An upload already running keeps going (its bytes
+                        // may be on the server already); it undoes itself
+                        // when it ends — see `discard_in_flight`.
+                        self.write_queue.discard_in_flight(&remote_path);
                     }
                     drafts.remove(&remote_path)?;
                     Some(base_etag)
