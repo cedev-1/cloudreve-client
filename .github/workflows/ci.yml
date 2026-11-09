@@ -52,11 +52,13 @@ jobs:
       - name: Run tests
         run: cargo test -p cloudreve-sync -p cloudreve-api -p cloudreve-uploader -p cloudreve-vfs
 
-      - name: Check desktop crate compiles
-        # tauri-build requires the frontendDist directory to exist,
-        # but type-checking the Rust code doesn't need a real frontend build
-        # need to add ci for frontend part
+      - name: Desktop crate (Tauri commands)
+        # tauri-build requires the frontendDist directory to exist, but the
+        # Rust side (and the JSON the UI reads) needs no real frontend build.
         run: |
+          mkdir -p ui/dist
+          cargo test -p cloudreve-desktop --lib
+|
           mkdir -p ui/dist
           cargo check -p cloudreve-desktop
 
@@ -80,6 +82,11 @@ jobs:
 
       - name: Run tests
         run: cargo test -p cloudreve-vfs
+
+      - name: What Foundation answers on the drive (safe save, trash, tags)
+        # Already run above; again with --nocapture so the log records each
+        # answer, not just the verdict.
+        run: cargo test -p cloudreve-vfs --test mounted_macos_apps -- --nocapture
 
       - name: Finder sidebar (real LSSharedFileList and NSWorkspace)
         # Edits the runner's Finder Favorites, so it is #[ignore]d for local runs.
