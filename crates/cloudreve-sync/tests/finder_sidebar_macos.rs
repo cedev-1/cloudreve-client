@@ -324,9 +324,9 @@ impl SidebarBackend for BrowsedFirst {
 /// It does from the moment it is mounted, before `set_icon` runs.
 /// The root's FinderInfo lives in an AppleDouble `._.` inside the root;
 /// once the client holds a listing of the root without it, Apple's NFS
-/// client answers every `._.` lookup with ENOENT on its own (see
-/// `cloudreve_vfs::nudge::NUDGE_NAME`) — the custom-icon bit could then be
-/// neither set nor read, and Finder drew the generic volume icon.
+/// client refuses to create it (see `cloudreve_vfs::appledouble`) — the
+/// custom-icon bit could then be neither set nor read, and Finder drew
+/// the generic volume icon.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn an_on_demand_drive_folder_resolves_to_the_cloudreve_logo_even_once_finder_listed_it() {

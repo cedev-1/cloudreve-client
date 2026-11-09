@@ -986,12 +986,7 @@ async fn the_drive_folder_icon_set_on_the_mount_root_reads_back_and_is_never_upl
         fork_len > 1000 || volume_icon_len > 1000,
         "the icon image is nowhere: Icon\\r fork {fork_len} bytes, .VolumeIcon.icns {volume_icon_len} bytes"
     );
-    // The icon file stays hidden like any junk; the root's own sidecar
-    // `._.` (its FinderInfo) is the one junk name listed, see
-    // `cloudreve_vfs::appledouble`.
-    let mut names = names;
-    names.sort();
-    assert_eq!(names, vec!["._.".to_string(), "a.txt".to_string()], "only the root's sidecar may be listed");
+    assert_eq!(names, vec!["a.txt".to_string()], "the icon file must stay hidden like any junk");
     assert!(
         env.uploaded_names().is_empty() && env.create_file_call_count() == 0,
         "the folder icon reached the server: {:?}",
@@ -1002,10 +997,10 @@ async fn the_drive_folder_icon_set_on_the_mount_root_reads_back_and_is_never_upl
 /// The root's FinderInfo (the drive folder's custom-icon bit) stays readable
 /// and writable once the root has been listed, which Finder does the moment
 /// it shows the folder. It lives in the root's `._.` sidecar, seeded before
-/// mounting the way the app does (`Vfs::put_local_only`); unlisted, the
-/// client answered its lookup with ENOENT on its own after a listing: the
-/// bit read as absent and `xattr -w` failed with EPERM (measured on CI,
-/// see `cloudreve_vfs::appledouble`).
+/// mounting the way the app does (`Vfs::put_local_only`). Not seeded, it
+/// could not be created once the root was listed: `xattr -w` failed with
+/// EPERM and the bit read as absent (measured on CI, see
+/// `cloudreve_vfs::appledouble`).
 #[tokio::test(flavor = "multi_thread")]
 async fn the_mount_root_finder_info_is_still_read_and_written_once_the_root_was_listed() {
     let env = VfsTestEnv::new().await;
