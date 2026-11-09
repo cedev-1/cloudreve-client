@@ -86,4 +86,6 @@ jobs:
         run: |
           cargo test -p cloudreve-sync --lib sidebar
           cargo test -p cloudreve-sync --test drive_sidebar
-          cargo test -p cloudreve-sync --test finder_sidebar_macos -- --ignored
+          # --nocapture: a panic in a test that loaded AppKit dies as SIGTRAP
+          # with captured output, hiding the message.
+          RUST_BACKTRACE=1 cargo test -p cloudreve-sync --test finder_sidebar_macos -- --ignored --nocapture --test-threads=1
