@@ -13,11 +13,7 @@ let
 
   # Stand-in for the app in module tests: they check the wiring, not the app,
   # and must not need the full Tauri build to evaluate.
-  fakeApp = pkgs.runCommand "cloudreve-client-fake" { meta.mainProgram = "cloudreve-desktop"; } ''
-    mkdir -p $out/bin $out/Applications/Cloudreve.app/Contents/MacOS
-    printf '#!/bin/sh\nexit 0\n' > $out/bin/cloudreve-desktop
-    chmod +x $out/bin/cloudreve-desktop
-  '';
+  fakeApp = pkgs.writeShellScriptBin "cloudreve-desktop" "exit 0";
 
   hmConfig =
     module:
