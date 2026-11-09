@@ -1926,7 +1926,9 @@ async fn a_failed_upload_is_retried_on_its_own_later() {
 
     // Nobody calls retry_pending_uploads: no reconnect, no restart.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while env.uploaded_content("report.txt").is_none() {
+    // Until COMPLETE, not merely present: the mock records chunks as they
+    // arrive (5 bytes each), so the first poll can catch "final" alone.
+    while env.uploaded_content("report.txt").as_deref() != Some(&b"final version"[..]) {
         assert!(
             std::time::Instant::now() < deadline,
             "a parked upload must be retried on its own"
