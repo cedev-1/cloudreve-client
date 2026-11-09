@@ -6,10 +6,11 @@ use cloudreve_api::{
 };
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
+use crate::drive::utils::{is_inside, safe_relative_path};
 
 const INITIAL_BACKOFF_SECS: u64 = 1;
 // Cap low enough that the client recovers quickly once the server is back:
@@ -43,6 +44,23 @@ impl BackoffState {
         self.current_delay =
             Duration::from_secs((self.current_delay.as_secs() * 2).min(MAX_BACKOFF_SECS));
         delay
+    }
+}
+
+/// The local path an SSE event's `from`/`to` names under `sync_root`, or
+/// `None` when it names nothing there: the root itself, or a path that
+/// would escape the sync folder (see `safe_relative_path`) — the event is
+/// then dropped rather than acted upon.
+fn local_event_path(sync_root: &Path, event_path: &str) -> Option<PathBuf> {
+    if event_path.trim_matches('/').is_empty() {
+        return None;
+    }
+    match safe_relative_path(event_path) {
+        Some(rel) => Some(sync_root.join(rel)),
+        None => {
+            tracing::warn!(target: "drive::remote_events", path = event_path, "Ignoring a remote event whose path escapes the sync folder");
+            None
+        }
     }
 }
 
@@ -328,28 +346,28 @@ impl Mount {
         let mut to_grouped: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
 
         for event in events {
-            let from_rel: PathBuf = event.from.trim_start_matches('/').split('/').collect();
-            let local_from = sync_root.join(&from_rel);
-            if local_from.exists() {
-                if let Some(parent) = local_from.parent() {
-                    from_grouped.entry(parent.to_path_buf()).or_default().push(local_from.clone());
+            if let Some(local_from) = local_event_path(&sync_root, &event.from) {
+                if local_from.exists() {
+                    if let Some(parent) = local_from.parent() {
+                        from_grouped.entry(parent.to_path_buf()).or_default().push(local_from.clone());
+                    }
+                }
+
+                // Cancel any pending tasks for the old path since the file was moved remotely
+                if let Err(e) = self.task_queue.cancel_by_path(&local_from).await {
+                    tracing::warn!(
+                        target: "drive::remote_events",
+                        path = %local_from.display(),
+                        error = %e,
+                        "Failed to cancel tasks for renamed-from path"
+                    );
                 }
             }
 
-            // Cancel any pending tasks for the old path since the file was moved remotely
-            if let Err(e) = self.task_queue.cancel_by_path(&local_from).await {
-                tracing::warn!(
-                    target: "drive::remote_events",
-                    path = %local_from.display(),
-                    error = %e,
-                    "Failed to cancel tasks for renamed-from path"
-                );
-            }
-
-            let to_rel: PathBuf = event.to.trim_start_matches('/').split('/').collect();
-            let local_to = sync_root.join(&to_rel);
-            if let Some(parent) = local_to.parent() {
-                to_grouped.entry(parent.to_path_buf()).or_default().push(local_to);
+            if let Some(local_to) = local_event_path(&sync_root, &event.to) {
+                if let Some(parent) = local_to.parent() {
+                    to_grouped.entry(parent.to_path_buf()).or_default().push(local_to);
+                }
             }
         }
 
@@ -362,8 +380,9 @@ impl Mount {
     async fn handle_delete_events(&self, sync_root: PathBuf, events: Vec<FileEventData>) -> Result<()> {
         let mut grouped: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
         for event in events {
-            let rel: PathBuf = event.from.trim_start_matches('/').split('/').collect();
-            let local_path = sync_root.join(&rel);
+            let Some(local_path) = local_event_path(&sync_root, &event.from) else {
+                continue;
+            };
             if local_path.exists() {
                 if let Some(parent) = local_path.parent() {
                     grouped.entry(parent.to_path_buf()).or_default().push(local_path);
@@ -379,8 +398,9 @@ impl Mount {
     async fn handle_create_update_events(&self, sync_root: PathBuf, events: Vec<FileEventData>) -> Result<()> {
         let mut grouped: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
         for event in events {
-            let rel: PathBuf = event.from.trim_start_matches('/').split('/').collect();
-            let local_path = sync_root.join(&rel);
+            let Some(local_path) = local_event_path(&sync_root, &event.from) else {
+                continue;
+            };
             if let Some(parent) = local_path.parent() {
                 grouped.entry(parent.to_path_buf()).or_default().push(local_path);
             }
@@ -398,7 +418,8 @@ impl Mount {
         parent: PathBuf,
         paths: Vec<PathBuf>,
     ) -> Result<()> {
-        if !parent.starts_with(&sync_root) {
+        // Component-wise, not `starts_with`: `sync/..` starts with `sync`.
+        if parent != sync_root && !is_inside(&sync_root, &parent) {
             tracing::warn!(target: "drive::remote_events", "Event parent outside sync root, skipping");
             return Ok(());
         }

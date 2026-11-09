@@ -21,7 +21,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::{
-    drive::{event_blocker::EventBlocker, utils::local_path_to_cr_uri},
+    drive::{event_blocker::EventBlocker, utils::{is_inside, local_path_to_cr_uri}},
     events::SummaryNotifier,
     inventory::{local_mtime_secs, ConflictState, FileMetadata, InventoryDb, MetadataEntry},
     tasks::queue::QueuedTask,
@@ -207,6 +207,14 @@ impl<'a> DownloadTask<'a> {
     async fn download_file(&mut self) -> Result<()> {
         let local_path = self.task.payload.local_path.clone();
         info!(target: "tasks::download", task_id = %self.task.task_id, path = %local_path.display(), "Starting download");
+
+        // Defense in depth, before anything below can write or remove a
+        // file: paths built from server data are already checked
+        // (`safe_relative_path`), but this is the one place every download
+        // passes through, whatever queued it.
+        if !is_inside(&self.sync_path, &local_path) {
+            anyhow::bail!("refusing to download outside the sync folder: {}", local_path.display());
+        }
 
         // Compute remote URI
         let uri = local_path_to_cr_uri(local_path.clone(), self.sync_path.clone(), self.remote_base.clone())

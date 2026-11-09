@@ -159,8 +159,13 @@ pub async fn full_sync(mount: &Mount, local_root: &PathBuf, remote_path: &str) -
         .filter(|f| f.file_type != file_type::FOLDER)
         .filter_map(|f| {
             let uri = CrUri::new(&f.path).ok()?;
-            let rel = remote_path_to_local_relative_path(&uri, &remote_base).ok()?;
-            Some((rel, f))
+            match remote_path_to_local_relative_path(&uri, &remote_base) {
+                Ok(rel) => Some((rel, f)),
+                Err(e) => {
+                    tracing::warn!(target: "drive::sync", id = %mount.id, error = %format_args!("{e:#}"), "Skipping a listed entry with an unsafe path");
+                    None
+                }
+            }
         })
         .collect();
 
