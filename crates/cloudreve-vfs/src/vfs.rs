@@ -1141,6 +1141,19 @@ impl Vfs {
         *self.open_pause_hook.lock().unwrap() = Some(hook);
     }
 
+    /// Stops this vfs talking to the server for good: the drive is being
+    /// deleted, or the app is quitting. Armed and parked uploads never fire,
+    /// an upload under way is dropped mid-request, `retry_pending_uploads`
+    /// queues nothing, and folder refreshes stop. Drafts stay on disk, so a
+    /// drive that still exists re-uploads them at its next launch.
+    /// Idempotent and synchronous (callable from any teardown path); call it
+    /// after the OS mount is detached — reads and writes still work
+    /// afterwards, only the server side is cut.
+    pub fn shutdown(&self) {
+        self.write_queue.shutdown();
+        self.stop_nudging_now();
+    }
+
     /// Re-arms every draft still `Pending` for immediate upload, bypassing
     /// the debounce entirely — offline recovery: phase 4 calls this on
     /// reconnect. Returns how many were queued.

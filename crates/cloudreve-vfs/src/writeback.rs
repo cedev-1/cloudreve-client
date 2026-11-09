@@ -608,7 +608,10 @@ pub struct WriteBackQueue {
     /// its own entry the instant it fires (before doing any real work), so
     /// a `cancel` racing in after that point correctly finds nothing and
     /// reports it did not stop anything — see `cancel`'s doc.
-    timers: Arc<StdMutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    timers: Arc<StdMutex<HashMap<String, (u64, tokio::task::JoinHandle<()>)>>>,
+    /// Identifies each armed timer in `timers`, so a timer only ever takes
+    /// out its own entry — see `arm`.
+    next_timer: Arc<std::sync::atomic::AtomicU64>,
     /// Outstanding work items: an armed-but-not-yet-fired timer, a
     /// just-fired timer waiting for the `upload_gate`, and an upload
     /// actually in flight all count as exactly one unit each, decremented
@@ -681,14 +684,21 @@ pub struct WriteBackQueue {
     /// the end of the cycle and undoes whatever the upload put on the
     /// server instead of settling the (already removed) draft.
     discarded: Arc<StdMutex<HashSet<String>>>,
+    /// Flipped once by [`WriteBackQueue::shutdown`] (the drive was deleted,
+    /// or the app is quitting) and never back: from then on nothing in this
+    /// queue may reach the server again. `true` is also what every `run`
+    /// selects on, so an upload already under way is dropped mid-request
+    /// instead of finishing with the tokens of a drive that no longer
+    /// exists. A `watch` rather than a bare flag so a waiting task wakes.
+    stopped: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
 /// Scope guard for `WriteBackQueue::run` (phase 4, this task): removes
-/// `remote_path` from `in_flight` and decrements `busy` on drop —
-/// unconditionally, whether `run` returns normally or a panic unwinds
-/// through the `process` call it brackets. See `in_flight`'s field doc for
-/// the leak this closes and why a plain post-`.await` statement (the
-/// pre-this-task shape) cannot: a panic skips straight past it.
+/// `remote_path` from `in_flight` on drop — unconditionally, whether `run`
+/// returns normally or a panic unwinds through the `process` call it
+/// brackets. See `in_flight`'s field doc for the leak this closes and why a
+/// plain post-`.await` statement (the pre-this-task shape) cannot: a panic
+/// skips straight past it.
 struct RunGuard<'a> {
     queue: &'a WriteBackQueue,
     remote_path: &'a str,
@@ -698,7 +708,28 @@ impl Drop for RunGuard<'_> {
     fn drop(&mut self) {
         self.queue.in_flight.lock().unwrap().remove(self.remote_path);
         self.queue.discarded.lock().unwrap().remove(self.remote_path);
-        self.queue.busy.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Cancels an [`Uploader`]'s chunk workers when dropped — a no-op once its
+/// upload has returned.
+struct CancelOnDrop<'a>(&'a Uploader);
+
+impl Drop for CancelOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+/// Decrements `busy` on drop. Split from [`RunGuard`] and taken first
+/// thing in `run`: a run cancelled by [`WriteBackQueue::shutdown`] while
+/// still waiting for the `upload_gate` never built its `RunGuard`, and
+/// must still give back the unit `arm`/`enqueue_immediate` counted for it.
+struct BusyGuard<'a>(&'a WriteBackQueue);
+
+impl Drop for BusyGuard<'_> {
+    fn drop(&mut self) {
+        self.0.busy.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -718,6 +749,7 @@ impl WriteBackQueue {
             events,
             upload_gate: Arc::new(TokioMutex::new(())),
             timers: Arc::new(StdMutex::new(HashMap::new())),
+            next_timer: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             busy: Arc::new(AtomicUsize::new(0)),
             debounce: Arc::new(StdMutex::new(WRITEBACK_DEBOUNCE)),
             retry_backoff: Arc::new(StdMutex::new(UPLOAD_RETRY_BACKOFF)),
@@ -727,6 +759,26 @@ impl WriteBackQueue {
             in_flight: Arc::new(StdMutex::new(HashSet::new())),
             panic_next_upload: Arc::new(StdMutex::new(false)),
             discarded: Arc::new(StdMutex::new(HashSet::new())),
+            stopped: Arc::new(tokio::sync::watch::channel(false).0),
+        }
+    }
+
+    fn is_stopped(&self) -> bool {
+        *self.stopped.borrow()
+    }
+
+    /// Stops this queue for good — see `Vfs::shutdown`. Idempotent. Armed
+    /// debounce timers are aborted (their drafts stay on disk, `Pending`,
+    /// picked up by the next launch's resume); every `run` — waiting for
+    /// the gate or mid-upload — is dropped at its next poll; `arm`,
+    /// `enqueue_immediate`, `retry_pending` and the parked-retry sweep all
+    /// turn into no-ops.
+    pub fn shutdown(&self) {
+        self.stopped.send_replace(true);
+        let timers: Vec<_> = self.timers.lock().unwrap().drain().collect();
+        for (_path, (_id, handle)) in timers {
+            handle.abort();
+            self.busy.fetch_sub(1, Ordering::SeqCst);
         }
     }
 
@@ -768,8 +820,14 @@ impl WriteBackQueue {
         let streak = self.parked_retry_streak.fetch_add(1, Ordering::SeqCst).min(5);
         let delay = (*self.parked_retry_base.lock().unwrap() * 2u32.pow(streak)).min(PARKED_RETRY_MAX);
         let this = self.clone();
+        let mut stopped = self.stopped.subscribe();
         tokio::spawn(async move {
-            tokio::time::sleep(delay).await;
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                // Shut down: no sweep, and no task left holding the
+                // drive's client for up to ten minutes.
+                _ = stopped.wait_for(|s| *s) => return,
+            }
             this.parked_retry_scheduled.store(false, Ordering::SeqCst);
             this.retry_pending().await;
         });
@@ -780,6 +838,9 @@ impl WriteBackQueue {
     /// from this point on, even though the actual upload attempt waits out
     /// the debounce first.
     pub fn arm(&self, remote_path: String) {
+        if self.is_stopped() {
+            return;
+        }
         self.busy.fetch_add(1, Ordering::SeqCst);
         let _ = self
             .events
@@ -789,15 +850,40 @@ impl WriteBackQueue {
         let timers = self.timers.clone();
         let this = self.clone();
         let path_for_timer = remote_path.clone();
+        let id = self.next_timer.fetch_add(1, Ordering::SeqCst);
+        // Held across the spawn so the timer, however short its debounce,
+        // can only look for its own entry once that entry exists.
+        let mut armed = self.timers.lock().unwrap();
         let handle = tokio::spawn(async move {
             tokio::time::sleep(debounce).await;
             // Remove ourselves before doing any real work: once this has
             // run, a racing `cancel` for the same path must find nothing
             // and correctly report that it stopped nothing (see `cancel`).
-            timers.lock().unwrap().remove(&path_for_timer);
+            // Our entry gone (or replaced) means `cancel`/`shutdown` took
+            // it — and with it this cycle's `busy` unit — while this task
+            // was between its sleep and here, too late for `abort` to land
+            // first: running anyway would give the unit back twice.
+            {
+                let mut timers = timers.lock().unwrap();
+                match timers.remove(&path_for_timer) {
+                    Some((entry_id, _)) if entry_id == id => {}
+                    Some(other) => {
+                        timers.insert(path_for_timer, other);
+                        return;
+                    }
+                    None => return,
+                }
+            }
             this.run(path_for_timer).await;
         });
-        self.timers.lock().unwrap().insert(remote_path, handle);
+        if let Some((_, superseded)) = armed.insert(remote_path.clone(), (id, handle)) {
+            // Never expected (a path is armed again only once its timer
+            // fired or was cancelled); accounted like a cancel so the
+            // replaced cycle still gets its one terminal event.
+            superseded.abort();
+            self.busy.fetch_sub(1, Ordering::SeqCst);
+            let _ = self.events.send(crate::vfs::VfsEvent::UploadCancelled { remote_path });
+        }
     }
 
     /// Marks `remote_path` as deleted while its upload is in flight
@@ -860,7 +946,7 @@ impl WriteBackQueue {
     pub fn cancel(&self, remote_path: &str) -> bool {
         let handle = self.timers.lock().unwrap().remove(remote_path);
         match handle {
-            Some(handle) => {
+            Some((_id, handle)) => {
                 handle.abort();
                 self.busy.fetch_sub(1, Ordering::SeqCst);
                 true
@@ -960,6 +1046,9 @@ impl WriteBackQueue {
     /// interleaving (`tokio::join!` on this exact method is both, depending
     /// on the runtime — the `drafts` lock is what makes either case safe).
     pub async fn retry_pending(&self) -> usize {
+        if self.is_stopped() {
+            return 0;
+        }
         let candidates: Vec<String> = {
             let mut drafts = self.drafts.lock().await;
             let mut in_flight = self.in_flight.lock().unwrap();
@@ -1006,6 +1095,14 @@ impl WriteBackQueue {
     /// just-opened store BEFORE that store is even wrapped in its `Arc<Mutex>`
     /// — no lock, no await, needed at that call site.
     pub(crate) fn enqueue_immediate(&self, paths: Vec<String>) -> usize {
+        if self.is_stopped() {
+            // Release the claims `retry_pending` took for these.
+            let mut in_flight = self.in_flight.lock().unwrap();
+            for path in &paths {
+                in_flight.remove(path);
+            }
+            return 0;
+        }
         for path in &paths {
             self.busy.fetch_add(1, Ordering::SeqCst);
             let _ = self
@@ -1040,10 +1137,21 @@ impl WriteBackQueue {
     /// statements AFTER `process().await`, skipped entirely by a panic —
     /// see `in_flight`'s field doc for the full consequence.
     async fn run(&self, remote_path: String) {
-        let _gate = self.upload_gate.lock().await;
-        self.in_flight.lock().unwrap().insert(remote_path.clone());
-        let _guard = RunGuard { queue: self, remote_path: &remote_path };
-        self.process(&remote_path).await;
+        let _busy = BusyGuard(self);
+        let mut stopped = self.stopped.subscribe();
+        // `shutdown` drops the cycle wherever it is — waiting for the gate,
+        // or mid-request (the draft stays on disk; `DraftStore::open`
+        // demotes a leftover `Uploading` at the next launch).
+        tokio::select! {
+            biased;
+            _ = stopped.wait_for(|s| *s) => {}
+            _ = async {
+                let _gate = self.upload_gate.lock().await;
+                self.in_flight.lock().unwrap().insert(remote_path.clone());
+                let _guard = RunGuard { queue: self, remote_path: &remote_path };
+                self.process(&remote_path).await;
+            } => {}
+        }
     }
 
     /// D5 (conflict check) + upload + D6 (success promotion) / retry, for
@@ -1137,6 +1245,9 @@ impl WriteBackQueue {
         let backoff = *self.retry_backoff.lock().unwrap();
         let uploader =
             Uploader::new(self.client.clone(), Arc::new(NoSessionStore), UploaderConfig::default());
+        // The uploader sends its chunks from tasks of its own: dropping this
+        // future (`shutdown`, see `run`) must also stop those.
+        let _cancel_chunks = CancelOnDrop(&uploader);
 
         // Cycle B (phase-2 debt burn-down): a conflict copy always uploads
         // with `overwrite=false` (it's assumed to be brand new), so if a
