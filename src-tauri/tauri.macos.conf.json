@@ -1,0 +1,15 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "build": {
+    "beforeBundleCommand": "sh ../src-tauri/macos/finder-sync/build-helper.sh"
+  },
+  "bundle": {
+    "macOS": {
+      "signingIdentity": "-",
+      "hardenedRuntime": false,
+      "files": {
+        "Helpers/CloudreveSidebar.app": "../target/finder-sync/CloudreveSidebar.app"
+      }
+    }
+  }
+}

@@ -15,11 +15,14 @@
 //! so the day Apple removes the API, CI says so. Entries are found by a tag
 //! property set at insert time, never by resolving them (see [`TAG`]).
 //!
-//! The Favorites row shows the folder's own custom icon (Finder redraws the
-//! row from it — what SidebarFavorites' documentation calls the custom icon
-//! "fighting" its sidebar glyph on macOS 26), so setting the Cloudreve icon
-//! on the folder is what puts the logo in the sidebar. A mirror folder gets
-//! it through `NSWorkspace` (an `Icon\r` file); an on-demand drive's folder
+//! The folder gets the Cloudreve icon (Get Info, Finder windows, Dock), but
+//! the Favorites row does NOT show it: Finder draws only template glyphs in
+//! its sidebar (`ForceTemplateIcons`), and a folder with a custom icon gets
+//! the generic folder glyph there (the NFS volume root, the generic network
+//! one) — checked by eye on macOS 27.0.1. The row's Cloudreve glyph comes
+//! from the Finder Sync extension instead (`super::finder_sync`, fed by
+//! `set_glyph_folders`). A mirror folder gets
+//! its icon through `NSWorkspace` (an `Icon\r` file); an on-demand drive's folder
 //! is a volume root and gets a volume icon instead ([`set_volume_icon`]). Its
 //! files are seeded into the vfs before mounting
 //! (`SidebarBackend::volume_root_files`): written only after mounting, the
@@ -37,6 +40,7 @@ use objc2::AllocAnyThread;
 use objc2_app_kit::{NSImage, NSWorkspace, NSWorkspaceIconCreationOptions};
 use objc2_foundation::{NSData, NSString};
 
+use super::finder_sync::FinderSyncGlyph;
 use super::SidebarBackend;
 
 const ICON_ICNS: &[u8] = include_bytes!("../../../../src-tauri/icons/icon.icns");
@@ -219,7 +223,15 @@ fn clear_volume_icon(root: &Path) -> Result<()> {
     set_custom_icon_flag(root, false)
 }
 
-pub struct FinderSidebar;
+pub struct FinderSidebar {
+    glyph: FinderSyncGlyph,
+}
+
+impl FinderSidebar {
+    pub fn new() -> Self {
+        Self { glyph: FinderSyncGlyph::for_this_app() }
+    }
+}
 
 impl SidebarBackend for FinderSidebar {
     fn contains(&self, folder: &Path) -> Result<bool> {
@@ -312,5 +324,13 @@ impl SidebarBackend for FinderSidebar {
             files.push((".VolumeIcon.icns", ICON_ICNS.to_vec()));
         }
         files
+    }
+
+    fn set_glyph_folders(&self, folders: &[std::path::PathBuf]) -> Result<()> {
+        self.glyph.publish(folders)
+    }
+
+    fn glyph_folder_remounted(&self) {
+        self.glyph.remounted();
     }
 }

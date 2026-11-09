@@ -5,6 +5,7 @@ members = [
     "crates/cloudreve-sync",
     "crates/cloudreve-uploader",
     "crates/cloudreve-vfs",
+    "crates/cloudreve-finder-sync",
     "src-tauri",
 ]
 

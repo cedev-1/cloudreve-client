@@ -146,6 +146,14 @@ impl DriveManager {
 
         tracing::info!(target: "drive", count = count, "Loaded drive(s) from config");
 
+        // Every launch: the extension is registered again from wherever the
+        // app now lives (see `sidebar::finder_sync`).
+        let mut configs = Vec::new();
+        for mount in self.drives.read().await.values() {
+            configs.push(mount.get_config().await);
+        }
+        self.publish_sidebar_glyphs(&configs).await;
+
         // Start heartbeat monitoring after drives are loaded
         self.heartbeat_manager.start().await;
 
@@ -174,8 +182,26 @@ impl DriveManager {
             .context("Failed to write drive config file")?;
 
         tracing::info!(target: "drive", count = new_state.drives.len(), "Persisted drive(s) to config");
+        drop(write_guard);
+
+        // Every change of a toggle, every added or removed drive ends here.
+        self.publish_sidebar_glyphs(&new_state.drives).await;
 
         Ok(())
+    }
+
+    /// Hands the platform sidebar the folders whose row gets the Cloudreve
+    /// glyph (`SidebarBackend::set_glyph_folders`): every drive whose "show
+    /// in sidebar" toggle is on. A failure only costs the glyph.
+    async fn publish_sidebar_glyphs(&self, drives: &[DriveConfig]) {
+        let folders: Vec<PathBuf> =
+            drives.iter().filter(|d| d.sidebar.enabled).map(|d| d.sync_path.clone()).collect();
+        let backend = self.sidebar_backend.clone();
+        match tokio::task::spawn_blocking(move || backend.set_glyph_folders(&folders)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => tracing::warn!(target: "drive", ?err, "failed to give the drive folders their sidebar glyph"),
+            Err(err) => tracing::warn!(target: "drive", ?err, "sidebar glyph update panicked"),
+        }
     }
 
     /// Register a callback to be invoked when status UI changes
@@ -1077,6 +1103,8 @@ impl DriveManager {
 #[cfg(test)]
 mod tests {
     use super::conflicted_copy_path;
+    use crate::sidebar::SidebarBackend;
+    use crate::sidebar::tests::FakeSidebar;
     use super::DriveManager;
     use crate::drive::heartbeat::HeartbeatManager;
     use crate::drive::mounts::{Credentials, DriveConfig, DriveMode, Mount};
@@ -1369,6 +1397,11 @@ mod tests {
     /// A manager with NO drive yet, its config dir a temp dir: what the app
     /// has right before `load()` reads `drives.json` at launch.
     async fn empty_manager() -> (DriveManager, tempfile::TempDir) {
+        empty_manager_with_sidebar(Arc::new(crate::sidebar::NoSidebar)).await
+    }
+
+    /// [`empty_manager`] with `sidebar` as the platform sidebar.
+    async fn empty_manager_with_sidebar(sidebar: Arc<dyn SidebarBackend>) -> (DriveManager, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
         let inventory = Arc::new(InventoryDb::with_path(tmp.path().join("meta.db")).unwrap());
         let event_broadcaster = Arc::new(EventBroadcaster::new(16));
@@ -1388,7 +1421,7 @@ mod tests {
             event_broadcaster,
             summary_notifier,
             heartbeat_manager,
-            sidebar_backend: Arc::new(crate::sidebar::NoSidebar),
+            sidebar_backend: sidebar,
             vfs_mount_test_hook: std::sync::Mutex::new(None),
         };
         (manager, tmp)
@@ -1498,5 +1531,107 @@ mod tests {
         if let Ok(dir) = crate::drive::vfs_mode::cache_dir_for(&drive_id) {
             let _ = std::fs::remove_dir_all(dir);
         }
+    }
+
+    /// An on-demand drive (`MountTestHook`: no OS mount) whose folder is
+    /// `name` under `tmp`, with the given sidebar toggle.
+    fn on_demand_drive(tmp: &std::path::Path, name: &str, sidebar: bool) -> DriveConfig {
+        let sync_path = tmp.join(name);
+        std::fs::create_dir_all(&sync_path).unwrap();
+        DriveConfig {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.to_string(),
+            instance_url: "http://127.0.0.1:9".to_string(),
+            remote_path: "cloudreve://my".to_string(),
+            sync_path,
+            sse_client_id: uuid::Uuid::new_v4().to_string(),
+            mode: DriveMode::OnDemand,
+            sidebar: crate::sidebar::SidebarSettings { enabled: sidebar, added: sidebar },
+            ..Default::default()
+        }
+    }
+
+    /// Launches a manager on `drives` (written to drives.json, then
+    /// `load()`, as at every app start) with a fake sidebar.
+    async fn launch_with(drives: impl FnOnce(&std::path::Path) -> Vec<DriveConfig>)
+    -> (DriveManager, Arc<FakeSidebar>, Vec<DriveConfig>, tempfile::TempDir) {
+        let sidebar = Arc::new(FakeSidebar::default());
+        let (manager, tmp) = empty_manager_with_sidebar(sidebar.clone()).await;
+        manager.install_vfs_mount_hook_for_tests(MountTestHook::new());
+        let drives = drives(tmp.path());
+        let state = super::DriveState { drives: drives.clone() };
+        std::fs::write(manager.get_config_file(), serde_json::to_string(&state).unwrap()).unwrap();
+        manager.load().await.expect("launch");
+        (manager, sidebar, drives, tmp)
+    }
+
+    async fn cleanup(manager: DriveManager, drives: &[DriveConfig]) {
+        manager.shutdown().await;
+        for drive in drives {
+            if let Ok(dir) = crate::drive::vfs_mode::cache_dir_for(&drive.id) {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+    }
+
+    /// Finder draws the Cloudreve glyph only on the rows of folders the
+    /// app names (macOS: its Finder Sync extension). At launch: every
+    /// drive whose "show in sidebar" toggle is on, and only those.
+    #[tokio::test]
+    async fn at_launch_the_drives_shown_in_the_sidebar_get_the_glyph() {
+        let (manager, sidebar, drives, _tmp) = launch_with(|tmp| {
+            vec![on_demand_drive(tmp, "Cloudreve", true), on_demand_drive(tmp, "Archives", false)]
+        })
+        .await;
+
+        assert_eq!(sidebar.glyph_folders(), Some(vec![drives[0].sync_path.clone()]));
+        cleanup(manager, &drives).await;
+    }
+
+    #[tokio::test]
+    async fn turning_the_sidebar_toggle_off_or_on_takes_the_glyph_away_or_back() {
+        let (manager, sidebar, drives, _tmp) = launch_with(|tmp| {
+            vec![on_demand_drive(tmp, "Cloudreve", true), on_demand_drive(tmp, "Work", true)]
+        })
+        .await;
+
+        manager.set_drive_sidebar(&drives[0].id, false).await.expect("toggle off");
+        assert_eq!(sidebar.glyph_folders(), Some(vec![drives[1].sync_path.clone()]));
+
+        manager.set_drive_sidebar(&drives[0].id, true).await.expect("toggle on");
+        let mut both = sidebar.glyph_folders().unwrap();
+        both.sort();
+        let mut expected = vec![drives[0].sync_path.clone(), drives[1].sync_path.clone()];
+        expected.sort();
+        assert_eq!(both, expected);
+        cleanup(manager, &drives).await;
+    }
+
+    /// Through the same calls as the `remove_drive` command.
+    #[tokio::test]
+    async fn removing_the_last_drive_leaves_no_folder_with_the_glyph() {
+        let (manager, sidebar, drives, _tmp) = launch_with(|tmp| vec![on_demand_drive(tmp, "Cloudreve", true)]).await;
+
+        manager.remove_drive(&drives[0].id).await.expect("remove");
+        manager.persist().await.expect("persist");
+
+        assert_eq!(sidebar.glyph_folders(), Some(vec![]));
+        cleanup(manager, &drives).await;
+    }
+
+    /// After a pause or resume the folder is another node (the bare
+    /// mountpoint, then the volume root): Finder must be told again.
+    #[tokio::test]
+    async fn pausing_and_resuming_an_on_demand_drive_tells_finder_to_look_again() {
+        let (manager, sidebar, drives, _tmp) = launch_with(|tmp| vec![on_demand_drive(tmp, "Cloudreve", true)]).await;
+        let remounts = || sidebar.remounts.load(std::sync::atomic::Ordering::Relaxed);
+        let at_launch = remounts();
+        assert!(at_launch >= 1, "mounting at launch must tell Finder");
+
+        manager.pause_drive(&drives[0].id).await.expect("pause");
+        assert_eq!(remounts(), at_launch + 1, "the unmount must tell Finder");
+        manager.resume_drive(&drives[0].id).await.expect("resume");
+        assert_eq!(remounts(), at_launch + 2, "the remount must tell Finder");
+        cleanup(manager, &drives).await;
     }
 }

@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  CloudreveSidebar.app, embedded in Cloudreve.app/Contents/Helpers: the app
+  that contains the Finder Sync extension. Finder draws THIS app's
+  CFBundleSymbolName (from its Assets.car) on the sidebar rows of the
+  extension's folders; CFBundleIconFile is what System Settings shows for
+  the extension. Never launched (LSBackgroundOnly; its executable exits at
+  once). @VERSION@ is filled in by build-helper.sh.
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>Cloudreve</string>
+	<key>CFBundleExecutable</key>
+	<string>CloudreveSidebar</string>
+	<key>CFBundleIconFile</key>
+	<string>icon</string>
+	<key>CFBundleIcons</key>
+	<dict>
+		<key>CFBundlePrimaryIcon</key>
+		<dict>
+			<key>CFBundleSymbolName</key>
+			<string>custom.cloudreve.logo</string>
+		</dict>
+	</dict>
+	<key>CFBundleIdentifier</key>
+	<string>cloudreve.desktop.sidebar</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>Cloudreve</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>@VERSION@</string>
+	<key>CFBundleVersion</key>
+	<string>@VERSION@</string>
+	<key>LSBackgroundOnly</key>
+	<true/>
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+</dict>
+</plist>

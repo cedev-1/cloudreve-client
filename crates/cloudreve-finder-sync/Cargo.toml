@@ -1,0 +1,28 @@
+[package]
+name = "cloudreve-finder-sync"
+version.workspace = true
+edition = "2024"
+description = "Finder Sync extension that gives the drive folders' sidebar rows the Cloudreve glyph (macOS)"
+
+# The library is what the app and the extension share: the bundle ids, the
+# notification name and the folder list file. The binary is the extension.
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "cloudreve-finder-sync"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSURL", "NSSet", "NSNotification", "NSDistributedNotificationCenter", "NSObject", "NSRunLoop", "NSDate"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSWorkspace"] }
+objc2-finder-sync = { version = "0.3", default-features = false, features = ["std"] }
+
+[build-dependencies]
+cc = "1"

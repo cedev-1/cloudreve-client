@@ -501,6 +501,8 @@ impl Mount {
         let hook = self.vfs_mount_test_hook.lock().await.clone();
         let mounted = vfs_mode::attach(vfs, mountpoint, &name, &cache_dir, cap, hook.as_ref()).await?;
         *self.mounted_vfs.lock().await = mounted;
+        // A new node behind the folder: its sidebar glyph must be re-attached.
+        self.sidebar_backend().glyph_folder_remounted();
 
         Ok(())
     }
@@ -534,6 +536,7 @@ impl Mount {
             vfs_mode::attach(vfs, &sync_path, &name, &cache_dir, cap, hook.as_ref()).await?;
 
         *self.mounted_vfs.lock().await = mounted;
+        self.sidebar_backend().glyph_folder_remounted();
         Ok(())
     }
 
@@ -548,6 +551,8 @@ impl Mount {
         if let Err(err) = vfs_mode::detach(mounted, &mountpoint, hook.as_ref()).await {
             tracing::warn!(target: "drive::mounts", id = %self.id, ?err, "failed to unmount the on-demand vfs");
         }
+        // The bare mountpoint again: another node for the sidebar glyph.
+        self.sidebar_backend().glyph_folder_remounted();
     }
 
     /// "Retry" on an on-demand drive that failed to mount: attach it, then

@@ -811,6 +811,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "cloudreve-finder-sync"
+version = "0.3.0"
+dependencies = [
+ "cc",
+ "libc",
+ "objc2 0.6.4",
+ "objc2-app-kit",
+ "objc2-finder-sync",
+ "objc2-foundation 0.3.2",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "cloudreve-sync"
 version = "0.3.0"
 dependencies = [
@@ -818,6 +832,7 @@ dependencies = [
  "bytes",
  "chrono",
  "cloudreve-api",
+ "cloudreve-finder-sync",
  "cloudreve-uploader",
  "cloudreve-vfs",
  "dark-light",
@@ -3794,6 +3809,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c7a1c5fbb72d7735b076bb47b578523aedc40f3c439bea6dfd595c089d79d98a"
 dependencies = [
  "cc",
+]
+
+[[package]]
+name = "objc2-finder-sync"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f807a27e4fbd1fe1fe31ebfab86f754e06da9f64af10d0dacc2f408afd244de2"
+dependencies = [
+ "objc2 0.6.4",
+ "objc2-foundation 0.3.2",
 ]
 
 [[package]]

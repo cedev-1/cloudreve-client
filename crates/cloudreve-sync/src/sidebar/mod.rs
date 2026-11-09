@@ -21,8 +21,14 @@
 //!   ([`SidebarBackend::volume_root_files`]): the OS reads the volume root
 //!   as soon as it is mounted, before `set_icon` runs.
 //! - Removing the drive removes the entry (only if this code added it).
+//! - macOS draws only template glyphs in Finder's sidebar, so the folder
+//!   icon never shows on the row itself: the row's Cloudreve glyph comes
+//!   from the app's Finder Sync extension, given the folders of every drive
+//!   whose toggle is on ([`SidebarBackend::set_glyph_folders`], from every
+//!   `drives.json` save and every launch) and told when an on-demand
+//!   drive's volume comes and goes ([`SidebarBackend::glyph_folder_remounted`]).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -32,6 +38,8 @@ use serde::{Deserialize, Serialize};
 pub mod places;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "macos")]
+mod finder_sync;
 #[cfg(unix)]
 pub mod linux;
 
@@ -75,6 +83,20 @@ pub trait SidebarBackend: Send + Sync {
     fn volume_root_files(&self, _icon: bool) -> Vec<(&'static str, Vec<u8>)> {
         Vec::new()
     }
+    /// The drive folders whose sidebar row gets the Cloudreve GLYPH: every
+    /// drive whose toggle is on, the whole list each time, called again
+    /// and again with the same list (every `drives.json` save) — an
+    /// unchanged list must cost nothing. Finder draws only template glyphs
+    /// in its sidebar, so the folder's colour icon never shows there; on
+    /// macOS this feeds the app's Finder Sync extension
+    /// (`finder_sync`). Nothing elsewhere.
+    fn set_glyph_folders(&self, _folders: &[PathBuf]) -> Result<()> {
+        Ok(())
+    }
+    /// A drive folder's volume was just mounted or unmounted (on-demand
+    /// drives): Finder must be told again which folders get the glyph, the
+    /// node behind the path changed. Quick, never blocks.
+    fn glyph_folder_remounted(&self) {}
 }
 
 /// Does nothing: platforms without a backend, and every `Mount` until the
@@ -104,7 +126,7 @@ impl SidebarBackend for NoSidebar {
 pub fn platform_backend() -> Arc<dyn SidebarBackend> {
     #[cfg(target_os = "macos")]
     {
-        Arc::new(macos::FinderSidebar)
+        Arc::new(macos::FinderSidebar::new())
     }
     #[cfg(target_os = "linux")]
     {
@@ -217,6 +239,9 @@ pub(crate) mod tests {
         pub icons: Mutex<BTreeSet<PathBuf>>,
         pub calls: Mutex<Vec<String>>,
         pub broken: std::sync::atomic::AtomicBool,
+        /// Every `set_glyph_folders` list, in order.
+        pub glyphs: Mutex<Vec<Vec<PathBuf>>>,
+        pub remounts: std::sync::atomic::AtomicUsize,
     }
 
     impl FakeSidebar {
@@ -225,6 +250,10 @@ pub(crate) mod tests {
         }
         pub fn has_icon(&self, p: &str) -> bool {
             self.icons.lock().unwrap().contains(Path::new(p))
+        }
+        /// The folders given the glyph by the last `set_glyph_folders`.
+        pub fn glyph_folders(&self) -> Option<Vec<PathBuf>> {
+            self.glyphs.lock().unwrap().last().cloned()
         }
         /// The user drags the entry out of the sidebar.
         pub fn user_removes(&self, p: &str) {
@@ -264,6 +293,13 @@ pub(crate) mod tests {
             self.fail()?;
             self.icons.lock().unwrap().remove(folder);
             Ok(())
+        }
+        fn set_glyph_folders(&self, folders: &[PathBuf]) -> Result<()> {
+            self.glyphs.lock().unwrap().push(folders.to_vec());
+            Ok(())
+        }
+        fn glyph_folder_remounted(&self) {
+            self.remounts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
