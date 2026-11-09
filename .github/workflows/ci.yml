@@ -123,21 +123,3 @@ jobs:
           # --nocapture: the E2E checkpoints locate a native crash, which
           # prints no panic message.
           RUST_BACKTRACE=1 cargo test -p cloudreve-sync --test finder_sidebar_macos -- --include-ignored --nocapture --test-threads=1
-
-      - name: Mutations of the drive icon fix (temporary)
-        continue-on-error: true
-        run: |
-          T=an_on_demand_drive_folder_resolves_to_the_cloudreve_logo_even_once_finder_listed_it
-          run() {
-            echo "=== MUTATION $1"
-            eval "$2"
-            git diff --stat
-            cargo test -q -p cloudreve-sync --test finder_sidebar_macos -- --ignored --exact $T --test-threads=1 2>&1 | grep -E "RESOLVED|test result" || true
-            cargo test -q -p cloudreve-vfs --test mounted_macos the_mount_root_finder_info 2>&1 | grep -E "panicked|assertion|test result" || true
-            git checkout -- crates
-          }
-          run "baseline" "true"
-          run "no seeding" "perl -pi -e 's/volume_root_files\(show_icon\) \{/volume_root_files(show_icon).into_iter().take(0) {/' crates/cloudreve-sync/src/drive/mounts.rs"
-          run "put_local_only does nothing" "perl -pi -e 's/if junk::classify\(name\) != Some\(JunkKind::LocalOnly\) \{/if true { return Ok(()); } if false {/' crates/cloudreve-vfs/src/vfs.rs"
-          run "root sidecar not listed" "perl -pi -e 's/if dir == self\.vfs\.tree\(\)\.root\(\) \{/if false \&\& dir == self.vfs.tree().root() {/' crates/cloudreve-vfs/src/nfs.rs"
-          run "seeded without the custom-icon bit" "perl -pi -e 's/with_custom_icon\(\[0; 32\], icon\)/with_custom_icon([0; 32], false)/' crates/cloudreve-sync/src/sidebar/macos.rs"
