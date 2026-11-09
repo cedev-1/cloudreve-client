@@ -764,6 +764,11 @@ impl WriteBackQueue {
         true
     }
 
+    /// Whether an upload cycle for `remote_path` is running right now.
+    pub fn is_in_flight(&self, remote_path: &str) -> bool {
+        self.in_flight.lock().unwrap().contains(remote_path)
+    }
+
     fn is_discarded(&self, remote_path: &str) -> bool {
         self.discarded.lock().unwrap().contains(remote_path)
     }

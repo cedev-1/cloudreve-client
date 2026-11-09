@@ -1718,6 +1718,15 @@ impl Vfs {
         if matches!(self.drafts.lock().await.state(&new_path), Some(DraftState::Uploading)) {
             return Err(anyhow::Error::new(RenameBusyError { remote_path: new_path }));
         }
+        // Same for the source: a running upload targets `old_path` and
+        // cannot be redirected — accepting the rename would leave a stray
+        // copy under the old name and strand the moved draft. Busy until
+        // it lands (NFS: a transparent JUKEBOX retry by the client).
+        if self.write_queue.is_in_flight(&old_path)
+            || matches!(self.drafts.lock().await.state(&old_path), Some(DraftState::Uploading))
+        {
+            return Err(anyhow::Error::new(RenameBusyError { remote_path: old_path }));
+        }
 
         if source_is_junk {
             {

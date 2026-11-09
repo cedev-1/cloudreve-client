@@ -13,7 +13,7 @@ use std::time::Duration;
 use cloudreve_uploader::{
     NoSessionStore, ProgressCallback, ProgressUpdate, UploadParams, Uploader, UploaderConfig,
 };
-use cloudreve_vfs::vfs::{StaleHandleError, Vfs, VfsEvent, DEFAULT_CACHE_MAX_BYTES};
+use cloudreve_vfs::vfs::{RenameBusyError, StaleHandleError, Vfs, VfsEvent, DEFAULT_CACHE_MAX_BYTES};
 use cloudreve_vfs::writeback::{DraftState, UPLOAD_RETRIES};
 use common::{remote_dir, remote_file, uri_of, VfsTestEnv};
 use tempfile::NamedTempFile;
@@ -1840,4 +1840,54 @@ async fn deleting_a_new_file_while_its_upload_runs_leaves_nothing_on_the_server(
         env.last_deleted_uris()
     );
     assert!(vfs.lookup(root, "draft.txt").await.unwrap().is_none());
+}
+
+/// Rename a brand-new file while its upload is running: the running upload
+/// targets the OLD name and cannot be redirected. Accepting the rename left
+/// a stray copy under the old name on the server and the moved draft
+/// stranded (`Uploading`, no timer). The rename is refused as busy instead
+/// (NFS turns that into a transparent client-side retry) and succeeds once
+/// the upload is done, leaving only the new name.
+#[tokio::test]
+async fn renaming_a_file_while_its_upload_runs_is_busy_then_succeeds() {
+    let env = VfsTestEnv::new().await;
+    env.expect_uploads().await;
+    env.expect_namespace_ops().await;
+    env.set_remote_files(vec![]).await;
+    env.slow_down_chunk_uploads(Duration::from_millis(400));
+
+    let (vfs, _rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+    vfs.set_debounce_for_tests(Duration::from_millis(20));
+
+    let root = vfs.tree().root();
+    let (_node, h) = vfs.create(root, "Untitled.txt").await.unwrap();
+    vfs.write(h, 0, b"meeting notes").await.unwrap();
+    vfs.close(h).await.unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while env.uploaded_content("Untitled.txt").is_none() {
+        assert!(std::time::Instant::now() < deadline, "the upload never started");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // The mock does not list what it received: list it like the real
+    // server does once the upload completes.
+    env.set_remote_files(vec![remote_file("Untitled.txt", 13, "e-up")]).await;
+
+    let err = vfs
+        .rename(root, "Untitled.txt", root, "Meeting.txt")
+        .await
+        .expect_err("a rename racing the running upload must be refused");
+    assert!(err.downcast_ref::<RenameBusyError>().is_some(), "unexpected error: {err:#}");
+
+    vfs.wait_for_writeback_idle().await;
+    vfs.rename(root, "Untitled.txt", root, "Meeting.txt")
+        .await
+        .expect("once the upload is done the rename goes through");
+    vfs.wait_for_writeback_idle().await;
+
+    assert!(vfs.lookup(root, "Untitled.txt").await.unwrap().is_none());
+    assert!(vfs.lookup(root, "Meeting.txt").await.unwrap().is_some());
+    assert_eq!(env.last_rename().map(|(_, to)| to), Some("Meeting.txt".to_string()));
 }
