@@ -623,6 +623,51 @@ pub async fn get_user_profile(state: State<'_, AppStateHandle>) -> CommandResult
 mod tests {
     use super::*;
 
+    /// The settings window and the popup read these exact field names and
+    /// values (`ui/src/pages/settings/types.ts`, `ui/src/pages/popup/types.ts`):
+    /// a drive that could not be mounted must reach them as
+    /// `status: "mount_failed"` with its explanation, plus the count of
+    /// changes not uploaded yet that the remove dialog warns about.
+    #[test]
+    fn a_drive_that_failed_to_mount_reaches_the_ui_with_its_reason() {
+        let info = DriveInfo {
+            id: "d1".into(),
+            name: "Work".into(),
+            instance_url: "https://cloud.example".into(),
+            sync_path: "/home/ana/Cloud".into(),
+            icon_path: None,
+            remote_path: "cloudreve://my".into(),
+            raw_icon_path: None,
+            enabled: true,
+            paused: false,
+            user_id: "u".into(),
+            status: cloudreve_sync::DriveInfoStatus::MountFailed,
+            capacity: None,
+            mode: DriveMode::OnDemand,
+            mount_error: Some("Files on demand needs FUSE".into()),
+            unsynced_files: 3,
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["status"], "mount_failed");
+        assert_eq!(json["mode"], "on_demand");
+        assert_eq!(json["mount_error"], "Files on demand needs FUSE");
+        assert_eq!(json["unsynced_files"], 3);
+
+        let summary = StatusSummary {
+            drives: vec![],
+            active_tasks: vec![],
+            finished_tasks: vec![],
+            has_ever_synced: true,
+            conflicts: vec![],
+            paused_drives: vec![],
+            pending_uploads: [("d1".to_string(), 2u64)].into_iter().collect(),
+            mount_errors: [("d1".to_string(), "reason".to_string())].into_iter().collect(),
+        };
+        let json = serde_json::to_value(&summary).unwrap();
+        assert_eq!(json["mount_errors"]["d1"], "reason");
+        assert_eq!(json["pending_uploads"]["d1"], 2);
+    }
+
     /// `AddDriveArgs.mode` must default to `FullMirror` when the field is
     /// absent (old/naive callers, and today's actual `AddDrive.tsx` before
     /// this task wires the selector) and must carry `OnDemand` through when

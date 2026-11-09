@@ -7,6 +7,7 @@ pub use types::*;
 use crate::drive::commands::{ManagerCommand, MountCommand};
 use crate::drive::heartbeat::HeartbeatManager;
 use crate::drive::mounts::{Credentials, DriveConfig, DriveMode, Mount};
+use crate::drive::vfs_mode::{self, MountTestHook};
 use crate::{EventBroadcaster, SummaryNotifier};
 use crate::inventory::InventoryDb;
 use crate::sidebar::{self, SidebarBackend};
@@ -31,6 +32,10 @@ pub struct DriveManager {
     heartbeat_manager: HeartbeatManager,
     /// The platform "show in sidebar" backend, handed to every `Mount`.
     sidebar_backend: Arc<dyn SidebarBackend>,
+    /// Test-only: installed on every `Mount` this manager builds, so a
+    /// test can drive `load()`/`add_drive`/`resume_drive` without a real
+    /// OS mount (see `vfs_mode::MountTestHook`). `None` in production.
+    vfs_mount_test_hook: std::sync::Mutex<Option<Arc<MountTestHook>>>,
 }
 
 impl DriveManager {
@@ -63,6 +68,7 @@ impl DriveManager {
             summary_notifier,
             heartbeat_manager,
             sidebar_backend: sidebar::platform_backend(),
+            vfs_mount_test_hook: std::sync::Mutex::new(None),
         })
     }
 
@@ -102,7 +108,7 @@ impl DriveManager {
         // Add drives to manager
         let mut count = 0;
         for config in state.drives.iter() {
-            match self.add_drive(config.clone()).await {
+            match self.add_drive_inner(config.clone(), true).await {
                 Ok(_) => {
                     count += 1;
                 }
@@ -189,7 +195,17 @@ impl DriveManager {
     }
 
     /// Add a new drive
-    pub async fn add_drive(&self, mut config: DriveConfig) -> Result<String> {
+    /// Adds a NEW drive (the add-drive window). If an on-demand drive's
+    /// folder cannot be mounted, nothing is added and the error is the
+    /// plain-language explanation for the user.
+    pub async fn add_drive(&self, config: DriveConfig) -> Result<String> {
+        self.add_drive_inner(config, false).await
+    }
+
+    /// `keep_on_mount_failure`: `load()` (an existing drive at launch) keeps
+    /// an on-demand drive whose mount failed, flagged with the reason (see
+    /// `Mount::mount_problem`), instead of dropping it.
+    async fn add_drive_inner(&self, mut config: DriveConfig, keep_on_mount_failure: bool) -> Result<String> {
         // Fetch favicon if icon_path is not set or doesn't exist
         if config.icon_path.is_none()
             || !config
@@ -244,9 +260,35 @@ impl DriveManager {
         )
         .await;
         mount.set_sidebar_backend(self.sidebar_backend.clone());
+        let test_hook = self.vfs_mount_test_hook.lock().unwrap().clone();
+        if let Some(hook) = test_hook {
+            mount.install_vfs_mount_hook_for_tests(hook).await;
+        }
         if let Err(e) = mount.start().await {
-            tracing::error!(target: "drive", error = ?e, "Failed to start drive");
-            return Err(e).context("Failed to start drive");
+            tracing::error!(target: "drive", drive_id = %config.id, error = ?e, "Failed to start drive");
+            if mode != DriveMode::OnDemand {
+                return Err(e).context("Failed to start drive");
+            }
+            let problem = vfs_mode::classify_mount_error(&e);
+            let message = vfs_mode::mount_problem_message(problem, &config.sync_path);
+            if !keep_on_mount_failure {
+                // A brand-new drive: nothing to keep, no draft can exist yet.
+                // Tear down the facade `start` built and its cache folder.
+                mount.shutdown().await;
+                if let Ok(cache_dir) = vfs_mode::cache_dir_for(&config.id) {
+                    let _ = std::fs::remove_dir_all(cache_dir);
+                }
+                return Err(anyhow::anyhow!(message));
+            }
+            // An existing drive at launch: keep it listed and saved, with the
+            // reason, instead of dropping it (the next `persist()` would have
+            // erased it from drives.json). Its facade still runs, so uploads
+            // left from the last session go on; "Retry" re-attaches it.
+            crate::utils::toast::send_warning_toast(
+                &t!("mountFailedTitle", drive = config.name.as_str()),
+                &message,
+            );
+            mount.set_mount_problem(Some(message));
         }
 
         let mount_arc = Arc::new(mount);
@@ -581,6 +623,12 @@ impl DriveManager {
 
     /// Pause a drive: stop background workers and cancel tasks, but keep the
     /// mount alive so it can be resumed.
+    /// Test-only: see `vfs_mount_test_hook`'s field doc.
+    #[doc(hidden)]
+    pub fn install_vfs_mount_hook_for_tests(&self, hook: Arc<MountTestHook>) {
+        *self.vfs_mount_test_hook.lock().unwrap() = Some(hook);
+    }
+
     pub async fn pause_drive(&self, id: &str) -> Result<()> {
         let read_guard = self.drives.read().await;
         let mount = read_guard
@@ -623,7 +671,23 @@ impl DriveManager {
                 // NOT re-spawned here on purpose — see
                 // `spawn_vfs_event_pump`'s doc: `pause()` never stopped it,
                 // so it is still draining the same `Vfs`'s events right now.
-                mount.remount_on_demand().await?;
+                // Also "Retry" for a drive that failed to mount (see
+                // `Mount::mount_problem`): same remount, with the outcome
+                // recorded for the UI either way.
+                let recovering = mount.mount_problem().is_some();
+                let remounted =
+                    if recovering { mount.retry_mount().await } else { mount.remount_on_demand().await };
+                if let Err(e) = remounted {
+                    tracing::error!(target: "drive::manager", drive_id = %id, error = ?e, "Failed to mount the on-demand drive");
+                    let sync_path = mount.get_sync_path().await;
+                    let message = vfs_mode::mount_problem_message(vfs_mode::classify_mount_error(&e), &sync_path);
+                    mount.set_mount_problem(Some(message.clone()));
+                    return Err(anyhow::anyhow!(message));
+                }
+                mount.set_mount_problem(None);
+                // A facade built only now (its first build failed) gets its
+                // event pump; a no-op when one already drains it.
+                mount.spawn_vfs_event_pump().await;
                 mount.spawn_remote_event_processor(mount.clone()).await;
                 mount.spawn_props_refresh_task().await;
             }
@@ -674,6 +738,7 @@ impl DriveManager {
         let mut has_ever_synced = false;
         let mut paused_drives = Vec::new();
         let mut pending_uploads = HashMap::new();
+        let mut mount_errors = HashMap::new();
         for mount in read_guard.values() {
             let config = mount.get_config().await;
             // D7: an on-demand drive never runs `FullSync`
@@ -693,10 +758,16 @@ impl DriveManager {
                 has_ever_synced = true;
             }
             if config.mode == DriveMode::OnDemand {
-                pending_uploads.insert(
-                    config.id.clone(),
-                    mount.vfs_pending_uploads.load(std::sync::atomic::Ordering::Relaxed),
-                );
+                // Files whose changes are not on the server yet — including
+                // a save parked after failed attempts, which the upload-cycle
+                // counter (`vfs_pending_uploads`) no longer counts. Never
+                // below that counter, which can briefly run ahead of a
+                // draft's creation.
+                let in_flight = mount.vfs_pending_uploads.load(std::sync::atomic::Ordering::Relaxed);
+                pending_uploads.insert(config.id.clone(), mount.unsynced_file_count().await.max(in_flight));
+                if let Some(message) = mount.mount_problem() {
+                    mount_errors.insert(config.id.clone(), message);
+                }
             }
             if mount.is_paused() {
                 paused_drives.push(mount.id.clone());
@@ -784,6 +855,7 @@ impl DriveManager {
             conflicts,
             paused_drives,
             pending_uploads,
+            mount_errors,
         })
     }
 
@@ -880,7 +952,10 @@ impl DriveManager {
             let drive_state = mount.get_status_flags().await;
 
             // Determine drive status
-            let status = if drive_state.is_credential_expired() {
+            let mount_error = mount.mount_problem();
+            let status = if mount_error.is_some() {
+                DriveInfoStatus::MountFailed
+            } else if drive_state.is_credential_expired() {
                 DriveInfoStatus::CredentialExpired
             } else if !self.heartbeat_manager.is_online() {
                 DriveInfoStatus::Offline
@@ -890,6 +965,7 @@ impl DriveManager {
                 DriveInfoStatus::Active
             };
 
+            let unsynced_files = mount.unsynced_file_count().await;
             drives_info.push(DriveInfo {
                 id: config.id.clone(),
                 name: config.name.clone(),
@@ -904,6 +980,8 @@ impl DriveManager {
                 status,
                 capacity,
                 mode: config.mode,
+                mount_error,
+                unsynced_files,
             });
         }
 
@@ -1003,6 +1081,8 @@ mod tests {
     use crate::drive::heartbeat::HeartbeatManager;
     use crate::drive::mounts::{Credentials, DriveConfig, DriveMode, Mount};
     use crate::drive::vfs_mode::MountTestHook;
+    use super::DriveInfoStatus;
+
     use crate::inventory::InventoryDb;
     use crate::{EventBroadcaster, SummaryNotifier};
     use std::collections::HashMap;
@@ -1127,6 +1207,7 @@ mod tests {
             summary_notifier,
             heartbeat_manager,
             sidebar_backend: Arc::new(crate::sidebar::NoSidebar),
+            vfs_mount_test_hook: std::sync::Mutex::new(None),
         };
 
         (manager, drive_id, hook, tmp)
@@ -1241,5 +1322,181 @@ mod tests {
         let drive = saved.drives.iter().find(|d| d.id == drive_id).expect("drive saved");
         assert!(!drive.sidebar.enabled, "the choice was not saved");
         assert!(!manager.get_drive_sidebar(&drive_id).await.unwrap());
+    }
+
+    /// A save that could not be uploaded (server error, offline) must keep
+    /// showing as waiting to upload — in the popup and before removing the
+    /// drive — for as long as the change is not on the server. Before, the
+    /// count fell back to 0 as soon as the attempts failed, so the popup
+    /// said everything was fine while the edit existed only on this Mac.
+    #[tokio::test]
+    async fn a_change_that_failed_to_upload_still_counts_as_waiting() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v4/file"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0, "msg": "",
+                "data": {
+                    "files": [],
+                    "pagination": { "page": 1, "page_size": 500, "total_items": 0 },
+                    "props": { "max_page_size": 10000, "order_by_options": ["name"], "order_direction_options": ["asc"] },
+                },
+            })))
+            .mount(&server)
+            .await;
+        // No upload endpoint: every attempt fails.
+        let (manager, drive_id, _hook, _tmp) = manager_with_one_on_demand_drive_at(&server.uri()).await;
+        let mount = manager.drives.read().await.get(&drive_id).unwrap().clone();
+        mount.spawn_vfs_event_pump().await;
+        let vfs = mount.vfs.lock().await.clone().expect("on-demand vfs");
+        vfs.set_debounce_for_tests(Duration::from_millis(10));
+        vfs.set_retry_backoff_for_tests([Duration::from_millis(5), Duration::from_millis(5)]);
+        vfs.set_parked_retry_delay_for_tests(Duration::from_secs(600));
+
+        let root = vfs.tree().root();
+        let (_node, h) = vfs.create(root, "minutes.txt").await.expect("create");
+        vfs.write(h, 0, b"decisions").await.expect("write");
+        vfs.close(h).await.expect("close");
+        vfs.wait_for_writeback_idle().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let summary = manager.get_status_summary(None).await.unwrap();
+        assert_eq!(summary.pending_uploads.get(&drive_id).copied(), Some(1));
+        let info = manager.get_drives_info().await.unwrap().into_iter().find(|d| d.id == drive_id).unwrap();
+        assert_eq!(info.unsynced_files, 1);
+    }
+
+    /// A manager with NO drive yet, its config dir a temp dir: what the app
+    /// has right before `load()` reads `drives.json` at launch.
+    async fn empty_manager() -> (DriveManager, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let inventory = Arc::new(InventoryDb::with_path(tmp.path().join("meta.db")).unwrap());
+        let event_broadcaster = Arc::new(EventBroadcaster::new(16));
+        let summary_notifier = Arc::new(SummaryNotifier::new(event_broadcaster.clone()));
+        let drives: Arc<RwLock<HashMap<String, Arc<Mount>>>> = Arc::new(RwLock::new(HashMap::new()));
+        let heartbeat_manager = HeartbeatManager::new(drives.clone(), event_broadcaster.clone());
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
+        let config_dir = tmp.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let manager = DriveManager {
+            drives,
+            config_dir,
+            inventory,
+            command_tx,
+            command_rx: Arc::new(Mutex::new(Some(command_rx))),
+            processor_handle: Arc::new(Mutex::new(None)),
+            event_broadcaster,
+            summary_notifier,
+            heartbeat_manager,
+            sidebar_backend: Arc::new(crate::sidebar::NoSidebar),
+            vfs_mount_test_hook: std::sync::Mutex::new(None),
+        };
+        (manager, tmp)
+    }
+
+    /// An on-demand drive that cannot be mounted at launch (here: its folder
+    /// is not empty; in real life also FUSE missing, a dead mount left by a
+    /// crash, ...) must NOT vanish: before the fix `load()` skipped it and
+    /// the next `persist()` (every quit) erased it from `drives.json` for
+    /// good — the user lost the drive, and with it the pending uploads in
+    /// its cache. It must stay listed with a clear, actionable error, and
+    /// "Retry" must bring it up once the cause is fixed.
+    #[tokio::test]
+    async fn an_on_demand_drive_that_fails_to_mount_at_launch_is_kept_with_an_error_and_can_be_retried() {
+        let (manager, tmp) = empty_manager().await;
+        let hook = MountTestHook::new();
+        manager.install_vfs_mount_hook_for_tests(hook.clone());
+
+        let sync_path = tmp.path().join("Cloud Drive");
+        std::fs::create_dir_all(&sync_path).unwrap();
+        std::fs::write(sync_path.join("old report.docx"), b"left over").unwrap();
+        let drive_id = uuid::Uuid::new_v4().to_string();
+        let config = DriveConfig {
+            id: drive_id.clone(),
+            name: "Work".to_string(),
+            instance_url: "http://127.0.0.1:9".to_string(),
+            remote_path: "cloudreve://my".to_string(),
+            credentials: Credentials {
+                access_token: Some("a".to_string()),
+                refresh_token: "r".to_string(),
+                refresh_expires: "2099-01-01T00:00:00Z".to_string(),
+                access_expires: Some("2099-01-01T00:00:00Z".to_string()),
+            },
+            sync_path: sync_path.clone(),
+            enabled: true,
+            user_id: "u".to_string(),
+            sse_client_id: uuid::Uuid::new_v4().to_string(),
+            mode: DriveMode::OnDemand,
+            ..Default::default()
+        };
+        let state = super::DriveState { drives: vec![config] };
+        std::fs::write(manager.get_config_file(), serde_json::to_string(&state).unwrap()).unwrap();
+
+        manager.load().await.expect("a drive failing to mount must not fail the whole launch");
+
+        let infos = manager.get_drives_info().await.unwrap();
+        let info = infos.iter().find(|d| d.id == drive_id).expect("the drive must still be listed");
+        assert!(matches!(info.status, DriveInfoStatus::MountFailed), "status: {:?}", info.status);
+        let message = info.mount_error.clone().expect("an explanation for the user");
+        assert!(message.contains("Cloud Drive"), "the message must name the folder: {message}");
+        assert!(message.to_lowercase().contains("empty"), "the message must say what to do: {message}");
+        let summary = manager.get_status_summary(None).await.unwrap();
+        assert_eq!(summary.mount_errors.get(&drive_id), Some(&message), "the popup must show it too");
+        assert_eq!(hook.mount_count(), 0);
+
+        // Quitting must keep the drive in drives.json.
+        manager.persist().await.unwrap();
+        let saved: super::DriveState =
+            serde_json::from_str(&std::fs::read_to_string(manager.get_config_file()).unwrap()).unwrap();
+        assert!(saved.drives.iter().any(|d| d.id == drive_id), "the drive was erased from drives.json");
+
+        // Retry while still broken: same clear error, still listed.
+        let err = manager.resume_drive(&drive_id).await.expect_err("still not empty");
+        assert!(err.to_string().contains("Cloud Drive"), "unexpected error: {err}");
+
+        // The user moves the file away and clicks Retry.
+        std::fs::remove_file(sync_path.join("old report.docx")).unwrap();
+        manager.resume_drive(&drive_id).await.expect("retry once the folder is empty");
+        assert_eq!(hook.mount_count(), 1);
+        let infos = manager.get_drives_info().await.unwrap();
+        let info = infos.iter().find(|d| d.id == drive_id).unwrap();
+        assert!(info.mount_error.is_none());
+        assert!(!matches!(info.status, DriveInfoStatus::MountFailed));
+
+        manager.shutdown().await;
+        if let Ok(dir) = crate::drive::vfs_mode::cache_dir_for(&drive_id) {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// Adding a NEW drive from the window: a mount failure is reported with
+    /// the same plain-language explanation (not "Failed to start drive"),
+    /// and the drive is not added half-way.
+    #[tokio::test]
+    async fn adding_an_on_demand_drive_on_a_non_empty_folder_explains_what_to_do() {
+        let (manager, tmp) = empty_manager().await;
+        manager.install_vfs_mount_hook_for_tests(MountTestHook::new());
+        let sync_path = tmp.path().join("Documents");
+        std::fs::create_dir_all(&sync_path).unwrap();
+        std::fs::write(sync_path.join("taxes.pdf"), b"x").unwrap();
+        let drive_id = uuid::Uuid::new_v4().to_string();
+        let config = DriveConfig {
+            id: drive_id.clone(),
+            name: "Home".to_string(),
+            instance_url: "http://127.0.0.1:9".to_string(),
+            remote_path: "cloudreve://my".to_string(),
+            sync_path,
+            sse_client_id: uuid::Uuid::new_v4().to_string(),
+            mode: DriveMode::OnDemand,
+            ..Default::default()
+        };
+
+        let err = manager.add_drive(config).await.expect_err("a non-empty folder cannot be mounted on");
+        let message = err.to_string();
+        assert!(message.contains("Documents") && message.to_lowercase().contains("empty"), "{message}");
+        assert!(manager.list_drives().await.is_empty(), "a failed add must not leave a drive behind");
+        if let Ok(dir) = crate::drive::vfs_mode::cache_dir_for(&drive_id) {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 }

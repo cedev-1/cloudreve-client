@@ -228,6 +228,12 @@ pub struct Mount {
     /// Test-only: see `vfs_mode::MountTestHook`'s doc. `None` on every
     /// production path.
     vfs_mount_test_hook: Mutex<Option<Arc<MountTestHook>>>,
+    /// On-demand mode only: why the drive is not mounted right now, in
+    /// plain language for the user (see `vfs_mode::mount_problem_message`),
+    /// or `None` when it is mounted (or paused on purpose). Set when
+    /// mounting fails at launch or on "Retry"; the drive stays listed and
+    /// saved instead of vanishing — see `DriveManager::add_drive_inner`.
+    mount_problem: std::sync::Mutex<Option<String>>,
     /// Where "show in sidebar" lands. [`NoSidebar`] until the `DriveManager`
     /// installs the platform one (`set_sidebar_backend`) before `start()`:
     /// a `Mount` built anywhere else (tests) never edits the real sidebar.
@@ -339,6 +345,7 @@ impl Mount {
             vfs_pending_uploads: std::sync::atomic::AtomicU64::new(0),
             vfs_failed_uploads: std::sync::atomic::AtomicU64::new(0),
             vfs_mount_test_hook: Mutex::new(None),
+            mount_problem: std::sync::Mutex::new(None),
             sidebar_backend: std::sync::RwLock::new(Arc::new(NoSidebar)),
             sync_lock: Mutex::new(()),
             cr_client,
@@ -472,12 +479,15 @@ impl Mount {
         let (vfs, events) =
             vfs_mode::build_vfs(self.cr_client.clone(), remote_path, &cache_dir, cap)?;
 
-        let hook = self.vfs_mount_test_hook.lock().await.clone();
-        let mounted =
-            vfs_mode::attach(vfs.clone(), mountpoint, &name, &cache_dir, cap, hook.as_ref()).await?;
-
-        *self.vfs.lock().await = Some(vfs);
+        // Kept BEFORE attaching, so a failed mount still leaves the facade
+        // running: drafts left by the last session keep uploading (`Vfs::new`
+        // already re-queued them), and "Retry" re-attaches this same
+        // instance through `remount_on_demand`.
+        *self.vfs.lock().await = Some(vfs.clone());
         *self.vfs_events.lock().await = Some(events);
+
+        let hook = self.vfs_mount_test_hook.lock().await.clone();
+        let mounted = vfs_mode::attach(vfs, mountpoint, &name, &cache_dir, cap, hook.as_ref()).await?;
         *self.mounted_vfs.lock().await = mounted;
 
         Ok(())
@@ -489,9 +499,12 @@ impl Mount {
     /// OS-level attachment was ever torn down (`unmount_on_demand`), so
     /// this never touches `Vfs::new`/`build_vfs` again.
     pub async fn remount_on_demand(&self) -> Result<()> {
-        let vfs = self.vfs.lock().await.clone().context(
-            "on-demand remount requested but no vfs was ever built for this drive — was start() called?",
-        )?;
+        // Never built (the very first `start` failed before the facade
+        // existed): build and attach it now, like `start` would have.
+        let Some(vfs) = self.vfs.lock().await.clone() else {
+            let sync_path = self.get_sync_path().await;
+            return self.start_on_demand(&sync_path).await;
+        };
 
         let (sync_path, name) = {
             let config = self.config.read().await;
@@ -523,6 +536,33 @@ impl Mount {
         if let Err(err) = vfs_mode::detach(mounted, &mountpoint, hook.as_ref()).await {
             tracing::warn!(target: "drive::mounts", id = %self.id, ?err, "failed to unmount the on-demand vfs");
         }
+    }
+
+    /// "Retry" on an on-demand drive that failed to mount: attach it, then
+    /// do what `start()` does once a drive is up (the sidebar entry).
+    pub async fn retry_mount(&self) -> Result<()> {
+        self.remount_on_demand().await?;
+        self.apply_sidebar_at_start().await;
+        Ok(())
+    }
+
+    /// On-demand only: files with changes not on the server yet (see
+    /// `Vfs::unsynced_file_count`); 0 for a mirror drive.
+    pub async fn unsynced_file_count(&self) -> u64 {
+        let vfs = self.vfs.lock().await.clone();
+        match vfs {
+            Some(vfs) => vfs.unsynced_file_count().await as u64,
+            None => 0,
+        }
+    }
+
+    /// See `mount_problem`'s field doc.
+    pub fn mount_problem(&self) -> Option<String> {
+        self.mount_problem.lock().unwrap().clone()
+    }
+
+    pub fn set_mount_problem(&self, message: Option<String>) {
+        *self.mount_problem.lock().unwrap() = message;
     }
 
     /// Test-only: install a substitute for the real OS mount/unmount calls
@@ -1155,6 +1195,18 @@ impl Mount {
         // never wrote any rows, but a leftover cache dir would otherwise
         // accumulate forever across add/remove cycles.
         if self.config.read().await.mode == DriveMode::OnDemand {
+            // The cache holds the drafts — changes not on the server yet.
+            // Give uploads already under way a chance to land first; the
+            // settings window warned the user about whatever is left
+            // (`DriveInfo::unsynced_files`).
+            let vfs = self.vfs.lock().await.clone();
+            if let Some(vfs) = vfs {
+                let _ = tokio::time::timeout(Duration::from_secs(20), vfs.wait_for_writeback_idle()).await;
+                let left = vfs.unsynced_file_count().await;
+                if left > 0 {
+                    tracing::warn!(target: "drive::mounts", id = %self.id, left, "removing an on-demand drive with changes that were never uploaded");
+                }
+            }
             match vfs_mode::cache_dir_for(&self.id) {
                 Ok(cache_dir) => {
                     if let Err(err) = std::fs::remove_dir_all(&cache_dir)

@@ -19,7 +19,9 @@ mod event_handler;
 #[macro_use]
 extern crate rust_i18n;
 
-i18n!("../locales");
+// English for any locale without a translation (en-GB, pt-BR, ...),
+// instead of showing raw message keys.
+i18n!("../locales", fallback = "en-US");
 
 fn init_i18n() {
     use rust_i18n::set_locale;

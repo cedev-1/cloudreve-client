@@ -113,13 +113,129 @@ fn ensure_mountpoint_ready(mountpoint: &Path) -> Result<()> {
         .next()
         .is_some();
     if has_entries {
-        anyhow::bail!(
-            "on-demand mountpoint {} is not empty — move its contents aside before enabling \
-             on-demand mode for this drive",
-            mountpoint.display()
-        );
+        return Err(anyhow::Error::new(MountpointNotEmpty { mountpoint: mountpoint.to_path_buf() }));
     }
     Ok(())
+}
+
+/// The drive folder already holds files: mounting on top would hide them.
+#[derive(Debug)]
+pub struct MountpointNotEmpty {
+    pub mountpoint: PathBuf,
+}
+
+impl std::fmt::Display for MountpointNotEmpty {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "on-demand mountpoint {} is not empty — move its contents aside before enabling \
+             on-demand mode for this drive",
+            self.mountpoint.display()
+        )
+    }
+}
+
+impl std::error::Error for MountpointNotEmpty {}
+
+/// Linux: what a FUSE mount needs is missing — the `/dev/fuse` device or
+/// the `fusermount3`/`fusermount` helper (the `fuse3` package).
+#[derive(Debug)]
+pub struct FuseUnavailable {
+    pub missing: &'static str,
+}
+
+impl std::fmt::Display for FuseUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "FUSE is not available on this system: {} is missing", self.missing)
+    }
+}
+
+impl std::error::Error for FuseUnavailable {}
+
+/// Checks, before trying, what a Linux FUSE mount needs: the `/dev/fuse`
+/// device and a `fusermount3` (or legacy `fusermount`) helper on `path_var`
+/// (the `PATH`). Without this, both failures surface from fuser as a bare
+/// "No such file or directory" or "Unexpected EOF reading from
+/// fusermount" that nobody can act on.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn check_fuse_prerequisites(dev_fuse: &Path, path_var: Option<&std::ffi::OsStr>) -> Result<(), FuseUnavailable> {
+    if !dev_fuse.exists() {
+        return Err(FuseUnavailable { missing: "/dev/fuse" });
+    }
+    let found = path_var
+        .map(|paths| {
+            std::env::split_paths(paths)
+                .any(|dir| dir.join("fusermount3").is_file() || dir.join("fusermount").is_file())
+        })
+        .unwrap_or(false);
+    if !found {
+        return Err(FuseUnavailable { missing: "fusermount3" });
+    }
+    Ok(())
+}
+
+/// Why an on-demand drive could not be mounted, in terms of what the user
+/// can do about it — see [`classify_mount_error`] and
+/// [`mount_problem_message`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MountProblem {
+    /// The folder holds files ([`MountpointNotEmpty`]).
+    FolderNotEmpty,
+    /// Linux: FUSE is not installed or not usable ([`FuseUnavailable`]).
+    FuseMissing,
+    /// The OS refused (EPERM/EACCES): macOS privacy settings, or a folder
+    /// the user does not own.
+    PermissionDenied,
+    /// A dead mount from an earlier session is still attached and could
+    /// not be removed (ENOTCONN, or something still sitting inside it).
+    StaleMount,
+    Other,
+}
+
+/// Classifies a failed `attach` (or any mount-path error) by its typed
+/// causes first, then by the OS error codes in its chain.
+pub fn classify_mount_error(err: &anyhow::Error) -> MountProblem {
+    if err.chain().any(|c| c.downcast_ref::<MountpointNotEmpty>().is_some()) {
+        return MountProblem::FolderNotEmpty;
+    }
+    if err.chain().any(|c| c.downcast_ref::<FuseUnavailable>().is_some()) {
+        return MountProblem::FuseMissing;
+    }
+    let codes: Vec<i32> = err
+        .chain()
+        .filter_map(|c| c.downcast_ref::<std::io::Error>().and_then(|io| io.raw_os_error()))
+        .collect();
+    let text = format!("{err:#}");
+    if codes.contains(&libc::ENOTCONN) || text.contains("Transport endpoint is not connected") {
+        return MountProblem::StaleMount;
+    }
+    if text.contains("after exhausting the escalation chain") {
+        return MountProblem::StaleMount;
+    }
+    if codes.iter().any(|c| *c == libc::EPERM || *c == libc::EACCES)
+        || text.contains("Operation not permitted")
+        || text.contains("Permission denied")
+    {
+        return MountProblem::PermissionDenied;
+    }
+    MountProblem::Other
+}
+
+/// The plain-language explanation shown to the user (settings, popup,
+/// notification, add-drive window) for `problem` on the drive folder
+/// `folder`: what happened and what to do.
+pub fn mount_problem_message(problem: MountProblem, folder: &Path) -> String {
+    let folder = folder.display().to_string();
+    match problem {
+        MountProblem::FolderNotEmpty => t!("mountErrorFolderNotEmpty", folder = folder).into_owned(),
+        MountProblem::FuseMissing => t!("mountErrorFuseMissing").into_owned(),
+        MountProblem::PermissionDenied if cfg!(target_os = "macos") => {
+            t!("mountErrorPermissionMac", folder = folder).into_owned()
+        }
+        MountProblem::PermissionDenied => t!("mountErrorPermission", folder = folder).into_owned(),
+        MountProblem::StaleMount => t!("mountErrorStale", folder = folder).into_owned(),
+        MountProblem::Other => t!("mountErrorOther", folder = folder).into_owned(),
+    }
 }
 
 /// Constructs the on-demand `Vfs` facade for one drive. Real local I/O only
@@ -254,6 +370,9 @@ pub async fn attach(
         return Ok(None);
     }
 
+    #[cfg(target_os = "linux")]
+    check_fuse_prerequisites(Path::new("/dev/fuse"), std::env::var_os("PATH").as_deref())?;
+
     let mounted = os_mount(vfs, mountpoint, volume_name, cache_dir)
         .await
         .with_context(|| format!("failed to mount the on-demand vfs at {}", mountpoint.display()))?;
@@ -376,6 +495,73 @@ mod tests {
     fn ensure_mountpoint_ready_accepts_an_existing_empty_directory() {
         let base = tempfile::tempdir().unwrap();
         ensure_mountpoint_ready(base.path()).unwrap();
+    }
+
+    /// Each failure a user can hit maps to the explanation that tells them
+    /// what to do — built from real error shapes, as the mount path wraps
+    /// them in context.
+    #[test]
+    fn mount_failures_are_classified_by_what_the_user_can_do() {
+        let not_empty = anyhow::Error::new(MountpointNotEmpty { mountpoint: PathBuf::from("/home/ana/Cloud") })
+            .context("failed to mount");
+        assert_eq!(classify_mount_error(&not_empty), MountProblem::FolderNotEmpty);
+
+        let fuse = anyhow::Error::new(FuseUnavailable { missing: "fusermount3" });
+        assert_eq!(classify_mount_error(&fuse), MountProblem::FuseMissing);
+
+        let dead = anyhow::Error::new(std::io::Error::from_raw_os_error(libc::ENOTCONN))
+            .context("failed to inspect the on-demand mountpoint /home/ana/Cloud");
+        assert_eq!(classify_mount_error(&dead), MountProblem::StaleMount);
+
+        let stuck = anyhow::anyhow!("failed to unmount /home/ana/Cloud after exhausting the escalation chain");
+        assert_eq!(classify_mount_error(&stuck), MountProblem::StaleMount);
+
+        let denied = anyhow::anyhow!("mount_nfs failed (status Some(1)): mount_nfs: can't mount / from 127.0.0.1 onto /Users/ana/Cloud: Operation not permitted")
+            .context("failed to mount the on-demand vfs at /Users/ana/Cloud");
+        assert_eq!(classify_mount_error(&denied), MountProblem::PermissionDenied);
+        let eacces = anyhow::Error::new(std::io::Error::from_raw_os_error(libc::EACCES)).context("create");
+        assert_eq!(classify_mount_error(&eacces), MountProblem::PermissionDenied);
+
+        let other = anyhow::anyhow!("binding the in-process nfs3 server to 127.0.0.1:0");
+        assert_eq!(classify_mount_error(&other), MountProblem::Other);
+    }
+
+    #[test]
+    fn every_mount_problem_has_a_message_naming_the_folder_or_the_fix() {
+        let folder = Path::new("/home/ana/Cloud Drive");
+        for problem in [
+            MountProblem::FolderNotEmpty,
+            MountProblem::PermissionDenied,
+            MountProblem::StaleMount,
+            MountProblem::Other,
+        ] {
+            let message = mount_problem_message(problem, folder);
+            assert!(message.contains("/home/ana/Cloud Drive"), "{problem:?}: {message}");
+        }
+        assert!(mount_problem_message(MountProblem::FuseMissing, folder).contains("fuse3"));
+    }
+
+    #[test]
+    fn fuse_prerequisites_need_the_device_and_the_helper() {
+        let dir = tempfile::tempdir().unwrap();
+        let dev = dir.path().join("fuse");
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let path_var = std::env::join_paths([bin.clone()]).unwrap();
+
+        let err = check_fuse_prerequisites(&dev, Some(&path_var)).unwrap_err();
+        assert_eq!(err.missing, "/dev/fuse");
+
+        std::fs::write(&dev, b"").unwrap();
+        let err = check_fuse_prerequisites(&dev, Some(&path_var)).unwrap_err();
+        assert_eq!(err.missing, "fusermount3");
+        assert!(check_fuse_prerequisites(&dev, None).is_err());
+
+        std::fs::write(bin.join("fusermount"), b"").unwrap();
+        check_fuse_prerequisites(&dev, Some(&path_var)).expect("legacy fusermount is enough");
+        std::fs::remove_file(bin.join("fusermount")).unwrap();
+        std::fs::write(bin.join("fusermount3"), b"").unwrap();
+        check_fuse_prerequisites(&dev, Some(&path_var)).expect("fusermount3 is enough");
     }
 
     #[test]

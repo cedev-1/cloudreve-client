@@ -25,4 +25,6 @@ pub const USER_AGENT: &str = concat!("cloudreve-desktop/", env!("CARGO_PKG_VERSI
 #[macro_use]
 extern crate rust_i18n;
 
-i18n!("../../locales");
+// English for any locale without a translation (en-GB, pt-BR, ...),
+// instead of showing raw message keys.
+i18n!("../../locales", fallback = "en-US");

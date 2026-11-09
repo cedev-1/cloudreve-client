@@ -34,6 +34,10 @@ pub struct StatusSummary {
     /// counting rules.
     #[serde(default)]
     pub pending_uploads: HashMap<String, u64>,
+    /// On-demand drives whose folder is not mounted, by drive id: the
+    /// plain-language reason and what to do (`Mount::mount_problem`).
+    #[serde(default)]
+    pub mount_errors: HashMap<String, String>,
 }
 
 /// A file conflict awaiting user resolution
@@ -149,6 +153,14 @@ pub struct DriveInfo {
     pub capacity: Option<CapacitySummary>,
     /// Full mirror vs. on-demand (D1)
     pub mode: DriveMode,
+    /// On-demand only: why the drive folder is not mounted, in plain
+    /// language (what happened and what to do), when `status` is
+    /// `MountFailed`.
+    pub mount_error: Option<String>,
+    /// On-demand only: files with changes not on the server yet (being
+    /// edited, waiting, uploading, or parked after failed attempts) — what
+    /// removing the drive now would lose.
+    pub unsynced_files: u64,
 }
 
 /// Drive status for the settings UI
@@ -163,6 +175,9 @@ pub enum DriveInfoStatus {
     CredentialExpired,
     /// Network connection is offline
     Offline,
+    /// On-demand drive whose folder could not be mounted: see
+    /// `DriveInfo::mount_error` for the explanation shown to the user.
+    MountFailed,
 }
 
 /// Format bytes into a human-readable string (e.g., "1.5 GB")
