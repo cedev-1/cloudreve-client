@@ -12,7 +12,8 @@
 //! `~/Library/Application Support/com.apple.sharedfilelist` is TCC-protected
 //! (EPERM even to read it from a terminal) and owned by `sharedfilelistd`.
 //! `tests/finder_sidebar_macos.rs` re-proves the round trip on every CI run,
-//! so the day Apple removes the API, CI says so.
+//! so the day Apple removes the API, CI says so. Entries are found by a tag
+//! property set at insert time, never by resolving them (see [`TAG`]).
 //!
 //! The Favorites row shows the folder's own custom icon (Finder redraws the
 //! row from it — what SidebarFavorites' documentation calls the custom icon
@@ -23,7 +24,7 @@
 
 use std::ffi::c_void;
 use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use objc2::rc::autoreleasepool;
@@ -37,10 +38,18 @@ const ICON_ICNS: &[u8] = include_bytes!("../../../../src-tauri/icons/icon.icns")
 
 type CFTypeRef = *const c_void;
 
-// kLSSharedFileListNoUserInteraction | kLSSharedFileListDoNotMountVolumes:
-// resolving an entry must never pop a dialog nor mount a network volume
-// (a stale entry for an old 127.0.0.1 NFS mount must not be remounted).
-const RESOLVE_FLAGS: u32 = 1 | 2;
+/// Item property tagging the Favorites entries this app added, valued with
+/// the drive folder's path. Entries are found by it, never by resolving
+/// their bookmark: the app looks its entry up right when the on-demand
+/// volume is NOT mounted (removing a drive, after its unmount; the toggle
+/// of a paused drive), and resolving an entry of an unmounted volume
+/// returns NULL (measured on a detached RAM volume, macOS 27) — the entry
+/// could not be found, so not removed. Resolving also stats the target,
+/// which a dead NFS server can hang. A property read touches neither the
+/// file system nor the network. Measured on macOS 27.0.1: set at insert time, a fresh process
+/// reads it back. Per-item properties are what SidebarFavorites relies on
+/// too (`com.apple.LSSharedFileList.OverrideIcon.OSType`).
+const TAG: &std::ffi::CStr = c"org.cloudreve.client.sync-path";
 
 #[link(name = "CoreServices", kind = "framework")]
 unsafe extern "C" {
@@ -48,7 +57,7 @@ unsafe extern "C" {
     static kLSSharedFileListItemLast: CFTypeRef;
     fn LSSharedFileListCreate(alloc: CFTypeRef, list_type: CFTypeRef, options: CFTypeRef) -> CFTypeRef;
     fn LSSharedFileListCopySnapshot(list: CFTypeRef, seed: *mut u32) -> CFTypeRef;
-    fn LSSharedFileListItemCopyResolvedURL(item: CFTypeRef, flags: u32, error: *mut CFTypeRef) -> CFTypeRef;
+    fn LSSharedFileListItemCopyProperty(item: CFTypeRef, name: CFTypeRef) -> CFTypeRef;
     fn LSSharedFileListInsertItemURL(
         list: CFTypeRef,
         after: CFTypeRef,
@@ -63,19 +72,35 @@ unsafe extern "C" {
 
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
+    static kCFTypeDictionaryKeyCallBacks: c_void;
+    static kCFTypeDictionaryValueCallBacks: c_void;
     fn CFRelease(cf: CFTypeRef);
+    fn CFEqual(a: CFTypeRef, b: CFTypeRef) -> u8;
     fn CFArrayGetCount(array: CFTypeRef) -> isize;
     fn CFArrayGetValueAtIndex(array: CFTypeRef, index: isize) -> CFTypeRef;
     fn CFURLCreateFromFileSystemRepresentation(alloc: CFTypeRef, buf: *const u8, len: isize, is_dir: u8) -> CFTypeRef;
-    fn CFURLGetFileSystemRepresentation(url: CFTypeRef, resolve: u8, buf: *mut u8, max: isize) -> u8;
+    fn CFStringCreateWithBytes(alloc: CFTypeRef, bytes: *const u8, len: isize, encoding: u32, external: u8) -> CFTypeRef;
+    fn CFDictionaryCreate(
+        alloc: CFTypeRef,
+        keys: *const CFTypeRef,
+        values: *const CFTypeRef,
+        count: isize,
+        key_callbacks: *const c_void,
+        value_callbacks: *const c_void,
+    ) -> CFTypeRef;
 }
+
+const UTF8: u32 = 0x0800_0100; // kCFStringEncodingUTF8
 
 /// Owns one CoreFoundation reference.
 struct Cf(CFTypeRef);
 
 impl Cf {
     fn new(ptr: CFTypeRef) -> Option<Self> {
-        (!ptr.is_null()).then_some(Self(ptr))
+        // Not `then_some(Self(ptr))`: that builds the `Cf` eagerly and drops
+        // it on NULL, and `CFRelease(NULL)` traps (SIGTRAP) — which is what
+        // killed the first CI runs as soon as any CF call returned NULL.
+        if ptr.is_null() { None } else { Some(Self(ptr)) }
     }
 }
 
@@ -96,41 +121,35 @@ fn url_of(path: &Path) -> Result<Cf> {
     Cf::new(url).with_context(|| format!("not a valid file URL: {}", path.display()))
 }
 
-fn path_of_url(url: CFTypeRef) -> Option<PathBuf> {
-    let mut buf = vec![0u8; 4096];
-    let ok = unsafe { CFURLGetFileSystemRepresentation(url, 1, buf.as_mut_ptr(), buf.len() as isize) };
-    if ok == 0 {
-        return None;
-    }
-    let len = buf.iter().position(|&b| b == 0)?;
-    Some(PathBuf::from(std::ffi::OsStr::from_bytes(&buf[..len])))
+fn cf_string(s: &[u8]) -> Result<Cf> {
+    Cf::new(unsafe { CFStringCreateWithBytes(std::ptr::null(), s.as_ptr(), s.len() as isize, UTF8, 0) })
+        .context("CFStringCreateWithBytes returned NULL")
 }
 
-/// `folder` as Finder resolves it (`/tmp` → `/private/tmp`), or as given
-/// when it cannot be resolved.
-fn normalized(folder: &Path) -> PathBuf {
-    std::fs::canonicalize(folder).unwrap_or_else(|_| folder.to_path_buf())
+/// The tag value for `folder`: its path exactly as the drive config holds
+/// it (no `canonicalize`: that would stat a possibly dead mount).
+fn tag_value(folder: &Path) -> Result<Cf> {
+    cf_string(folder.as_os_str().as_bytes())
 }
 
-/// The Favorites items pointing to `folder`, with the list they belong to.
-fn matching_items(folder: &Path) -> Result<(Cf, Cf, Vec<CFTypeRef>)> {
+/// The Favorites items this app tagged for `folder`, with the list they
+/// belong to and the snapshot they borrow from (kept alive by the caller).
+fn tagged_items(folder: &Path) -> Result<(Cf, Cf, Vec<CFTypeRef>)> {
     let list = favorites()?;
     let mut seed = 0u32;
     let snapshot = Cf::new(unsafe { LSSharedFileListCopySnapshot(list.0, &mut seed) })
         .context("LSSharedFileListCopySnapshot returned NULL")?;
-    let target = normalized(folder);
+    let key = cf_string(TAG.to_bytes())?;
+    let want = tag_value(folder)?;
     let mut items = Vec::new();
     for i in 0..unsafe { CFArrayGetCount(snapshot.0) } {
         let item = unsafe { CFArrayGetValueAtIndex(snapshot.0, i) };
-        let Some(url) = Cf::new(unsafe { LSSharedFileListItemCopyResolvedURL(item, RESOLVE_FLAGS, std::ptr::null_mut()) })
-        else {
-            continue;
-        };
-        if path_of_url(url.0).is_some_and(|p| p == target || p == folder) {
+        if let Some(value) = Cf::new(unsafe { LSSharedFileListItemCopyProperty(item, key.0) })
+            && unsafe { CFEqual(value.0, want.0) } != 0
+        {
             items.push(item);
         }
     }
-    // `items` borrow from `snapshot`, which the caller keeps alive.
     Ok((list, snapshot, items))
 }
 
@@ -171,10 +190,10 @@ fn set_custom_icon_flag(path: &Path, on: bool) -> Result<()> {
 
 /// A volume root's icon, the way Finder has always read it: the image in
 /// `.VolumeIcon.icns` at the root, the custom-icon bit in the root's
-/// FinderInfo. Plain file I/O on purpose: with `NSWorkspace.setIcon` on the
-/// NFS mount root, called from a blocking thread (every caller here is),
-/// the real-mount CI test died of SIGTRAP with no panic, while the same
-/// call on a plain folder works from any thread (CI and macOS 27). On the mount both names
+/// FinderInfo. AppKit writes the same thing for a volume root (measured on
+/// an HFS+ RAM volume), but plain file I/O keeps AppKit off the NFS mount
+/// and off this blocking thread, and its result is pinned by tests
+/// (`tests/finder_sidebar_macos.rs`). On the mount both names
 /// are local-only junk (`cloudreve_vfs::junk`): never uploaded.
 fn set_volume_icon(root: &Path) -> Result<()> {
     let icns = root.join(".VolumeIcon.icns");
@@ -195,7 +214,7 @@ pub struct FinderSidebar;
 
 impl SidebarBackend for FinderSidebar {
     fn contains(&self, folder: &Path) -> Result<bool> {
-        Ok(!matching_items(folder)?.2.is_empty())
+        Ok(!tagged_items(folder)?.2.is_empty())
     }
 
     fn add(&self, folder: &Path, _label: &str) -> Result<()> {
@@ -204,6 +223,22 @@ impl SidebarBackend for FinderSidebar {
         // does not honor the display name or icon", 2013), so none is.
         let list = favorites()?;
         let url = url_of(folder)?;
+        let key = cf_string(TAG.to_bytes())?;
+        let value = tag_value(folder)?;
+        let properties = Cf::new(unsafe {
+            CFDictionaryCreate(
+                std::ptr::null(),
+                &key.0,
+                &value.0,
+                1,
+                &kCFTypeDictionaryKeyCallBacks,
+                &kCFTypeDictionaryValueCallBacks,
+            )
+        })
+        .context("CFDictionaryCreate returned NULL")?;
+        // Inserting a URL already in Favorites updates that entry (one row,
+        // measured): a re-add, or the folder already there by hand, ends up
+        // as one tagged entry.
         let item = unsafe {
             LSSharedFileListInsertItemURL(
                 list.0,
@@ -211,7 +246,7 @@ impl SidebarBackend for FinderSidebar {
                 std::ptr::null(),
                 std::ptr::null(),
                 url.0,
-                std::ptr::null(),
+                properties.0,
                 std::ptr::null(),
             )
         };
@@ -221,7 +256,7 @@ impl SidebarBackend for FinderSidebar {
     }
 
     fn remove(&self, folder: &Path) -> Result<()> {
-        let (list, _snapshot, items) = matching_items(folder)?;
+        let (list, _snapshot, items) = tagged_items(folder)?;
         for item in items {
             let status = unsafe { LSSharedFileListItemRemove(list.0, item) };
             if status != 0 {

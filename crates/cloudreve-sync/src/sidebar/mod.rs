@@ -56,7 +56,9 @@ pub trait SidebarBackend: Send + Sync {
     fn contains(&self, folder: &Path) -> Result<bool>;
     /// Must not duplicate an entry that is already there.
     fn add(&self, folder: &Path, label: &str) -> Result<()>;
-    /// Removes every entry pointing to `folder`; none is not an error.
+    /// Removes every entry this backend added for `folder` (on macOS the
+    /// entries it tagged, on Linux every bookmark of the folder); none is
+    /// not an error.
     fn remove(&self, folder: &Path) -> Result<()>;
     fn set_icon(&self, folder: &Path) -> Result<()>;
     fn clear_icon(&self, folder: &Path) -> Result<()>;

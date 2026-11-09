@@ -49,11 +49,17 @@ fn a_folder_is_added_to_finder_favorites_with_the_logo_and_removed_again() {
     std::fs::create_dir(&folder).unwrap();
     let backend = sidebar::platform_backend();
     let cleanup = Cleanup(backend.clone(), folder.clone());
+    // A second drive's folder, also tagged: removing one drive must leave
+    // the other's entry alone.
+    let other = tmp.path().join("Cloudreve Second Drive");
+    std::fs::create_dir(&other).unwrap();
+    let cleanup_other = Cleanup(backend.clone(), other.clone());
+    backend.add(&other, "Second").unwrap();
 
     // Everything is observed first and asserted only after the entry is
-    // gone: a failing assertion once crashed the process (SIGTRAP, AppKit
-    // loaded, libtest capturing output) before the guard could run, and
-    // left a dead entry in a developer's sidebar.
+    // gone: a crash (a SIGTRAP from native code never unwinds) would skip
+    // the guard and leave a dead entry in a developer's sidebar — which a
+    // `CFRelease(NULL)` bug in the backend once did.
     let listed_before = backend.contains(&folder).unwrap();
     backend.add(&folder, "Cloudreve").unwrap();
     let listed_after_add = backend.contains(&folder).unwrap();
@@ -61,6 +67,9 @@ fn a_folder_is_added_to_finder_favorites_with_the_logo_and_removed_again() {
     backend.add(&folder, "Cloudreve").unwrap();
     backend.remove(&folder).unwrap();
     let listed_after_one_remove = backend.contains(&folder).unwrap();
+    let other_kept = backend.contains(&other).unwrap();
+    backend.remove(&other).unwrap();
+    drop(cleanup_other);
 
     backend.add(&folder, "Cloudreve").unwrap();
     backend.set_icon(&folder).unwrap();
@@ -76,6 +85,7 @@ fn a_folder_is_added_to_finder_favorites_with_the_logo_and_removed_again() {
     assert!(!listed_before, "a fresh folder cannot already be a favorite");
     assert!(listed_after_add, "LSSharedFileList did not add the folder");
     assert!(!listed_after_one_remove, "a second add left a duplicate behind");
+    assert!(other_kept, "removing one drive's entry took another drive's entry too");
     assert!(icon_set, "the folder has no custom icon");
     assert!(icon_file, "AppKit stores the image in Icon\\r");
     assert!(!listed_at_end, "the entry is still in Favorites");
@@ -152,8 +162,8 @@ async fn observe(backend: Arc<dyn SidebarBackend>, folder: PathBuf) -> (bool, bo
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn an_on_demand_drive_keeps_its_favorite_and_logo_across_a_relaunch() {
-    // `E2E` checkpoints: a crash in AppKit/CoreServices kills the process
-    // without a panic message; the last line printed says where.
+    // `E2E` checkpoints: a crash in native code kills the process without
+    // a panic message; the last line printed says where.
     eprintln!("E2E start");
     let backend = sidebar::platform_backend();
     let mut env = TestEnv::with_real_mount_and_sidebar(backend.clone()).await;
