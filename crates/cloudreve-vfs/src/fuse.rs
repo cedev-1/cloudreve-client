@@ -35,23 +35,21 @@
 //! life of the mount (the caller's already-running runtime, in practice —
 //! see `mount::mount`'s Linux branch).
 //!
-//! One consequence worth stating plainly: `Session::run()`'s own doc
-//! (`session.rs`) says its read-dispatch loop is "non-concurrent... but the
-//! filesystem methods may run concurrent by spawning threads" — this
-//! adapter does NOT spawn extra threads per call, so at most one FUSE
-//! operation is ever in flight against `VfsFuse` at a time. That is
-//! actually what makes the EBUSY contract below deterministic rather than
-//! scheduler-luck-dependent (contrast with `nfs.rs`'s module doc, which
-//! could only pin `RenameBusyError`'s mapping with a direct unit test): a
-//! `rename` FUSE call and an already-open file's `read`/`write` calls can
-//! never race each other inside this process — but a handle opened by one
-//! `open()` call still very much persists in `Vfs::open_files` across the
-//! *separate*, later FUSE call that eventually `release`s it, exactly like
-//! a real file descriptor. So `open` a file, keep holding it (its `fh`
-//! lives in the KERNEL now, not on this thread's stack), and a `rename` of
-//! that same path arriving as its own later, separate FUSE call reliably
-//! finds `Vfs::rename`'s `is_subtree_open` guard tripped — no race, no
-//! scheduler dependency. See `tests/mounted_linux.rs`'s EBUSY test.
+//! Concurrency: `Session::run()`'s own doc (`session.rs`) says its
+//! read-dispatch loop is "non-concurrent... but the filesystem methods may
+//! run concurrent by spawning threads". Requests that can wait on the
+//! network or on another request — `lookup`, `getattr`, `readdir`, `open`,
+//! `read`, `unlink`/`rmdir`, `rename` — run as tasks on the runtime
+//! ([`VfsFuse::spawn`]) and reply when done, so one slow download never
+//! freezes the mount, and an `unlink`/`rename` waiting out
+//! [`crate::vfs::BUSY_GRACE`] for a late `release` (the kernel sends it
+//! asynchronously, possibly after the app's next request) leaves the
+//! dispatch thread free to deliver that `release`. `create`, `write`,
+//! `flush`, `release`, `mkdir` and `setattr` stay inline. A handle opened
+//! by one `open()` call persists in `Vfs::open_files` until its `release`,
+//! exactly like a real file descriptor, so `rename`/`unlink` of a file
+//! some app still holds open answers EBUSY once the grace runs out. See
+//! `tests/mounted_linux.rs`'s EBUSY test.
 //!
 //! ## Handle model (D6)
 //!
@@ -168,6 +166,21 @@ impl VfsFuse {
     fn block_on<F: Future>(&self, fut: F) -> F::Output {
         self.rt.block_on(fut)
     }
+
+    /// Runs a call on the runtime instead of blocking fuser's single
+    /// dispatch thread, replying from the task when the facade answers —
+    /// see the module doc's concurrency paragraph. Without this, ONE read
+    /// waiting on the network (opening a large video, a slow server) froze
+    /// every other request on the mount: the file manager hung on a plain
+    /// folder listing until that download finished. A spawned read never
+    /// outlives its handle: the kernel sends `release` only once every
+    /// request holding the file has been answered.
+    fn spawn<F>(&self, fut: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.rt.spawn(fut);
+    }
 }
 
 impl Filesystem for VfsFuse {
@@ -177,62 +190,43 @@ impl Filesystem for VfsFuse {
             return;
         };
         let vfs = self.vfs.clone();
-        match self.block_on(vfs.lookup(NodeId(parent), name)) {
-            Ok(Some((id, attr))) => reply.entry(&ATTR_TTL, &to_file_attr(&to_frontend_attr(id.0, &attr)), 0),
-            // Lookup miss: the facade's `Ok(None)`, not an error — same
-            // "constructed at the call site" pattern as `nfs.rs`'s
-            // `FrontendErrno::NotFound` (see that module's doc).
-            Ok(None) => reply.error(libc::ENOENT),
-            Err(err) => reply.error(errno_for(&err)),
-        }
+        let name = name.to_string();
+        self.spawn(async move {
+            match vfs.lookup(NodeId(parent), &name).await {
+                Ok(Some((id, attr))) => reply.entry(&ATTR_TTL, &to_file_attr(&to_frontend_attr(id.0, &attr)), 0),
+                // Lookup miss: the facade's `Ok(None)`, not an error — same
+                // "constructed at the call site" pattern as `nfs.rs`'s
+                // `FrontendErrno::NotFound` (see that module's doc).
+                Ok(None) => reply.error(libc::ENOENT),
+                Err(err) => reply.error(errno_for(&err)),
+            }
+        });
     }
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         let vfs = self.vfs.clone();
-        match self.block_on(vfs.getattr(NodeId(ino))) {
-            Ok(Some(attr)) => reply.attr(&ATTR_TTL, &to_file_attr(&to_frontend_attr(ino, &attr))),
-            Ok(None) => reply.error(libc::ENOENT),
-            Err(err) => reply.error(errno_for(&err)),
-        }
+        self.spawn(async move {
+            match vfs.getattr(NodeId(ino)).await {
+                Ok(Some(attr)) => reply.attr(&ATTR_TTL, &to_file_attr(&to_frontend_attr(ino, &attr))),
+                Ok(None) => reply.error(libc::ENOENT),
+                Err(err) => reply.error(errno_for(&err)),
+            }
+        });
     }
 
-    fn readdir(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
+    fn readdir(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, offset: i64, reply: ReplyDirectory) {
         let vfs = self.vfs.clone();
-        let listing = match self.block_on(vfs.readdir(NodeId(ino))) {
-            Ok(listing) => listing,
-            Err(err) => {
-                reply.error(errno_for(&err));
-                return;
-            }
-        };
-        // Same cookie scheme as `nfs.rs`'s `VfsReadDirIter`: the offset
-        // handed back with each entry is `1 + <its index in this
-        // snapshot>`, so resuming at that offset starts right after it. A
-        // client-supplied `offset` past the end of a fresh snapshot (the
-        // directory shrank between two paged calls) just yields an empty
-        // `.skip()` — an empty reply is FUSE's own end-of-stream signal
-        // (`lib.rs`'s `readdir` doc: "Send an empty buffer on end of
-        // stream"), unlike NFSv3's explicit `BAD_COOKIE` error code.
-        // Clamped the same way `read`/`write` clamp their own `offset`:
-        // the kernel never sends a negative one in practice, but a bare
-        // `as usize` cast on one would wrap to a huge value instead of the
-        // intended "start from 0".
-        for (index, (id, attr)) in listing.iter().enumerate().skip(offset.max(0) as usize) {
-            let kind = if attr.is_dir { FileType::Directory } else { FileType::RegularFile };
-            let buffer_full = reply.add(id.0, (index + 1) as i64, kind, &attr.name);
-            if buffer_full {
-                break;
-            }
-        }
-        reply.ok();
+        self.spawn(async move { readdir_reply(vfs, ino, offset, reply).await });
     }
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
         let vfs = self.vfs.clone();
-        match self.block_on(vfs.open(NodeId(ino))) {
-            Ok(handle) => reply.opened(handle.0, 0),
-            Err(err) => reply.error(errno_for(&err)),
-        }
+        self.spawn(async move {
+            match vfs.open(NodeId(ino)).await {
+                Ok(handle) => reply.opened(handle.0, 0),
+                Err(err) => reply.error(errno_for(&err)),
+            }
+        });
     }
 
     fn read(
@@ -249,12 +243,26 @@ impl Filesystem for VfsFuse {
         let vfs = self.vfs.clone();
         // The kernel never sends a negative offset in practice; clamped
         // rather than asserted so a malformed request degrades to "read
-        // from the start" instead of panicking a shared FUSE thread.
+        // from the start" instead of panicking.
         let offset = offset.max(0) as u64;
-        match self.block_on(vfs.read(FileHandle(fh), offset, size)) {
-            Ok(data) => reply.data(&data),
-            Err(err) => reply.error(errno_for(&err)),
-        }
+        self.spawn(async move {
+            match vfs.read(FileHandle(fh), offset, size).await {
+                Ok(data) => reply.data(&data),
+                Err(err) => reply.error(errno_for(&err)),
+            }
+        });
+    }
+
+    /// Without this, fuser answers 0 blocks: `df` shows a 0-byte drive and
+    /// file managers see no free space (Nautilus refuses to copy into a
+    /// volume it thinks is full). The facade has no quota to report, so
+    /// this mirrors the macOS mount, whose NFS server reports 1 TiB total
+    /// and free.
+    fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: fuser::ReplyStatfs) {
+        const BLOCK: u32 = 4096;
+        const BLOCKS: u64 = (1u64 << 40) / BLOCK as u64; // 1 TiB
+        const FILES: u64 = 1_000_000;
+        reply.statfs(BLOCKS, BLOCKS, BLOCKS, FILES, FILES, BLOCK, 255, BLOCK);
     }
 
     fn write(
@@ -390,15 +398,19 @@ impl Filesystem for VfsFuse {
             return;
         };
         let vfs = self.vfs.clone();
-        match self.block_on(vfs.rename(NodeId(parent), name, NodeId(newparent), newname)) {
-            Ok(()) => reply.ok(),
-            // This is the mapping the whole phase-3 FUSE task exists to make
-            // real: `RenameBusyError` -> `FrontendErrno::Busy` -> `EBUSY`,
-            // reachable deterministically (not just unit-tested) because
-            // FUSE handles persist across calls — see the module doc and
-            // `tests/mounted_linux.rs`'s EBUSY test.
-            Err(err) => reply.error(errno_for(&err)),
-        }
+        let (name, newname) = (name.to_string(), newname.to_string());
+        // Spawned, like `unlink`: the facade may wait (`BUSY_GRACE`) for a
+        // `release` the kernel has not delivered yet, and that `release`
+        // must be able to reach this adapter in the meantime.
+        self.spawn(async move {
+            match vfs.rename(NodeId(parent), &name, NodeId(newparent), &newname).await {
+                Ok(()) => reply.ok(),
+                // `RenameBusyError` -> `FrontendErrno::Busy` -> `EBUSY` (a
+                // handle still open past `BUSY_GRACE`) — see
+                // `tests/mounted_linux.rs`'s EBUSY test.
+                Err(err) => reply.error(errno_for(&err)),
+            }
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -456,6 +468,37 @@ impl Filesystem for VfsFuse {
     }
 }
 
+/// `readdir`'s body, run on the runtime (see `VfsFuse::spawn`).
+async fn readdir_reply(vfs: Arc<Vfs>, ino: u64, offset: i64, mut reply: ReplyDirectory) {
+    let listing = match vfs.readdir(NodeId(ino)).await {
+        Ok(listing) => listing,
+        Err(err) => {
+            reply.error(errno_for(&err));
+            return;
+        }
+    };
+    // Same cookie scheme as `nfs.rs`'s `VfsReadDirIter`: the offset
+    // handed back with each entry is `1 + <its index in this
+    // snapshot>`, so resuming at that offset starts right after it. A
+    // client-supplied `offset` past the end of a fresh snapshot (the
+    // directory shrank between two paged calls) just yields an empty
+    // `.skip()` — an empty reply is FUSE's own end-of-stream signal
+    // (`lib.rs`'s `readdir` doc: "Send an empty buffer on end of
+    // stream"), unlike NFSv3's explicit `BAD_COOKIE` error code.
+    // Clamped the same way `read`/`write` clamp their own `offset`:
+    // the kernel never sends a negative one in practice, but a bare
+    // `as usize` cast on one would wrap to a huge value instead of the
+    // intended "start from 0".
+    for (index, (id, attr)) in listing.iter().enumerate().skip(offset.max(0) as usize) {
+        let kind = if attr.is_dir { FileType::Directory } else { FileType::RegularFile };
+        let buffer_full = reply.add(id.0, (index + 1) as i64, kind, &attr.name);
+        if buffer_full {
+            break;
+        }
+    }
+    reply.ok();
+}
+
 impl VfsFuse {
     /// Shared body of `unlink`/`rmdir` — see `rmdir`'s doc for why both
     /// FUSE calls map onto the same facade method.
@@ -465,10 +508,17 @@ impl VfsFuse {
             return;
         };
         let vfs = self.vfs.clone();
-        match self.block_on(vfs.unlink(NodeId(parent), name)) {
-            Ok(()) => reply.ok(),
-            Err(err) => reply.error(errno_for(&err)),
-        }
+        let name = name.to_string();
+        // Spawned: the facade may wait (`BUSY_GRACE`) for this file's
+        // `release`, which the kernel sends asynchronously and possibly
+        // after this request — the dispatch thread must stay free to
+        // deliver it.
+        self.spawn(async move {
+            match vfs.unlink(NodeId(parent), &name).await {
+                Ok(()) => reply.ok(),
+                Err(err) => reply.error(errno_for(&err)),
+            }
+        });
     }
 }
 

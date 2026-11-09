@@ -227,6 +227,34 @@ fn remove_mount_marker(cache_dir: &Path) {
 ///   NOT stale. This is the two-instance false positive itself: a
 ///   currently-alive sibling still legitimately owns this mountpoint.
 /// - A match, a marker WAS recorded, and its owner is dead: stale.
+/// Decodes the octal escapes `/proc/mounts` writes for whitespace and
+/// backslashes in a path field (proc(5): a space is `\040`, a tab `\011`,
+/// a newline `\012`, a backslash `\134`). Anything that is not a full
+/// three-digit octal escape is kept as is. Compiled on every OS so its
+/// unit test runs on the macOS dev machine too; only Linux calls it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn unescape_proc_mounts_field(field: &str) -> String {
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 3 < bytes.len() {
+            let digits = &bytes[i + 1..i + 4];
+            if digits.iter().all(|d| (b'0'..=b'7').contains(d)) {
+                let value = (digits[0] - b'0') as u32 * 64 + (digits[1] - b'0') as u32 * 8 + (digits[2] - b'0') as u32;
+                if value <= 0xff {
+                    out.push(value as u8);
+                    i += 4;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn is_stale(mount_table_match: bool, marker_owner_alive: Option<bool>) -> bool {
     if !mount_table_match {
         return false;
@@ -879,13 +907,10 @@ mod linux_impl {
     //! is_stale`]'s documented default for "cannot positively confirm
     //! either way".
     //!
-    //! **Known limitation, disclosed rather than handled**: `/proc/mounts`
-    //! escapes whitespace/backslashes in paths as octal (`proc(5)`, e.g. a
-    //! space becomes `\040`); this parser does not unescape. Every
-    //! mountpoint this crate ever constructs comes from a caller-chosen
-    //! directory (in practice, `tempfile::tempdir()` in tests) that does
-    //! not contain such characters, so this is a real but narrow gap, not
-    //! exercised by any test here.
+    //! `/proc/mounts` escapes whitespace/backslashes in paths as octal
+    //! (`proc(5)`, e.g. a space becomes `\040`); the parser decodes them
+    //! (`unescape_proc_mounts_field`) — users do pick folders like
+    //! "Cloud Drive". Pinned on a real mount by `tests/mounted_linux.rs`.
 
     use std::ffi::{OsStr, OsString};
     use std::path::{Path, PathBuf};
@@ -1092,6 +1117,11 @@ mod linux_impl {
         let marker_owner_alive =
             match read_mount_marker(cache_dir).and_then(|m| m.parse::<i32>().ok()) {
                 Some(pid) => Some(is_pid_alive(pid)),
+                // No marker (deleted cache, older version): a FUSE mount
+                // whose server process is gone answers every access with
+                // ENOTCONN ("Transport endpoint is not connected") — proof
+                // nobody serves it, whoever mounted it.
+                None if is_disconnected(mountpoint).await => Some(false),
                 None => None,
             };
         if !super::is_stale(mount_table_match, marker_owner_alive) {
@@ -1114,7 +1144,7 @@ mod linux_impl {
                 let Some(_source) = fields.next() else { continue };
                 let Some(target) = fields.next() else { continue };
                 let Some(fstype) = fields.next() else { continue };
-                if target == canonical && fstype.starts_with("fuse") {
+                if super::unescape_proc_mounts_field(target) == canonical && fstype.starts_with("fuse") {
                     return Ok(true);
                 }
             }
@@ -1122,6 +1152,17 @@ mod linux_impl {
         })
         .await
         .and_then(std::convert::identity)
+    }
+
+    /// Whether `mountpoint` is a FUSE mount whose server is gone: `stat`
+    /// fails with ENOTCONN. Bounded like every other probe here.
+    async fn is_disconnected(mountpoint: &Path) -> bool {
+        let mountpoint = mountpoint.to_path_buf();
+        blocking_bounded(DETECT_BUDGET, move || {
+            matches!(std::fs::metadata(&mountpoint), Err(err) if err.raw_os_error() == Some(libc::ENOTCONN))
+        })
+        .await
+        .unwrap_or(false)
     }
 
     /// Whether pid `pid` currently names a live process — `kill(pid, 0)`
@@ -1163,6 +1204,20 @@ mod linux_impl {
             return Ok(());
         }
         if run_ok_bounded("fusermount", vec![OsString::from("-u"), path.clone()], UMOUNT_STEP_BUDGET)
+            .await
+        {
+            return Ok(());
+        }
+        // Lazy detach through the setuid helper: the only rung that works
+        // for a regular user on a BUSY dead mount (a terminal or a file
+        // manager still sitting inside it) — `umount -f`/`-l` below need
+        // root for a FUSE mount on most distributions.
+        if run_ok_bounded("fusermount3", vec![OsString::from("-uz"), path.clone()], UMOUNT_STEP_BUDGET)
+            .await
+        {
+            return Ok(());
+        }
+        if run_ok_bounded("fusermount", vec![OsString::from("-uz"), path.clone()], UMOUNT_STEP_BUDGET)
             .await
         {
             return Ok(());
@@ -1303,5 +1358,19 @@ mod tests {
     #[test]
     fn is_stale_is_true_when_the_recorded_owner_is_dead() {
         assert!(is_stale(true, Some(false)));
+    }
+
+    /// `/proc/mounts` writes a space in a mountpoint as `\040` (proc(5)).
+    /// Users name their drive folder "Cloud Drive" or "Mon Cloud": without
+    /// unescaping, a stale mount there was never recognized after a crash.
+    #[test]
+    fn proc_mounts_escapes_are_decoded() {
+        assert_eq!(unescape_proc_mounts_field(r"/home/ana/Cloud\040Drive"), "/home/ana/Cloud Drive");
+        assert_eq!(unescape_proc_mounts_field(r"/home/ana/a\011b\012c\134d"), "/home/ana/a\tb\nc\\d");
+        assert_eq!(unescape_proc_mounts_field("/home/ana/Caf\u{e9}"), "/home/ana/Caf\u{e9}");
+        assert_eq!(unescape_proc_mounts_field("/plain/path"), "/plain/path");
+        // Not a full octal escape: left as is.
+        assert_eq!(unescape_proc_mounts_field(r"/odd\04"), r"/odd\04");
+        assert_eq!(unescape_proc_mounts_field(r"/odd\9xy"), r"/odd\9xy");
     }
 }
