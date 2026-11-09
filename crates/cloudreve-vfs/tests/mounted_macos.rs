@@ -986,7 +986,12 @@ async fn the_drive_folder_icon_set_on_the_mount_root_reads_back_and_is_never_upl
         fork_len > 1000 || volume_icon_len > 1000,
         "the icon image is nowhere: Icon\\r fork {fork_len} bytes, .VolumeIcon.icns {volume_icon_len} bytes"
     );
-    assert_eq!(names, vec!["a.txt".to_string()], "the icon file must stay hidden like any junk");
+    // The icon file stays hidden like any junk; the root's own sidecar
+    // `._.` (its FinderInfo) is the one junk name listed, see
+    // `cloudreve_vfs::appledouble`.
+    let mut names = names;
+    names.sort();
+    assert_eq!(names, vec!["._.".to_string(), "a.txt".to_string()], "only the root's sidecar may be listed");
     assert!(
         env.uploaded_names().is_empty() && env.create_file_call_count() == 0,
         "the folder icon reached the server: {:?}",
