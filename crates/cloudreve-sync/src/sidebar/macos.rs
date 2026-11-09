@@ -17,7 +17,9 @@
 //! The Favorites row shows the folder's own custom icon (Finder redraws the
 //! row from it — what SidebarFavorites' documentation calls the custom icon
 //! "fighting" its sidebar glyph on macOS 26), so setting the Cloudreve icon
-//! on the folder is what puts the logo in the sidebar.
+//! on the folder is what puts the logo in the sidebar. A mirror folder gets
+//! it through `NSWorkspace` (an `Icon\r` file); an on-demand drive's folder
+//! is a volume root and gets a volume icon instead ([`set_volume_icon`]).
 
 use std::ffi::c_void;
 use std::os::unix::ffi::OsStrExt;
@@ -132,6 +134,63 @@ fn matching_items(folder: &Path) -> Result<(Cf, Cf, Vec<CFTypeRef>)> {
     Ok((list, snapshot, items))
 }
 
+/// Whether `folder` is the root of a mounted volume (an on-demand drive's
+/// NFS mount): a different device than its parent.
+fn is_mount_point(folder: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(folder), folder.parent().map(std::fs::metadata)) {
+        (Ok(dir), Some(Ok(parent))) => dir.dev() != parent.dev(),
+        _ => false,
+    }
+}
+
+const FINDER_INFO: &std::ffi::CStr = c"com.apple.FinderInfo";
+/// kHasCustomIcon, in the Finder flags at bytes 8-9 of FinderInfo.
+const HAS_CUSTOM_ICON: u8 = 0x04;
+
+/// The 32-byte FinderInfo of `path` with the custom-icon bit set or
+/// cleared. Everything else in it (type, creator, label) is kept.
+fn set_custom_icon_flag(path: &Path, on: bool) -> Result<()> {
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+    let mut info = [0u8; 32];
+    let read = unsafe { libc::getxattr(c_path.as_ptr(), FINDER_INFO.as_ptr(), info.as_mut_ptr().cast(), info.len(), 0, 0) };
+    if read != 32 {
+        info = [0u8; 32];
+    }
+    if on {
+        info[8] |= HAS_CUSTOM_ICON;
+    } else {
+        info[8] &= !HAS_CUSTOM_ICON;
+    }
+    let rc = unsafe { libc::setxattr(c_path.as_ptr(), FINDER_INFO.as_ptr(), info.as_ptr().cast(), info.len(), 0, 0) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| format!("failed to set the FinderInfo of {}", path.display()));
+    }
+    Ok(())
+}
+
+/// A volume root's icon, the way Finder has always read it: the image in
+/// `.VolumeIcon.icns` at the root, the custom-icon bit in the root's
+/// FinderInfo. Plain file I/O on purpose: with `NSWorkspace.setIcon` on the
+/// NFS mount root, called from a blocking thread (every caller here is),
+/// the real-mount CI test died of SIGTRAP with no panic, while the same
+/// call on a plain folder works from any thread (CI and macOS 27). On the mount both names
+/// are local-only junk (`cloudreve_vfs::junk`): never uploaded.
+fn set_volume_icon(root: &Path) -> Result<()> {
+    let icns = root.join(".VolumeIcon.icns");
+    std::fs::write(&icns, ICON_ICNS).with_context(|| format!("failed to write {}", icns.display()))?;
+    set_custom_icon_flag(root, true)
+}
+
+fn clear_volume_icon(root: &Path) -> Result<()> {
+    match std::fs::remove_file(root.join(".VolumeIcon.icns")) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).context("failed to remove .VolumeIcon.icns"),
+    }
+    set_custom_icon_flag(root, false)
+}
+
 pub struct FinderSidebar;
 
 impl SidebarBackend for FinderSidebar {
@@ -173,6 +232,9 @@ impl SidebarBackend for FinderSidebar {
     }
 
     fn set_icon(&self, folder: &Path) -> Result<()> {
+        if is_mount_point(folder) {
+            return set_volume_icon(folder);
+        }
         autoreleasepool(|_| {
             let data = NSData::with_bytes(ICON_ICNS);
             let image = NSImage::initWithData(NSImage::alloc(), &data).context("the bundled icon.icns does not decode")?;
@@ -185,6 +247,9 @@ impl SidebarBackend for FinderSidebar {
     }
 
     fn clear_icon(&self, folder: &Path) -> Result<()> {
+        if is_mount_point(folder) {
+            return clear_volume_icon(folder);
+        }
         autoreleasepool(|_| {
             let path = NSString::from_str(&folder.to_string_lossy());
             if !NSWorkspace::sharedWorkspace().setIcon_forFile_options(None, &path, NSWorkspaceIconCreationOptions(0)) {

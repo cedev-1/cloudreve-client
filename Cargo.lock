@@ -830,6 +830,7 @@ dependencies = [
  "futures",
  "globset",
  "image",
+ "libc",
  "libsqlite3-sys",
  "notify-debouncer-full",
  "objc2 0.6.4",

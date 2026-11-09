@@ -82,6 +82,44 @@ fn a_folder_is_added_to_finder_favorites_with_the_logo_and_removed_again() {
     assert!(!icon_at_end, "the custom icon was not cleared");
 }
 
+/// An on-demand drive's folder is a volume root: its logo is a volume icon
+/// (`.VolumeIcon.icns` + the custom-icon bit), written without AppKit and
+/// from a non-main thread — what `Mount::start` does. A real HFS+ RAM
+/// volume stands in for the NFS mount (which this test cannot reach
+/// locally); the real NFS root is covered by the test below, on CI.
+/// Not ignored: it never touches the Finder sidebar.
+#[test]
+fn the_logo_on_a_volume_root_is_a_volume_icon_set_from_any_thread() {
+    let Some(disk) = common::RamDisk::new(64, "CloudreveIconTest") else {
+        eprintln!("SKIP: no RAM volume could be created");
+        return;
+    };
+    let root = disk.mount_point.clone();
+    let backend = sidebar::platform_backend();
+    // Whatever else the root's FinderInfo holds must survive the flag.
+    let existing = "0102030400000000000000000000000000000000000000000000000000000000";
+    let ok = Command::new("/usr/bin/xattr").args(["-wx", "com.apple.FinderInfo", existing]).arg(&root).status().unwrap();
+    assert!(ok.success());
+
+    let b = backend.clone();
+    let r = root.clone();
+    std::thread::spawn(move || b.set_icon(&r)).join().unwrap().unwrap();
+    let icon_set = has_custom_icon(&root);
+    let kept = Command::new("/usr/bin/xattr").args(["-px", "com.apple.FinderInfo"]).arg(&root).output().unwrap();
+    let kept = String::from_utf8_lossy(&kept.stdout).split_whitespace().take(4).collect::<Vec<_>>().join("");
+    let icns = std::fs::read(root.join(".VolumeIcon.icns")).unwrap_or_default();
+    let no_icon_file = !root.join("Icon\r").exists();
+
+    backend.clear_icon(&root).unwrap();
+    let cleared = !has_custom_icon(&root) && !root.join(".VolumeIcon.icns").exists();
+
+    assert!(icon_set, "the volume root has no custom-icon bit");
+    assert_eq!(kept, "01020304", "setting the flag wiped the rest of the FinderInfo");
+    assert!(icns.len() > 1000 && &icns[..4] == b"icns", "no icns image at the volume root ({} bytes)", icns.len());
+    assert!(no_icon_file, "a volume root must not get an Icon\\r file");
+    assert!(cleared, "clearing left the volume icon behind");
+}
+
 /// Force-unmounts `path` on drop, whatever the test did.
 struct UnmountGuard(PathBuf);
 
@@ -109,20 +147,26 @@ async fn observe(backend: Arc<dyn SidebarBackend>, folder: PathBuf) -> (bool, bo
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn an_on_demand_drive_keeps_its_favorite_and_logo_across_a_relaunch() {
+    // `E2E` checkpoints: a crash in AppKit/CoreServices kills the process
+    // without a panic message; the last line printed says where.
+    eprintln!("E2E start");
     let backend = sidebar::platform_backend();
     let mut env = TestEnv::with_real_mount_and_sidebar(backend.clone()).await;
+    eprintln!("E2E mounted and started");
     let folder = env.sync_dir.clone();
     let _unmount = UnmountGuard(folder.clone());
     let cleanup = Cleanup(backend.clone(), folder.clone());
 
     let first = observe(backend.clone(), folder.clone()).await;
     let first_settings = env.mount.get_config().await.sidebar;
+    eprintln!("E2E first observed {first:?}");
 
     env.mount.shutdown().await;
     let while_unmounted = observe(backend.clone(), folder.clone()).await;
     let mountpoint_entries = std::fs::read_dir(&folder).map(|d| d.count()).unwrap_or(usize::MAX);
     env.restart_mount().await;
     let after_relaunch = observe(backend.clone(), folder.clone()).await;
+    eprintln!("E2E relaunched, observed {after_relaunch:?}");
 
     env.mount.delete().await.unwrap();
     let after_delete = observe(backend.clone(), folder.clone()).await;

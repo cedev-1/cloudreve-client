@@ -40,6 +40,7 @@ fs4 = { version = "1", default-features = false }
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData", "NSString"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSWorkspace", "NSImage"] }
+libc = "0.2"
 
 [dependencies.uuid]
 version = "1.6"
