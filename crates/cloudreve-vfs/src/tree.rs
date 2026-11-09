@@ -135,19 +135,20 @@ impl VfsTree {
     }
 
     /// Resolves one child by name, listing the parent first if needed.
+    /// An exact match wins; otherwise a name equal under Unicode NFC
+    /// matches too (see [`same_name`]).
     pub async fn lookup(&self, parent: NodeId, name: &str) -> Result<Option<(NodeId, NodeAttr)>> {
         self.ensure_listed(parent).await?;
         let inner = self.inner.read().await;
         let Some(ids) = inner.children.get(&parent) else {
             return Ok(None);
         };
-        Ok(ids.iter().find_map(|id| {
-            inner
-                .attrs
-                .get(id)
-                .filter(|attr| attr.name == name)
-                .map(|attr| (*id, attr.clone()))
-        }))
+        let find = |matches: &dyn Fn(&str) -> bool| {
+            ids.iter().find_map(|id| {
+                inner.attrs.get(id).filter(|attr| matches(&attr.name)).map(|attr| (*id, attr.clone()))
+            })
+        };
+        Ok(find(&|n| n == name).or_else(|| find(&|n| same_name(n, name))))
     }
 
     /// Reads a node's own attributes. `node` must already be known, e.g.
@@ -797,4 +798,23 @@ fn parse_rfc3339(s: &str) -> i64 {
     chrono::DateTime::parse_from_rfc3339(s)
         .map(|dt| dt.timestamp())
         .unwrap_or(0)
+}
+
+/// Whether two file names are the same name to a user: byte-equal, or
+/// equal once both are in Unicode NFC. macOS hands names from Finder to a
+/// network volume decomposed (NFD: "e" + U+0301), while Linux, Windows and
+/// the Cloudreve web UI write them composed (NFC: U+00E9) — both render
+/// as "é", and must resolve to the same file.
+pub(crate) fn same_name(a: &str, b: &str) -> bool {
+    use unicode_normalization::UnicodeNormalization;
+    a == b || a.nfc().eq(b.nfc())
+}
+
+/// The NFC form of a name this facade is about to CREATE on the server
+/// (create, mkdir, rename target), so a file made on a Mac reaches the
+/// server under the same bytes every other client writes — see
+/// [`same_name`].
+pub(crate) fn to_nfc(name: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    name.nfc().collect()
 }

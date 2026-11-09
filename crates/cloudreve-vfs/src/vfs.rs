@@ -1241,6 +1241,8 @@ impl Vfs {
     /// this call's own registration window use unrelated lock keys and can
     /// interleave.
     pub async fn create(&self, parent: NodeId, name: &str) -> Result<(NodeId, FileHandle)> {
+        // Created on the server under its NFC form (see `tree::same_name`).
+        let name = &crate::tree::to_nfc(name);
         let _ns_guard = self.namespace_lock.read().await;
 
         let parent_attr = self
@@ -1336,6 +1338,7 @@ impl Vfs {
     /// (the tree's `LISTING_TTL` keeps it cached) to hand back a `NodeId`
     /// without a second network round-trip.
     pub async fn mkdir(&self, parent: NodeId, name: &str) -> Result<NodeId> {
+        let name = &crate::tree::to_nfc(name);
         // Every junk name, local-only ones included: the overlay holds
         // plain files only (see `crate::junk`).
         if junk::classify(name).is_some() {
@@ -1631,6 +1634,11 @@ impl Vfs {
             .lookup(parent, name)
             .await?
             .with_context(|| format!("rename: no such entry {name:?}"))?;
+        // The tree knows the entry by its stored name, which may differ
+        // from `name` by Unicode normalization (see `tree::same_name`);
+        // the new name is created in NFC.
+        let name = &attr.name.clone();
+        let new_name = &crate::tree::to_nfc(new_name);
         let old_path = attr.remote_path;
         let source_is_dir = attr.is_dir;
         let new_parent_attr = self
@@ -2053,7 +2061,7 @@ impl Vfs {
             return Ok(Some((id, attr)));
         }
         for (id, mut attr) in self.tree.known_children_of(parent).await {
-            if attr.name == name {
+            if crate::tree::same_name(&attr.name, name) {
                 self.overlay_draft(&mut attr).await;
                 return Ok(Some((id, attr)));
             }

@@ -17,6 +17,7 @@ sha2 = "0.10"
 cloudreve-uploader = { path = "../cloudreve-uploader" }
 nfs3_server = "0.11"
 libc = "0.2.189"
+unicode-normalization = "0.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # `default-features = false` disables fuser's `libfuse` feature, which
