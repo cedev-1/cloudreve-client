@@ -16,12 +16,15 @@
     "modeChoice": {
       "title": "¿Cómo quieres guardar tus archivos en este equipo?",
       "mirror": "Descargar todo",
-      "mirrorHint": "Cada archivo se copia en este equipo y se mantiene sincronizado. Los archivos se abren sin internet, pero ocupan tanto espacio en disco como tu nube.",
+      "mirrorHint": "Cada archivo se copia en este equipo y se mantiene sincronizado.",
+      "mirrorDetails": "Los archivos se abren sin internet, pero ocupan tanto espacio en disco como tu nube.",
       "onDemand": "Archivos bajo demanda",
-      "onDemandHint": "Tus archivos aparecen en la carpeta al instante, pero no ocupan espacio en disco hasta que los abres. Abrir un archivo por primera vez requiere conexión a internet; los archivos abiertos recientemente siguen disponibles.",
+      "onDemandHint": "Tus archivos aparecen en la carpeta al instante, pero no ocupan espacio en disco hasta que los abres.",
+      "onDemandDetails": "Abrir un archivo por primera vez requiere conexión a internet; los archivos abiertos recientemente siguen disponibles.",
       "fixedNote": "Esta opción no se puede cambiar después. Para cambiarla, quita la unidad y vuelve a añadirla.",
       "macNote": "La primera vez, macOS puede preguntar si Cloudreve puede acceder a archivos de un volumen de red: pulsa Permitir.",
-      "linuxNote": "Requiere FUSE (el paquete \"fuse3\", ya instalado en la mayoría de sistemas Linux)."
+      "linuxNote": "Requiere FUSE (el paquete \"fuse3\", ya instalado en la mayoría de sistemas Linux).",
+      "learnMore": "Más información"
     },
     "localPathPlaceholder": "/Users/username/CloudDrive",
     "browse": "Examinar",

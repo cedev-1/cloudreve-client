@@ -16,12 +16,15 @@
     "modeChoice": {
       "title": "Come vuoi conservare i tuoi file su questo computer?",
       "mirror": "Scarica tutto",
-      "mirrorHint": "Ogni file viene copiato su questo computer e mantenuto sincronizzato. I file si aprono senza internet, ma occupano tanto spazio su disco quanto il tuo cloud.",
+      "mirrorHint": "Ogni file viene copiato su questo computer e mantenuto sincronizzato.",
+      "mirrorDetails": "I file si aprono senza internet, ma occupano tanto spazio su disco quanto il tuo cloud.",
       "onDemand": "File su richiesta",
-      "onDemandHint": "I tuoi file compaiono subito nella cartella ma non occupano spazio su disco finché non li apri. Aprire un file la prima volta richiede una connessione internet; i file aperti di recente restano disponibili.",
+      "onDemandHint": "I tuoi file compaiono subito nella cartella ma non occupano spazio su disco finché non li apri.",
+      "onDemandDetails": "Aprire un file la prima volta richiede una connessione internet; i file aperti di recente restano disponibili.",
       "fixedNote": "Questa scelta non può essere cambiata in seguito. Per cambiarla, rimuovi l'unità e aggiungila di nuovo.",
       "macNote": "La prima volta macOS potrebbe chiedere se Cloudreve può accedere ai file di un volume di rete: fai clic su Consenti.",
-      "linuxNote": "Richiede FUSE (il pacchetto \"fuse3\", già installato sulla maggior parte dei sistemi Linux)."
+      "linuxNote": "Richiede FUSE (il pacchetto \"fuse3\", già installato sulla maggior parte dei sistemi Linux).",
+      "learnMore": "Scopri di più"
     },
     "localPathPlaceholder": "/Users/username/CloudDrive",
     "browse": "Sfoglia",

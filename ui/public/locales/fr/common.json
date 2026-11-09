@@ -16,12 +16,15 @@
     "modeChoice": {
       "title": "Comment garder vos fichiers sur cet ordinateur ?",
       "mirror": "Tout télécharger",
-      "mirrorHint": "Chaque fichier est copié sur cet ordinateur et tenu à jour. Les fichiers s'ouvrent sans internet, mais occupent autant d'espace disque que votre cloud.",
+      "mirrorHint": "Chaque fichier est copié sur cet ordinateur et tenu à jour.",
+      "mirrorDetails": "Les fichiers s'ouvrent sans internet, mais occupent autant d'espace disque que votre cloud.",
       "onDemand": "Fichiers à la demande",
-      "onDemandHint": "Vos fichiers apparaissent tout de suite dans le dossier mais n'occupent aucun espace disque tant que vous ne les ouvrez pas. Ouvrir un fichier pour la première fois demande une connexion internet ; les fichiers ouverts récemment restent disponibles.",
+      "onDemandHint": "Vos fichiers apparaissent tout de suite dans le dossier mais n'occupent aucun espace disque tant que vous ne les ouvrez pas.",
+      "onDemandDetails": "Ouvrir un fichier pour la première fois demande une connexion internet ; les fichiers ouverts récemment restent disponibles.",
       "fixedNote": "Ce choix ne peut pas être modifié ensuite. Pour changer, supprimez le disque puis ajoutez-le à nouveau.",
       "macNote": "La première fois, macOS peut demander si Cloudreve peut accéder aux fichiers d'un volume réseau : cliquez sur Autoriser.",
-      "linuxNote": "Nécessite FUSE (le paquet « fuse3 », déjà installé sur la plupart des systèmes Linux)."
+      "linuxNote": "Nécessite FUSE (le paquet « fuse3 », déjà installé sur la plupart des systèmes Linux).",
+      "learnMore": "En savoir plus"
     },
     "localPathPlaceholder": "/Users/username/CloudDrive",
     "browse": "Parcourir",

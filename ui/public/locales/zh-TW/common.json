@@ -16,12 +16,15 @@
     "modeChoice": {
       "title": "檔案要如何保存在這台電腦上？",
       "mirror": "全部下載",
-      "mirrorHint": "所有檔案都會複製到這台電腦並保持同步。無需連網即可開啟，但佔用的磁碟空間與雲端相同。",
+      "mirrorHint": "所有檔案都會複製到這台電腦並保持同步。",
+      "mirrorDetails": "無需連網即可開啟，但佔用的磁碟空間與雲端相同。",
       "onDemand": "隨選檔案",
-      "onDemandHint": "檔案會立即顯示在資料夾中，但在開啟之前不佔用磁碟空間。首次開啟檔案需要連網；最近開啟過的檔案仍可使用。",
+      "onDemandHint": "檔案會立即顯示在資料夾中，但在開啟之前不佔用磁碟空間。",
+      "onDemandDetails": "首次開啟檔案需要連網；最近開啟過的檔案仍可使用。",
       "fixedNote": "此選擇之後無法變更。如需切換，請移除該雲端硬碟後重新新增。",
       "macNote": "首次使用時，macOS 可能會詢問是否允許 Cloudreve 取用網路卷宗上的檔案：請點選「允許」。",
-      "linuxNote": "需要 FUSE（「fuse3」套件，大多數 Linux 系統已預裝）。"
+      "linuxNote": "需要 FUSE（「fuse3」套件，大多數 Linux 系統已預裝）。",
+      "learnMore": "了解更多"
     },
     "localPathPlaceholder": "/Users/username/CloudDrive",
     "browse": "瀏覽",

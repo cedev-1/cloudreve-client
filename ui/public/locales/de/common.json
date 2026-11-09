@@ -16,12 +16,15 @@
     "modeChoice": {
       "title": "Wie sollen Ihre Dateien auf diesem Computer gespeichert werden?",
       "mirror": "Alles herunterladen",
-      "mirrorHint": "Jede Datei wird auf diesen Computer kopiert und synchron gehalten. Dateien öffnen sich ohne Internet, belegen aber so viel Speicherplatz wie Ihre Cloud.",
+      "mirrorHint": "Jede Datei wird auf diesen Computer kopiert und synchron gehalten.",
+      "mirrorDetails": "Dateien öffnen sich ohne Internet, belegen aber so viel Speicherplatz wie Ihre Cloud.",
       "onDemand": "Dateien bei Bedarf",
-      "onDemandHint": "Ihre Dateien erscheinen sofort im Ordner, belegen aber keinen Speicherplatz, bis Sie sie öffnen. Zum ersten Öffnen einer Datei wird eine Internetverbindung benötigt; kürzlich geöffnete Dateien bleiben verfügbar.",
+      "onDemandHint": "Ihre Dateien erscheinen sofort im Ordner, belegen aber keinen Speicherplatz, bis Sie sie öffnen.",
+      "onDemandDetails": "Zum ersten Öffnen einer Datei wird eine Internetverbindung benötigt; kürzlich geöffnete Dateien bleiben verfügbar.",
       "fixedNote": "Diese Auswahl kann später nicht geändert werden. Zum Wechseln entfernen Sie das Laufwerk und fügen es erneut hinzu.",
       "macNote": "Beim ersten Mal fragt macOS eventuell, ob Cloudreve auf Dateien eines Netzwerkvolumes zugreifen darf: Klicken Sie auf „Erlauben“.",
-      "linuxNote": "Benötigt FUSE (das Paket „fuse3“, auf den meisten Linux-Systemen bereits installiert)."
+      "linuxNote": "Benötigt FUSE (das Paket „fuse3“, auf den meisten Linux-Systemen bereits installiert).",
+      "learnMore": "Mehr erfahren"
     },
     "localPathPlaceholder": "/Users/username/CloudDrive",
     "browse": "Durchsuchen",

@@ -16,12 +16,15 @@
     "modeChoice": {
       "title": "How should your files be kept on this computer?",
       "mirror": "Download everything",
-      "mirrorHint": "Every file is copied to this computer and kept in sync. Files open without internet, but use as much disk space as your cloud.",
+      "mirrorHint": "Every file is copied to this computer and kept in sync.",
+      "mirrorDetails": "Files open without internet, but use as much disk space as your cloud.",
       "onDemand": "Files on demand",
-      "onDemandHint": "Your files show up in the folder right away but use no disk space until you open them. Opening a file for the first time needs an internet connection; files you opened recently stay available.",
+      "onDemandHint": "Your files show up in the folder right away but use no disk space until you open them.",
+      "onDemandDetails": "Opening a file for the first time needs an internet connection; files you opened recently stay available.",
       "fixedNote": "This choice can't be changed later. To switch, remove the drive and add it again.",
       "macNote": "The first time, macOS may ask whether Cloudreve can access files on a network volume: click Allow.",
-      "linuxNote": "Needs FUSE (the \"fuse3\" package, already installed on most Linux systems)."
+      "linuxNote": "Needs FUSE (the \"fuse3\" package, already installed on most Linux systems).",
+      "learnMore": "Learn more"
     },
     "localPathPlaceholder": "/Users/username/CloudDrive",
     "browse": "Browse",

@@ -1,5 +1,6 @@
-import { Alert, Box, Button, CircularProgress, Container, IconButton, InputAdornment, Snackbar, ToggleButton, ToggleButtonGroup, Typography } from "@mui/material";
+import { Alert, Box, Button, CircularProgress, Collapse, Container, IconButton, InputAdornment, Snackbar, ToggleButton, ToggleButtonGroup, Tooltip, Typography } from "@mui/material";
 import CloseIcon from "@mui/icons-material/Close";
+import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { platform } from "@tauri-apps/plugin-os";
@@ -98,6 +99,7 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
   const [snackbarOpen, setSnackbarOpen] = useState(false);
   const [logo, setLogo] = useState(defaultLogo);
   const [authorizeUrl, setAuthorizeUrl] = useState<string | null>(null);
+  const [modeDetailsOpen, setModeDetailsOpen] = useState(false);
   const os = platform();
   const tokensRef = useRef<TokenResponse | null>(null);
   // The backend's plain-language reason a drive could not be added (shown
@@ -551,35 +553,56 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
                           {t("addDrive.modeChoice.onDemand")}
                         </ToggleButton>
                       </ToggleButtonGroup>
-                      <Typography
-                        variant="caption"
-                        color="text.secondary"
-                        sx={{ mt: 0.75, display: "block" }}
-                      >
-                        {driveMode === "on_demand"
-                          ? t("addDrive.modeChoice.onDemandHint")
-                          : t("addDrive.modeChoice.mirrorHint")}
-                      </Typography>
-                      {driveMode === "on_demand" && (
+                      <Box sx={{ mt: 0.75, display: "flex", alignItems: "flex-start", gap: 0.5 }}>
+                        <Typography variant="caption" color="text.secondary" sx={{ flex: 1 }}>
+                          {driveMode === "on_demand"
+                            ? t("addDrive.modeChoice.onDemandHint")
+                            : t("addDrive.modeChoice.mirrorHint")}
+                        </Typography>
+                        <Tooltip title={t("addDrive.modeChoice.learnMore")}>
+                          <IconButton
+                            size="small"
+                            aria-label={t("addDrive.modeChoice.learnMore")}
+                            aria-expanded={modeDetailsOpen}
+                            onClick={() => setModeDetailsOpen((open) => !open)}
+                            sx={{ p: 0.25, mt: -0.25 }}
+                          >
+                            <InfoOutlinedIcon
+                              fontSize="small"
+                              color={modeDetailsOpen ? "primary" : "action"}
+                            />
+                          </IconButton>
+                        </Tooltip>
+                      </Box>
+                      <Collapse in={modeDetailsOpen}>
                         <Typography
                           variant="caption"
                           color="text.secondary"
                           sx={{ mt: 0.5, display: "block" }}
                         >
-                          {os === "macos"
-                            ? t("addDrive.modeChoice.macNote")
-                            : os === "linux"
-                              ? t("addDrive.modeChoice.linuxNote")
-                              : null}
+                          {driveMode === "on_demand"
+                            ? t("addDrive.modeChoice.onDemandDetails")
+                            : t("addDrive.modeChoice.mirrorDetails")}
                         </Typography>
-                      )}
-                      <Typography
-                        variant="caption"
-                        color="text.secondary"
-                        sx={{ mt: 0.5, display: "block", fontStyle: "italic" }}
-                      >
-                        {t("addDrive.modeChoice.fixedNote")}
-                      </Typography>
+                        {driveMode === "on_demand" && (os === "macos" || os === "linux") && (
+                          <Typography
+                            variant="caption"
+                            color="text.secondary"
+                            sx={{ mt: 0.5, display: "block" }}
+                          >
+                            {os === "macos"
+                              ? t("addDrive.modeChoice.macNote")
+                              : t("addDrive.modeChoice.linuxNote")}
+                          </Typography>
+                        )}
+                        <Typography
+                          variant="caption"
+                          color="text.secondary"
+                          sx={{ mt: 0.5, display: "block", fontStyle: "italic" }}
+                        >
+                          {t("addDrive.modeChoice.fixedNote")}
+                        </Typography>
+                      </Collapse>
                     </Box>
 
                     <FilledTextField

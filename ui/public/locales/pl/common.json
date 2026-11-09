@@ -16,12 +16,15 @@
     "modeChoice": {
       "title": "Jak przechowywać pliki na tym komputerze?",
       "mirror": "Pobierz wszystko",
-      "mirrorHint": "Każdy plik jest kopiowany na ten komputer i synchronizowany. Pliki otwierają się bez internetu, ale zajmują tyle miejsca na dysku, co twoja chmura.",
+      "mirrorHint": "Każdy plik jest kopiowany na ten komputer i synchronizowany.",
+      "mirrorDetails": "Pliki otwierają się bez internetu, ale zajmują tyle miejsca na dysku, co twoja chmura.",
       "onDemand": "Pliki na żądanie",
-      "onDemandHint": "Pliki od razu pojawiają się w folderze, ale nie zajmują miejsca na dysku, dopóki ich nie otworzysz. Pierwsze otwarcie pliku wymaga połączenia z internetem; ostatnio otwierane pliki pozostają dostępne.",
+      "onDemandHint": "Pliki od razu pojawiają się w folderze, ale nie zajmują miejsca na dysku, dopóki ich nie otworzysz.",
+      "onDemandDetails": "Pierwsze otwarcie pliku wymaga połączenia z internetem; ostatnio otwierane pliki pozostają dostępne.",
       "fixedNote": "Tego wyboru nie można później zmienić. Aby go zmienić, usuń dysk i dodaj go ponownie.",
       "macNote": "Za pierwszym razem macOS może zapytać, czy Cloudreve może uzyskać dostęp do plików na woluminie sieciowym: kliknij Zezwól.",
-      "linuxNote": "Wymaga FUSE (pakietu „fuse3”, zainstalowanego w większości systemów Linux)."
+      "linuxNote": "Wymaga FUSE (pakietu „fuse3”, zainstalowanego w większości systemów Linux).",
+      "learnMore": "Więcej informacji"
     },
     "localPathPlaceholder": "/Users/username/CloudDrive",
     "browse": "Przeglądaj",
