@@ -649,6 +649,7 @@ fn to_nfsstat3(errno: FrontendErrno) -> nfsstat3 {
         // Junk (`crate::junk`): NFSv3's own codes for both conditions.
         FrontendErrno::Access => nfsstat3::NFS3ERR_ACCES,
         FrontendErrno::CrossDevice => nfsstat3::NFS3ERR_XDEV,
+        FrontendErrno::NoSpace => nfsstat3::NFS3ERR_NOSPC,
         FrontendErrno::Io => nfsstat3::NFS3ERR_IO,
     }
 }

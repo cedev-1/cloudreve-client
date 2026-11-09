@@ -59,6 +59,9 @@ pub enum FrontendErrno {
     /// A local-only junk file renamed onto a real name:
     /// [`CrossOverlayRenameError`]. EXDEV makes `mv`/Finder copy instead.
     CrossDevice,
+    /// The local disk holding drafts and cached blocks is full (ENOSPC
+    /// anywhere in the error chain).
+    NoSpace,
     /// Everything else. The anyhow causal chain is logged at debug so a
     /// real bug stays diagnosable without ever leaking `anyhow::Error`
     /// details across the frontend boundary.
@@ -96,6 +99,12 @@ pub fn classify_error(err: &anyhow::Error) -> FrontendErrno {
     }
     if err.to_string().starts_with("EEXIST") {
         return FrontendErrno::Exist;
+    }
+    let disk_full = err.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().and_then(|io| io.raw_os_error()) == Some(libc::ENOSPC)
+    });
+    if disk_full {
+        return FrontendErrno::NoSpace;
     }
     tracing::debug!(chain = ?err, "vfs frontend: unmapped error, reporting a generic i/o failure");
     FrontendErrno::Io
@@ -171,6 +180,23 @@ pub fn process_gid() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The disk holding the drafts and the cache is full: the app writing
+    /// the file must get "no space left on device" (it can tell the user
+    /// what is wrong), not a generic I/O error.
+    #[test]
+    fn a_full_disk_classifies_as_no_space_even_behind_context() {
+        let io = std::io::Error::from_raw_os_error(libc::ENOSPC);
+        let err = anyhow::Error::new(io).context("failed to write draft data").context("write");
+        assert_eq!(classify_error(&err), FrontendErrno::NoSpace);
+    }
+
+    #[test]
+    fn other_io_errors_stay_generic() {
+        let io = std::io::Error::from_raw_os_error(libc::EBADF);
+        let err = anyhow::Error::new(io).context("failed to write draft data");
+        assert_eq!(classify_error(&err), FrontendErrno::Io);
+    }
 
     #[test]
     fn stale_handle_error_classifies_as_stale() {

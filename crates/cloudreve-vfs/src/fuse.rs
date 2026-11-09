@@ -489,6 +489,7 @@ fn to_errno(errno: FrontendErrno) -> i32 {
         FrontendErrno::IsDir => libc::EISDIR,
         FrontendErrno::Access => libc::EACCES,
         FrontendErrno::CrossDevice => libc::EXDEV,
+        FrontendErrno::NoSpace => libc::ENOSPC,
         FrontendErrno::Io => libc::EIO,
     }
 }
