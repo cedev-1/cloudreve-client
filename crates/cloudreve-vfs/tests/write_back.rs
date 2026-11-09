@@ -1891,3 +1891,45 @@ async fn renaming_a_file_while_its_upload_runs_is_busy_then_succeeds() {
     assert!(vfs.lookup(root, "Meeting.txt").await.unwrap().is_some());
     assert_eq!(env.last_rename().map(|(_, to)| to), Some("Meeting.txt".to_string()));
 }
+
+/// A save fails because the server had a hiccup (5xx, a short network
+/// blip) while the live-update connection stayed up. Before the fix the
+/// draft then sat parked until the next reconnect or app restart — hours
+/// on a stable connection — with the file looking saved locally. It must
+/// be retried on its own after a while.
+#[tokio::test]
+async fn a_failed_upload_is_retried_on_its_own_later() {
+    let env = VfsTestEnv::new().await;
+    env.expect_uploads().await;
+    env.set_remote_files(vec![remote_file("report.txt", 5, "e1")]).await;
+    env.serve_file_content("report.txt", b"abcde").await;
+    env.fail_next_upload_sessions(UPLOAD_RETRIES as usize);
+
+    let (vfs, mut rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+    vfs.set_debounce_for_tests(Duration::from_millis(20));
+    vfs.set_retry_backoff_for_tests([Duration::from_millis(5), Duration::from_millis(5)]);
+    vfs.set_parked_retry_delay_for_tests(Duration::from_millis(300));
+
+    let root = vfs.tree().root();
+    let node = vfs.tree().lookup(root, "report.txt").await.unwrap().unwrap().0;
+    let h = vfs.open(node).await.unwrap();
+    vfs.write(h, 0, b"final version").await.unwrap();
+    vfs.close(h).await.unwrap();
+
+    let failed = expect_event(&mut rx, |e| matches!(e, VfsEvent::UploadFailed { .. })).await;
+    assert!(matches!(failed, VfsEvent::UploadFailed { will_retry: true, .. }));
+    assert_eq!(env.uploaded_content("report.txt"), None);
+
+    // Nobody calls retry_pending_uploads: no reconnect, no restart.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while env.uploaded_content("report.txt").is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a parked upload must be retried on its own"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(env.uploaded_content("report.txt").as_deref(), Some(&b"final version"[..]));
+}

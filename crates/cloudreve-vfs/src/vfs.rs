@@ -1148,6 +1148,13 @@ impl Vfs {
         self.write_queue.set_retry_backoff_for_tests(backoff);
     }
 
+    /// Test-only: overrides how long a draft parked by failed attempts
+    /// waits before it is retried on its own. Same reasoning as
+    /// `set_debounce_for_tests`.
+    pub fn set_parked_retry_delay_for_tests(&self, base: Duration) {
+        self.write_queue.set_parked_retry_delay_for_tests(base);
+    }
+
     /// Test-only: forces a draft's state directly, bypassing every normal
     /// transition path (`close`'s arm, `open`'s cancel, `process`'s own
     /// transitions). Same non-`#[cfg(test)]` reasoning as the two methods

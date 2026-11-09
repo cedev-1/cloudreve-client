@@ -543,6 +543,12 @@ impl DraftStore {
 /// restart). Pinned for the whole phase-2 write path.
 pub const UPLOAD_RETRIES: u32 = 3;
 
+/// First delay before a parked draft is retried on its own — see
+/// `WriteBackQueue::schedule_parked_retry`.
+pub const PARKED_RETRY_BASE: Duration = Duration::from_secs(30);
+/// Longest delay between two automatic retries of a parked draft.
+pub const PARKED_RETRY_MAX: Duration = Duration::from_secs(600);
+
 /// Backoff slept between upload attempts, indexed by attempt number (after
 /// the first failure sleeps `UPLOAD_RETRY_BACKOFF[0]`, after the second
 /// `UPLOAD_RETRY_BACKOFF[1]`, then the third and final attempt runs with no
@@ -607,6 +613,12 @@ pub struct WriteBackQueue {
     /// here, never read by any non-test-only call site.
     debounce: Arc<StdMutex<Duration>>,
     retry_backoff: Arc<StdMutex<[Duration; 2]>>,
+    /// Base delay before a draft parked by failed attempts is retried on
+    /// its own (see [`WriteBackQueue::schedule_parked_retry`]); doubles per
+    /// consecutive parking, capped at [`PARKED_RETRY_MAX`].
+    parked_retry_base: Arc<StdMutex<Duration>>,
+    parked_retry_scheduled: Arc<std::sync::atomic::AtomicBool>,
+    parked_retry_streak: Arc<std::sync::atomic::AtomicU32>,
     /// Remote paths for which `run`/`process` is CURRENTLY executing — the
     /// queue's own ground truth for "is anything genuinely in flight for
     /// this path right now". Since draining is sequential (`upload_gate`)
@@ -698,6 +710,9 @@ impl WriteBackQueue {
             busy: Arc::new(AtomicUsize::new(0)),
             debounce: Arc::new(StdMutex::new(WRITEBACK_DEBOUNCE)),
             retry_backoff: Arc::new(StdMutex::new(UPLOAD_RETRY_BACKOFF)),
+            parked_retry_base: Arc::new(StdMutex::new(PARKED_RETRY_BASE)),
+            parked_retry_scheduled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            parked_retry_streak: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             in_flight: Arc::new(StdMutex::new(HashSet::new())),
             panic_next_upload: Arc::new(StdMutex::new(false)),
             discarded: Arc::new(StdMutex::new(HashSet::new())),
@@ -721,6 +736,32 @@ impl WriteBackQueue {
     /// doc — same reasoning applies here.
     pub fn set_retry_backoff_for_tests(&self, backoff: [Duration; 2]) {
         *self.retry_backoff.lock().unwrap() = backoff;
+    }
+
+    /// Test-only: overrides [`PARKED_RETRY_BASE`].
+    pub fn set_parked_retry_delay_for_tests(&self, base: Duration) {
+        *self.parked_retry_base.lock().unwrap() = base;
+    }
+
+    /// A draft just parked `Pending` after every attempt failed (server
+    /// hiccup, network blip): retry it on its own after a while instead of
+    /// waiting for the next live-update reconnect or app restart, which on
+    /// a stable connection can be hours away while the file looks saved.
+    /// One delayed `retry_pending` sweep at a time covers every parked
+    /// draft; the delay doubles per consecutive parking (30 s, 1 min, ...
+    /// capped at 10 min) and resets on the next successful upload.
+    fn schedule_parked_retry(&self) {
+        if self.parked_retry_scheduled.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let streak = self.parked_retry_streak.fetch_add(1, Ordering::SeqCst).min(5);
+        let delay = (*self.parked_retry_base.lock().unwrap() * 2u32.pow(streak)).min(PARKED_RETRY_MAX);
+        let this = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            this.parked_retry_scheduled.store(false, Ordering::SeqCst);
+            this.retry_pending().await;
+        });
     }
 
     /// Arms the debounce timer for a draft just parked `Pending` by
@@ -1171,6 +1212,7 @@ impl WriteBackQueue {
                     let rearm = self
                         .settle_uploaded_draft(remote_path, snapshot_seq, Some(&new_etag))
                         .await;
+                    self.parked_retry_streak.store(0, Ordering::SeqCst);
                     let _ = self.events.send(crate::vfs::VfsEvent::UploadSucceeded {
                         remote_path: remote_path.to_string(),
                         new_etag,
@@ -1202,6 +1244,9 @@ impl WriteBackQueue {
                     error: err.to_string(),
                     will_retry: !terminal,
                 });
+                if !terminal {
+                    self.schedule_parked_retry();
+                }
             }
         }
     }
