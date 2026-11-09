@@ -63,6 +63,11 @@ pub const FETCH_RETRY_BACKOFF: [Duration; 2] =
 /// configured with elsewhere in the app.
 const USER_AGENT: &str = concat!("cloudreve-desktop/", env!("CARGO_PKG_VERSION"));
 
+/// How long an unlink/rename waits for an open handle (or a running
+/// upload) on its path to go away before answering "busy" — see
+/// `Vfs::settle_closed`. Under NFS's 3 s soft timeout.
+pub const BUSY_GRACE: Duration = Duration::from_millis(1500);
+
 /// Opaque handle returned by [`Vfs::open`], threaded through [`Vfs::read`]
 /// and [`Vfs::close`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1433,6 +1438,16 @@ impl Vfs {
         let open_lock = self.open_lock_for(&remote_path);
         let _open_guard = open_lock.lock().await;
 
+        // Local-only junk never uploads, so nothing can resurrect it: no
+        // busy guard. A lock file is routinely deleted while some process
+        // still holds it (a late FUSE `release`, a helper that inherited
+        // the descriptor).
+        if junk::is_local_only_path(&remote_path) {
+            self.junk.lock().unwrap().remove(&remote_path);
+            self.tree.forget_local_entry(parent, &attr.name).await;
+            return Ok(());
+        }
+
         if attr.is_dir {
             // M1 (review fold-in): force a fresh listing before judging
             // emptiness rather than trusting whatever `readdir` last cached
@@ -1461,17 +1476,11 @@ impl Vfs {
             if !self.readdir(id).await?.is_empty() {
                 return Err(anyhow::Error::new(DirNotEmptyError { remote_path }));
             }
-        } else if self.is_subtree_open(&remote_path).await {
+        } else if !self.settle_closed(&remote_path).await {
             // EBUSY guard (deliverable B): exact-match only ever fires for a
             // file (no descendants possible), same discipline `rename`'s
             // guard already relies on for its own exact-path case.
             return Err(anyhow::Error::new(UnlinkBusyError { remote_path }));
-        }
-
-        if junk::is_local_only_path(&remote_path) {
-            self.junk.lock().unwrap().remove(&remote_path);
-            self.tree.forget_local_entry(parent, name).await;
-            return Ok(());
         }
 
         // `cancel` is a harmless no-op if nothing is currently armed for
@@ -1707,7 +1716,7 @@ impl Vfs {
         // ordinary drafted-FILE-rename case, no descendants possible) must
         // stay allowed through unmigrated-until-below, exactly as before
         // this fix — see that method's doc.
-        if self.is_subtree_open(&old_path).await
+        if !self.settle_closed(&old_path).await
             || self.drafts.lock().await.has_draft_strictly_under(&old_path)
         {
             return Err(anyhow::Error::new(RenameBusyError { remote_path: old_path }));
@@ -1723,23 +1732,21 @@ impl Vfs {
         // (not open) is not itself treated as busy — this call has no
         // narrower "would this rename orphan the destination's own draft"
         // concern to add beyond what already existed for a plain overwrite.
-        if self.is_subtree_open(&new_path).await
+        if !self.settle_closed(&new_path).await
             || self.drafts.lock().await.has_draft_strictly_under(&new_path)
         {
             return Err(anyhow::Error::new(RenameBusyError { remote_path: new_path }));
         }
         // An upload of the destination's draft already in flight would land
         // its bytes over whatever this rename puts there: wait it out.
-        if matches!(self.drafts.lock().await.state(&new_path), Some(DraftState::Uploading)) {
+        if !self.settle_upload(&new_path).await {
             return Err(anyhow::Error::new(RenameBusyError { remote_path: new_path }));
         }
         // Same for the source: a running upload targets `old_path` and
         // cannot be redirected — accepting the rename would leave a stray
         // copy under the old name and strand the moved draft. Busy until
         // it lands (NFS: a transparent JUKEBOX retry by the client).
-        if self.write_queue.is_in_flight(&old_path)
-            || matches!(self.drafts.lock().await.state(&old_path), Some(DraftState::Uploading))
-        {
+        if !self.settle_upload(&old_path).await {
             return Err(anyhow::Error::new(RenameBusyError { remote_path: old_path }));
         }
 
@@ -2193,6 +2200,42 @@ impl Vfs {
     /// path — closing THAT (phase-3-disclosed) gap is exactly what
     /// `namespace_lock` (D10, phase 4) is for: see its field doc, and
     /// `rename`'s own doc for how the two locks compose.
+    /// `!is_subtree_open`, after giving open handles up to [`BUSY_GRACE`]
+    /// to close. On Linux the kernel sends FUSE `release` asynchronously
+    /// and can deliver it AFTER the app's next request: an editor that
+    /// closes a file and immediately deletes or renames it (LibreOffice's
+    /// lock file, a gedit save) otherwise hit a spurious EBUSY.
+    async fn settle_closed(&self, remote_path: &str) -> bool {
+        let deadline = tokio::time::Instant::now() + BUSY_GRACE;
+        loop {
+            if !self.is_subtree_open(remote_path).await {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Whether no upload of `remote_path` is running, after waiting up to
+    /// [`BUSY_GRACE`] for one to land (a small file's upload usually
+    /// does) — see `rename`'s upload guards.
+    async fn settle_upload(&self, remote_path: &str) -> bool {
+        let deadline = tokio::time::Instant::now() + BUSY_GRACE;
+        loop {
+            let uploading = self.write_queue.is_in_flight(remote_path)
+                || matches!(self.drafts.lock().await.state(remote_path), Some(DraftState::Uploading));
+            if !uploading {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     async fn is_subtree_open(&self, remote_path: &str) -> bool {
         let nested_prefix = format!("{remote_path}/");
         self.open_files

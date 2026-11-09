@@ -265,3 +265,29 @@ async fn renaming_a_folder_carries_its_sidecars_along() {
     assert_eq!(env.rename_call_count(), 1);
     assert_eq!(env.upload_session_count(), 0);
 }
+
+/// A lock file deleted while some process still holds it open — on Linux
+/// a FUSE `release` can arrive after the app's next request, and a helper
+/// process that inherited the descriptor keeps it open longer still. The
+/// "busy" guard exists so a deleted file's pending upload cannot bring it
+/// back; local-only junk never uploads, so the delete must just succeed.
+#[tokio::test]
+async fn an_open_lock_file_can_be_deleted() {
+    let env = VfsTestEnv::new().await;
+    env.set_remote_files(vec![]).await;
+    let vfs = new_vfs(&env).await;
+    let root = vfs.tree().root();
+
+    write_new(&vfs, root, ".~lock.Budget.ods#", b",ana,laptop;").await;
+    let (id, _) = vfs.lookup(root, ".~lock.Budget.ods#").await.unwrap().unwrap();
+    let held = vfs.open(id).await.unwrap();
+
+    tokio::time::timeout(Duration::from_millis(500), vfs.unlink(root, ".~lock.Budget.ods#"))
+        .await
+        .expect("deleting an open lock file must not wait for it to close")
+        .expect("deleting an open lock file must succeed");
+    assert!(vfs.lookup(root, ".~lock.Budget.ods#").await.unwrap().is_none());
+
+    vfs.close(held).await.unwrap();
+    assert_eq!(server_writes(&env), 0);
+}

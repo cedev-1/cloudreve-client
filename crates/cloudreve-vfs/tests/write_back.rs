@@ -1845,16 +1845,18 @@ async fn deleting_a_new_file_while_its_upload_runs_leaves_nothing_on_the_server(
 /// Rename a brand-new file while its upload is running: the running upload
 /// targets the OLD name and cannot be redirected. Accepting the rename left
 /// a stray copy under the old name on the server and the moved draft
-/// stranded (`Uploading`, no timer). The rename is refused as busy instead
-/// (NFS turns that into a transparent client-side retry) and succeeds once
-/// the upload is done, leaving only the new name.
+/// stranded (`Uploading`, no timer). The rename waits up to `BUSY_GRACE`
+/// for the upload to land, then is refused as busy (NFS turns that into a
+/// transparent client-side retry); it succeeds once the upload is done,
+/// leaving only the new name.
 #[tokio::test]
-async fn renaming_a_file_while_its_upload_runs_is_busy_then_succeeds() {
+async fn renaming_a_file_while_a_long_upload_runs_is_busy_then_succeeds() {
     let env = VfsTestEnv::new().await;
     env.expect_uploads().await;
     env.expect_namespace_ops().await;
     env.set_remote_files(vec![]).await;
-    env.slow_down_chunk_uploads(Duration::from_millis(400));
+    // Longer than `BUSY_GRACE`: the rename gives up waiting.
+    env.slow_down_chunk_uploads(Duration::from_millis(3000));
 
     let (vfs, _rx) =
         Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
@@ -1932,4 +1934,41 @@ async fn a_failed_upload_is_retried_on_its_own_later() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert_eq!(env.uploaded_content("report.txt").as_deref(), Some(&b"final version"[..]));
+}
+
+/// The common case of the race above: a small file's upload lands within
+/// `BUSY_GRACE`, so the rename just waits for it and succeeds — the app
+/// never sees an error, and the server ends up with the new name only.
+#[tokio::test]
+async fn renaming_a_file_during_a_short_upload_waits_and_succeeds() {
+    let env = VfsTestEnv::new().await;
+    env.expect_uploads().await;
+    env.expect_namespace_ops().await;
+    env.set_remote_files(vec![]).await;
+    env.slow_down_chunk_uploads(Duration::from_millis(300));
+
+    let (vfs, _rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+    vfs.set_debounce_for_tests(Duration::from_millis(20));
+
+    let root = vfs.tree().root();
+    let (_node, h) = vfs.create(root, "Untitled.txt").await.unwrap();
+    vfs.write(h, 0, b"meeting notes").await.unwrap();
+    vfs.close(h).await.unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while env.uploaded_content("Untitled.txt").is_none() {
+        assert!(std::time::Instant::now() < deadline, "the upload never started");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    env.set_remote_files(vec![remote_file("Untitled.txt", 13, "e-up")]).await;
+
+    vfs.rename(root, "Untitled.txt", root, "Meeting.txt")
+        .await
+        .expect("the rename waits for the short upload instead of failing");
+    vfs.wait_for_writeback_idle().await;
+
+    assert!(vfs.lookup(root, "Untitled.txt").await.unwrap().is_none());
+    assert_eq!(env.last_rename(), Some((uri_of("Untitled.txt"), "Meeting.txt".to_string())));
 }
