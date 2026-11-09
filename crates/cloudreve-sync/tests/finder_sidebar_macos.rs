@@ -199,3 +199,154 @@ async fn an_on_demand_drive_keeps_its_favorite_and_logo_across_a_relaunch() {
     assert_eq!(after_relaunch, (true, true), "(listed, logo) after a relaunch on a new NFS server");
     assert!(!after_delete.0, "removing the drive left it in Favorites");
 }
+
+/// The icon macOS RESOLVES for `path` (`NSURLEffectiveIconKey`, what Finder
+/// and every open panel draw), rendered at 32x32, against the bundled
+/// Cloudreve icon rendered the same way: the mean absolute difference per
+/// RGBA byte (0 = identical; the generic file-server icon a bare NFS root
+/// gets is ~74 away, measured on CI). Read in a FRESH process (this test
+/// binary re-run on `resolved_icon_child`): IconServices caches icons per
+/// process, so an in-process read can repeat an answer made before the
+/// icon changed.
+fn resolved_icon_distance_to_logo(path: &Path) -> f64 {
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args(["resolved_icon_child", "--exact", "--ignored", "--nocapture", "--test-threads=1"])
+        .env("CLOUDREVE_ICON_PROBE", path)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Not line-anchored: the harness prints "test ... " on the same line.
+    stdout
+        .split("ICON-DISTANCE=")
+        .nth(1)
+        .and_then(|d| d.split_whitespace().next()?.parse().ok())
+        .unwrap_or_else(|| panic!("the icon probe printed no distance: {stdout}{}", String::from_utf8_lossy(&out.stderr)))
+}
+
+/// Within this of the logo, the resolved icon IS the logo (measured on CI:
+/// 0.0 for a volume icon, 1.6 for a folder's `Icon\r`, against 70+ for
+/// every generic icon).
+const SAME_ICON: f64 = 8.0;
+
+/// The child half of [`resolved_icon_distance_to_logo`]. Does nothing
+/// unless that function runs it.
+#[test]
+#[ignore]
+fn resolved_icon_child() {
+    use objc2::rc::{autoreleasepool, Retained};
+    use objc2::runtime::AnyObject;
+    use objc2::AllocAnyThread;
+    use objc2_app_kit::{NSBitmapImageRep, NSCompositingOperation, NSDeviceRGBColorSpace, NSGraphicsContext, NSImage};
+    use objc2_foundation::{NSData, NSPoint, NSRect, NSSize, NSString, NSURLEffectiveIconKey, NSURL};
+
+    let Ok(path) = std::env::var("CLOUDREVE_ICON_PROBE") else { return };
+    fn render(image: &NSImage) -> Vec<u8> {
+        const PX: isize = 32;
+        let rep = unsafe {
+            NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
+                NSBitmapImageRep::alloc(), std::ptr::null_mut(), PX, PX, 8, 4, true, false, NSDeviceRGBColorSpace, 0, 0)
+        }
+        .unwrap();
+        let ctx = NSGraphicsContext::graphicsContextWithBitmapImageRep(&rep).unwrap();
+        NSGraphicsContext::saveGraphicsState_class();
+        NSGraphicsContext::setCurrentContext(Some(&ctx));
+        let rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(PX as f64, PX as f64));
+        image.drawInRect_fromRect_operation_fraction(rect, NSRect::ZERO, NSCompositingOperation::Copy, 1.0);
+        ctx.flushGraphics();
+        NSGraphicsContext::restoreGraphicsState_class();
+        unsafe { std::slice::from_raw_parts(rep.bitmapData(), (PX * PX * 4) as usize) }.to_vec()
+    }
+    autoreleasepool(|_| {
+        let icns = include_bytes!("../../../src-tauri/icons/icon.icns");
+        let logo = render(&NSImage::initWithData(NSImage::alloc(), &NSData::with_bytes(icns)).unwrap());
+        let url = NSURL::fileURLWithPath(&NSString::from_str(&path));
+        let mut value: Option<Retained<AnyObject>> = None;
+        unsafe { url.getResourceValue_forKey_error(&mut value, NSURLEffectiveIconKey) }.unwrap();
+        let icon = render(&value.expect("no effective icon").downcast::<NSImage>().unwrap());
+        let distance = icon.iter().zip(&logo).map(|(a, b)| (*a as f64 - *b as f64).abs()).sum::<f64>() / logo.len() as f64;
+        println!("ICON-DISTANCE={distance}");
+    });
+}
+
+/// A mirror drive's folder is a plain folder: the logo `set_icon` puts on
+/// it is the icon macOS resolves for it. Not ignored: it never touches the
+/// Finder sidebar.
+#[test]
+fn a_mirror_drive_folder_resolves_to_the_cloudreve_logo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = tmp.path().join("Cloudreve");
+    std::fs::create_dir(&folder).unwrap();
+    let backend = sidebar::platform_backend();
+
+    let before = resolved_icon_distance_to_logo(&folder);
+    backend.set_icon(&folder).unwrap();
+    let after = resolved_icon_distance_to_logo(&folder);
+
+    assert!(before > SAME_ICON, "a bare folder already resolves to the logo ({before})");
+    assert!(after < SAME_ICON, "the folder does not resolve to the logo: distance {after}");
+}
+
+/// Plays Finder on the drive folder: lists it the moment it appears,
+/// before the app gets to set its icon — what Finder does to a Favorites
+/// entry whose volume just mounted, and to any window showing it.
+struct BrowsedFirst(Arc<dyn SidebarBackend>);
+
+impl SidebarBackend for BrowsedFirst {
+    fn contains(&self, folder: &Path) -> anyhow::Result<bool> {
+        self.0.contains(folder)
+    }
+    fn add(&self, folder: &Path, label: &str) -> anyhow::Result<()> {
+        self.0.add(folder, label)
+    }
+    fn remove(&self, folder: &Path) -> anyhow::Result<()> {
+        self.0.remove(folder)
+    }
+    fn set_icon(&self, folder: &Path) -> anyhow::Result<()> {
+        let listed = std::fs::read_dir(folder).map(|d| d.count());
+        eprintln!("RESOLVED listed the folder before set_icon: {listed:?}");
+        self.0.set_icon(folder)
+    }
+    fn clear_icon(&self, folder: &Path) -> anyhow::Result<()> {
+        self.0.clear_icon(folder)
+    }
+}
+
+/// The on-demand drive's folder (the NFS mount root) resolves to the
+/// Cloudreve logo even though Finder listed it before the app set the
+/// icon, and again after a relaunch (new server, empty in-memory overlay).
+/// The root's FinderInfo lives in an AppleDouble `._.` inside the root;
+/// once the client holds a listing of the root without it, Apple's NFS
+/// client answers every `._.` lookup with ENOENT on its own (see
+/// `cloudreve_vfs::nudge::NUDGE_NAME`) — the custom-icon bit could then be
+/// neither set nor read, and Finder drew the generic volume icon.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn an_on_demand_drive_folder_resolves_to_the_cloudreve_logo_even_once_finder_listed_it() {
+    let real = sidebar::platform_backend();
+    let backend: Arc<dyn SidebarBackend> = Arc::new(BrowsedFirst(real.clone()));
+    let mut env = TestEnv::with_real_mount_and_sidebar(backend.clone()).await;
+    let folder = env.sync_dir.clone();
+    let _unmount = UnmountGuard(folder.clone());
+    let cleanup = Cleanup(real.clone(), folder.clone());
+
+    let f = folder.clone();
+    let first = tokio::task::spawn_blocking(move || {
+        let fresh = resolved_icon_distance_to_logo(&f);
+        // Browsed again later: the answer must not depend on luck.
+        let _ = std::fs::read_dir(&f).map(|d| d.count());
+        (fresh, resolved_icon_distance_to_logo(&f))
+    })
+    .await
+    .unwrap();
+    env.mount.shutdown().await;
+    env.restart_mount().await;
+    let f = folder.clone();
+    let after_relaunch = tokio::task::spawn_blocking(move || resolved_icon_distance_to_logo(&f)).await.unwrap();
+    env.mount.delete().await.unwrap();
+    drop(cleanup);
+
+    eprintln!("RESOLVED distances to the logo: first {first:?}, after a relaunch {after_relaunch}");
+    assert!(first.0 < SAME_ICON, "the mounted drive folder does not resolve to the logo: distance {}", first.0);
+    assert!(first.1 < SAME_ICON, "the logo was lost once the folder was browsed again: distance {}", first.1);
+    assert!(after_relaunch < SAME_ICON, "the logo is gone after a relaunch: distance {after_relaunch}");
+}

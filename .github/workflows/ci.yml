@@ -106,14 +106,6 @@ jobs:
       - name: Show macOS version
         run: sw_vers
 
-      - name: Icon probe (temporary experiment)
-        continue-on-error: true
-        run: cargo test -p cloudreve-sync --test icon_probe_tmp -- --ignored --nocapture probe_icons
-
-      - name: Root xattr probe (temporary experiment)
-        continue-on-error: true
-        run: cargo test -p cloudreve-vfs --test root_xattr_probe_tmp -- --nocapture
-
       - name: Run tests
         run: cargo test -p cloudreve-vfs
 
