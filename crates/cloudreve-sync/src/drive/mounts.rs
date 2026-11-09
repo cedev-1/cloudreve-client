@@ -486,6 +486,18 @@ impl Mount {
         *self.vfs.lock().await = Some(vfs.clone());
         *self.vfs_events.lock().await = Some(events);
 
+        // Before attaching: the OS reads the volume root (and Finder lists
+        // it) as soon as it is mounted, before `apply_sidebar_at_start`
+        // runs (see `SidebarBackend::volume_root_files`). Kept by a pause:
+        // `remount_on_demand` reuses this facade and its overlay.
+        let show_icon = self.config.read().await.sidebar.enabled;
+        let root = vfs.tree().root();
+        for (name, data) in self.sidebar_backend().volume_root_files(show_icon) {
+            if let Err(err) = vfs.put_local_only(root, name, data).await {
+                tracing::warn!(target: "drive::mounts", id = %self.id, name, ?err, "failed to seed the volume root");
+            }
+        }
+
         let hook = self.vfs_mount_test_hook.lock().await.clone();
         let mounted = vfs_mode::attach(vfs, mountpoint, &name, &cache_dir, cap, hook.as_ref()).await?;
         *self.mounted_vfs.lock().await = mounted;

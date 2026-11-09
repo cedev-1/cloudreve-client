@@ -291,3 +291,28 @@ async fn an_open_lock_file_can_be_deleted() {
     vfs.close(held).await.unwrap();
     assert_eq!(server_writes(&env), 0);
 }
+
+/// What the app seeds the volume root with before mounting (the root's
+/// AppleDouble sidecar, the volume icon): a whole local-only file put in
+/// place, replaced by a second put, read back like any sidecar, never
+/// uploaded. A real name is refused: it would have to reach the server.
+#[tokio::test]
+async fn a_local_only_file_put_in_place_reads_back_and_is_replaced_by_the_next_put() {
+    let env = VfsTestEnv::new().await;
+    env.add_remote_file("report.pdf", b"%PDF".to_vec(), "e1").await;
+    let vfs = new_vfs(&env).await;
+    let root = vfs.tree().root();
+
+    vfs.put_local_only(root, ".VolumeIcon.icns", b"first icon".to_vec()).await.unwrap();
+    let first = read_all(&vfs, root, ".VolumeIcon.icns").await;
+    vfs.put_local_only(root, ".VolumeIcon.icns", b"second".to_vec()).await.unwrap();
+    let second = read_all(&vfs, root, ".VolumeIcon.icns").await;
+    let refused = vfs.put_local_only(root, "report.pdf", b"not junk".to_vec()).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert_eq!(first, b"first icon");
+    assert_eq!(second, b"second");
+    assert!(refused.is_err(), "a real name was put in the local-only overlay");
+    assert_eq!(read_all(&vfs, root, "report.pdf").await, b"%PDF");
+    assert_eq!(server_writes(&env), 0);
+}

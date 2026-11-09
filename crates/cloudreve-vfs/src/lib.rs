@@ -4,6 +4,7 @@
 //! (macOS) and FUSE (Linux) frontends added in phase 3 are thin adapters
 //! over it. Nothing in this crate mounts anything.
 
+pub mod appledouble;
 pub mod cache;
 pub mod frontend_util;
 pub mod junk;

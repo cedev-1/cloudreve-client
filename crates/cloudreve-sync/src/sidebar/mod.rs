@@ -17,6 +17,9 @@
 //!   xattrs), so an on-demand drive only gets it while its volume is
 //!   mounted: written into the bare mountpoint, `Icon\r` would make the
 //!   next mount refuse a non-empty directory.
+//!   It is also seeded into the vfs before each mount
+//!   ([`SidebarBackend::volume_root_files`]): the OS reads the volume root
+//!   as soon as it is mounted, before `set_icon` runs.
 //! - Removing the drive removes the entry (only if this code added it).
 
 use std::path::Path;
@@ -62,6 +65,16 @@ pub trait SidebarBackend: Send + Sync {
     fn remove(&self, folder: &Path) -> Result<()>;
     fn set_icon(&self, folder: &Path) -> Result<()>;
     fn clear_icon(&self, folder: &Path) -> Result<()>;
+    /// The local-only files (`cloudreve_vfs::junk`) an on-demand drive's
+    /// volume root must hold from its very first request, `icon` when the
+    /// logo is wanted: put into the vfs BEFORE it is mounted, since the OS
+    /// may read the root before `set_icon` gets to run. macOS: the root's
+    /// AppleDouble sidecar (`cloudreve_vfs::appledouble`), which can no
+    /// longer be created once Finder has listed the root, carrying the
+    /// custom-icon bit, and `.VolumeIcon.icns`. None elsewhere.
+    fn volume_root_files(&self, _icon: bool) -> Vec<(&'static str, Vec<u8>)> {
+        Vec::new()
+    }
 }
 
 /// Does nothing: platforms without a backend, and every `Mount` until the

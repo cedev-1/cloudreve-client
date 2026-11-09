@@ -18,6 +18,8 @@ struct FakeSidebar {
     entries: Mutex<BTreeSet<PathBuf>>,
     icons: Mutex<BTreeSet<PathBuf>>,
     adds: Mutex<usize>,
+    /// The `icon` of every `volume_root_files` request, in order.
+    seeds: Mutex<Vec<bool>>,
 }
 
 impl FakeSidebar {
@@ -49,6 +51,10 @@ impl SidebarBackend for FakeSidebar {
     fn clear_icon(&self, folder: &Path) -> anyhow::Result<()> {
         self.icons.lock().unwrap().remove(folder);
         Ok(())
+    }
+    fn volume_root_files(&self, icon: bool) -> Vec<(&'static str, Vec<u8>)> {
+        self.seeds.lock().unwrap().push(icon);
+        vec![(".VolumeIcon.icns", b"icns".to_vec())]
     }
 }
 
@@ -97,6 +103,26 @@ async fn an_on_demand_drive_that_is_not_mounted_gets_nothing_written_into_its_mo
 
     assert!(fake.lists(&env.sync_dir), "the entry does not depend on the mount");
     assert!(!fake.has_icon(&env.sync_dir));
+}
+
+/// An on-demand drive's volume root is seeded at every start, before it
+/// is mounted, with the logo only while the entry is on (see
+/// `SidebarBackend::volume_root_files`). A mirror drive has no volume root.
+#[tokio::test]
+async fn an_on_demand_volume_root_is_seeded_at_every_start_with_the_logo_only_while_enabled() {
+    let fake = Arc::new(FakeSidebar::default());
+    let mut env = TestEnv::with_sidebar(DriveMode::OnDemand, fake.clone()).await;
+    let at_first_start = fake.seeds.lock().unwrap().clone();
+    env.mount.set_show_in_sidebar(false).await.unwrap();
+    env.restart_mount().await;
+    let after_switching_off = fake.seeds.lock().unwrap().clone();
+
+    let mirror = Arc::new(FakeSidebar::default());
+    let _mirror_env = TestEnv::with_sidebar(DriveMode::FullMirror, mirror.clone()).await;
+
+    assert_eq!(at_first_start, vec![true]);
+    assert_eq!(after_switching_off, vec![true, false]);
+    assert!(mirror.seeds.lock().unwrap().is_empty(), "a mirror drive was seeded");
 }
 
 #[tokio::test]

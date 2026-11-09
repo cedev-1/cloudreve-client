@@ -20,13 +20,18 @@
 //! "fighting" its sidebar glyph on macOS 26), so setting the Cloudreve icon
 //! on the folder is what puts the logo in the sidebar. A mirror folder gets
 //! it through `NSWorkspace` (an `Icon\r` file); an on-demand drive's folder
-//! is a volume root and gets a volume icon instead ([`set_volume_icon`]).
+//! is a volume root and gets a volume icon instead ([`set_volume_icon`]). Its
+//! files are seeded into the vfs before mounting
+//! (`SidebarBackend::volume_root_files`): written only after mounting, the
+//! custom-icon bit could no longer be set once Finder had listed the
+//! folder, which kept the generic volume icon.
 
 use std::ffi::c_void;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
+use cloudreve_vfs::appledouble;
 use objc2::rc::autoreleasepool;
 use objc2::AllocAnyThread;
 use objc2_app_kit::{NSImage, NSWorkspace, NSWorkspaceIconCreationOptions};
@@ -195,6 +200,10 @@ fn set_custom_icon_flag(path: &Path, on: bool) -> Result<()> {
 /// and off this blocking thread, and its result is pinned by tests
 /// (`tests/finder_sidebar_macos.rs`). On the mount both names
 /// are local-only junk (`cloudreve_vfs::junk`): never uploaded.
+/// On the mount the FinderInfo lives in the root's `._.` sidecar, which
+/// only exists because `volume_root_files` seeded it before mounting
+/// (see `cloudreve_vfs::appledouble`): this is what the settings toggle
+/// and every start go through, the seed is what the first look gets.
 fn set_volume_icon(root: &Path) -> Result<()> {
     let icns = root.join(".VolumeIcon.icns");
     std::fs::write(&icns, ICON_ICNS).with_context(|| format!("failed to write {}", icns.display()))?;
@@ -292,5 +301,16 @@ impl SidebarBackend for FinderSidebar {
             }
             Ok(())
         })
+    }
+
+    fn volume_root_files(&self, icon: bool) -> Vec<(&'static str, Vec<u8>)> {
+        // The sidecar is seeded even without the logo: `set_icon` from the
+        // settings toggle can only set the bit in a sidecar that exists.
+        let finder_info = appledouble::with_custom_icon([0; 32], icon);
+        let mut files = vec![(appledouble::ROOT_SIDECAR_NAME, appledouble::finder_info_sidecar(finder_info))];
+        if icon {
+            files.push((".VolumeIcon.icns", ICON_ICNS.to_vec()));
+        }
+        files
     }
 }

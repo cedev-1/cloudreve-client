@@ -309,6 +309,9 @@ impl SidebarBackend for BrowsedFirst {
     fn clear_icon(&self, folder: &Path) -> anyhow::Result<()> {
         self.0.clear_icon(folder)
     }
+    fn volume_root_files(&self, icon: bool) -> Vec<(&'static str, Vec<u8>)> {
+        self.0.volume_root_files(icon)
+    }
 }
 
 /// The on-demand drive's folder (the NFS mount root) resolves to the

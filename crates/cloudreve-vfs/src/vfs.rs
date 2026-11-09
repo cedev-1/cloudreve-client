@@ -1990,6 +1990,27 @@ impl Vfs {
         Ok(())
     }
 
+    /// Puts a whole local-only junk file (see `crate::junk`) named `name`
+    /// in `parent`, replacing one already there. How the app seeds the
+    /// volume root before mounting (`crate::appledouble`): no handle, no
+    /// open/write/close round. Any other name is refused — it would have
+    /// to reach the server.
+    pub async fn put_local_only(&self, parent: NodeId, name: &str, data: Vec<u8>) -> Result<()> {
+        if junk::classify(name) != Some(JunkKind::LocalOnly) {
+            return Err(anyhow::Error::new(JunkNameError { name: name.to_string() }));
+        }
+        let _ns_guard = self.namespace_lock.read().await;
+        let parent_attr = self
+            .tree
+            .getattr(parent)
+            .await?
+            .context("put_local_only: unknown parent (readdir/lookup it first)")?;
+        let remote_path = format!("{}/{name}", parent_attr.remote_path);
+        self.junk.lock().unwrap().insert(remote_path, JunkFile { data, mtime_secs: unix_now() });
+        self.tree.insert_local_entry(parent, name).await?;
+        Ok(())
+    }
+
     /// Writes `data` at `offset`. The first write on a handle with no draft
     /// yet materializes the file first (D2: downloads the whole current
     /// content through `read_from_cache` into a fresh draft) — unless a
