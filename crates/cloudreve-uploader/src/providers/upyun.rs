@@ -52,7 +52,7 @@ where
     debug!(
         target: "uploader::upyun",
         size = chunk.size,
-        url = %url,
+        url = %cloudreve_api::redact::redact_url(url.as_ref()),
         "Uploading file to Upyun (streaming)"
     );
 
@@ -79,6 +79,7 @@ where
         .multipart(form)
         .send()
         .await
+        .map_err(|e| e.without_url())
         .context("failed to upload to Upyun")?;
 
     if !response.status().is_success() {

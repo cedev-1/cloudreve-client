@@ -86,6 +86,7 @@ where
         .body(body)
         .send()
         .await
+        .map_err(|e| e.without_url())
         .with_context(|| format!("failed to upload chunk {} to OneDrive", chunk.index))?;
 
     let status = response.status();
@@ -139,6 +140,7 @@ pub async fn query_session_status(
         .get(url)
         .send()
         .await
+        .map_err(|e| e.without_url())
         .context("failed to query OneDrive session status")?;
 
     if !response.status().is_success() {

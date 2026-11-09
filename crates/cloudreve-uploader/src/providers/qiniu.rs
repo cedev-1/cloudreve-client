@@ -62,7 +62,7 @@ where
         target: "uploader::qiniu",
         chunk = chunk.index,
         size = chunk.size,
-        url = %url,
+        url = %cloudreve_api::redact::redact_url(url.as_ref()),
         "Uploading chunk to Qiniu (streaming)"
     );
 
@@ -76,6 +76,7 @@ where
         .body(body)
         .send()
         .await
+        .map_err(|e| e.without_url())
         .with_context(|| format!("failed to upload chunk {} to Qiniu", chunk.index))?;
 
     if !response.status().is_success() {
@@ -131,7 +132,7 @@ pub async fn complete_upload(http_client: &HttpClient, session: &UploadSession) 
 
     debug!(
         target: "uploader::qiniu",
-        url = %url,
+        url = %cloudreve_api::redact::redact_url(url.as_ref()),
         parts = request.parts.len(),
         "Completing Qiniu multipart upload"
     );
@@ -143,6 +144,7 @@ pub async fn complete_upload(http_client: &HttpClient, session: &UploadSession) 
         .json(&request)
         .send()
         .await
+        .map_err(|e| e.without_url())
         .context("failed to complete Qiniu upload")?;
 
     if !response.status().is_success() {

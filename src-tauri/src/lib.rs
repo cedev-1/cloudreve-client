@@ -313,7 +313,8 @@ pub fn run() {
                 let handle = app.handle().clone();
                 app.deep_link().on_open_url(move |event| {
                     for url in event.urls() {
-                        tracing::info!(target: "main", url = %url, "Deep link received");
+                        // The query carries the OAuth code, state and user id: never log it.
+                        tracing::info!(target: "main", url = %cloudreve_api::redact::redact_url(url.as_str()), "Deep link received");
                         let _ = handle.emit("deeplink", url.to_string());
                         show_add_drive_window_impl(&handle);
                     }

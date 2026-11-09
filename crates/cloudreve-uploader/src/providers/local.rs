@@ -84,7 +84,7 @@ where
         target: "uploader::remote",
         chunk = chunk.index,
         size = chunk.size,
-        url = %url,
+        url = %cloudreve_api::redact::redact_url(url.as_ref()),
         "Uploading chunk to slave node (streaming)"
     );
 
@@ -101,6 +101,7 @@ where
         .body(body)
         .send()
         .await
+        .map_err(|e| e.without_url())
         .context("failed to upload chunk")?;
 
     if !response.status().is_success() {

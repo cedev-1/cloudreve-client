@@ -149,7 +149,8 @@ impl From<std::io::Error> for UploadError {
 
 impl From<reqwest::Error> for UploadError {
     fn from(err: reqwest::Error) -> Self {
-        UploadError::HttpError(err.to_string())
+        // A storage URL carries its signature: keep it out of the message.
+        UploadError::HttpError(err.without_url().to_string())
     }
 }
 

@@ -32,7 +32,7 @@ where
         target: "uploader::s3",
         chunk = chunk.index,
         size = chunk.size,
-        url = %url,
+        url = %cloudreve_api::redact::redact_url(url.as_ref()),
         "Uploading chunk to S3 (streaming)"
     );
 
@@ -46,6 +46,7 @@ where
         .body(body)
         .send()
         .await
+        .map_err(|e| e.without_url())
         .with_context(|| format!("failed to upload chunk {}", chunk.index))?;
 
     if !response.status().is_success() {
@@ -116,7 +117,7 @@ pub async fn complete_upload_oss(http_client: &HttpClient, session: &UploadSessi
 
     debug!(
         target: "uploader::s3",
-        url = %url,
+        url = %cloudreve_api::redact::redact_url(url.as_ref()),
         "Completing OSS multipart upload"
     );
 
@@ -128,6 +129,7 @@ pub async fn complete_upload_oss(http_client: &HttpClient, session: &UploadSessi
         .header("x-oss-complete-all", "yes")
         .send()
         .await
+        .map_err(|e| e.without_url())
         .context("failed to complete OSS upload")?;
 
     if !response.status().is_success() {
@@ -152,7 +154,7 @@ pub async fn complete_upload_s3like(
 
     debug!(
         target: "uploader::s3",
-        url = %url,
+        url = %cloudreve_api::redact::redact_url(url.as_ref()),
         "Completing S3-like multipart upload"
     );
 
@@ -169,6 +171,7 @@ pub async fn complete_upload_s3like(
     let response = request
         .send()
         .await
+        .map_err(|e| e.without_url())
         .context("failed to complete S3-like upload")?;
 
     if !response.status().is_success() {
@@ -190,7 +193,7 @@ pub async fn complete_upload_obs(http_client: &HttpClient, session: &UploadSessi
 
     debug!(
         target: "uploader::s3",
-        url = %url,
+        url = %cloudreve_api::redact::redact_url(url.as_ref()),
         "Completing OBS multipart upload"
     );
 
@@ -200,6 +203,7 @@ pub async fn complete_upload_obs(http_client: &HttpClient, session: &UploadSessi
         .body(body)
         .send()
         .await
+        .map_err(|e| e.without_url())
         .context("failed to complete OBS upload")?;
 
     if !response.status().is_success() {

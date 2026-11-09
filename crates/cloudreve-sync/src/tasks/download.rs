@@ -349,7 +349,7 @@ impl<'a> DownloadTask<'a> {
             self.cr_client.rewrite_url_origin(&raw)
         };
 
-        debug!(target: "tasks::download", task_id = %self.task.task_id, url = %download_url, size = file_size, "Got download URL");
+        debug!(target: "tasks::download", task_id = %self.task.task_id, url = %cloudreve_api::redact::redact_url(&download_url), size = file_size, "Got download URL");
 
         // Create parent directory
         if let Some(parent) = local_path.parent() {
@@ -426,7 +426,7 @@ impl<'a> DownloadTask<'a> {
         reporter: &InMemoryDownloadProgressReporter,
     ) -> Result<()> {
         let client = reqwest::Client::new();
-        let response = client.get(url).send().await.context("download request failed")?;
+        let response = client.get(url).send().await.map_err(|e| e.without_url()).context("download request failed")?;
 
         if !response.status().is_success() {
             anyhow::bail!("Download failed with status: {}", response.status());
@@ -441,7 +441,7 @@ impl<'a> DownloadTask<'a> {
             if self.cancel_token.is_cancelled() {
                 anyhow::bail!("Download cancelled");
             }
-            let chunk = chunk_result.context("failed to read download chunk")?;
+            let chunk = chunk_result.map_err(|e| e.without_url()).context("failed to read download chunk")?;
             file.write_all(&chunk).await.context("failed to write chunk")?;
             tracker.add_bytes(chunk.len() as u64);
             if last_report.elapsed() >= REPORT_INTERVAL {
