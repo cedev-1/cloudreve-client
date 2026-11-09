@@ -80,3 +80,10 @@ jobs:
 
       - name: Run tests
         run: cargo test -p cloudreve-vfs
+
+      - name: Finder sidebar (real LSSharedFileList and NSWorkspace)
+        # Edits the runner's Finder Favorites, so it is #[ignore]d for local runs.
+        run: |
+          cargo test -p cloudreve-sync --lib sidebar
+          cargo test -p cloudreve-sync --test drive_sidebar
+          cargo test -p cloudreve-sync --test finder_sidebar_macos -- --ignored
