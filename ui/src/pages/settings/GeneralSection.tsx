@@ -215,6 +215,7 @@ interface GeneralSettings {
   heartbeat_interval: number;
   check_updates_on_startup: boolean;
   auto_install_updates: boolean;
+  package_managed: boolean;
 }
 
 const LOG_LEVELS = [
@@ -246,6 +247,7 @@ export default function GeneralSection() {
   const [heartbeatInterval, setHeartbeatInterval] = useState(15);
   const [checkUpdatesOnStartup, setCheckUpdatesOnStartup] = useState(true);
   const [autoInstallUpdates, setAutoInstallUpdates] = useState(false);
+  const [packageManaged, setPackageManaged] = useState(false);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -267,6 +269,7 @@ export default function GeneralSection() {
         setHeartbeatInterval(settings.heartbeat_interval);
         setCheckUpdatesOnStartup(settings.check_updates_on_startup);
         setAutoInstallUpdates(settings.auto_install_updates);
+        setPackageManaged(settings.package_managed);
       } catch (error) {
         console.error("Failed to load settings:", error);
       } finally {
@@ -424,14 +427,17 @@ export default function GeneralSection() {
   return (
     <Box>
       <SettingsGroup title={t("settings.launchSettings")}>
-        <SettingItem
-          title={t("settings.autoStart")}
-          description={t("settings.autoStartDescription")}
-          checked={autoStart}
-          onChange={handleAutoStartChange}
-          disabled={loading}
-          isLast={false}
-        />
+        {/* Package-managed builds (Nix...) start through their package, see packaging.rs */}
+        {!packageManaged && (
+          <SettingItem
+            title={t("settings.autoStart")}
+            description={t("settings.autoStartDescription")}
+            checked={autoStart}
+            onChange={handleAutoStartChange}
+            disabled={loading}
+            isLast={false}
+          />
+        )}
         <SettingItem
           title={t("settings.fastPopupLaunch")}
           description={t("settings.fastPopupLaunchDescription")}
@@ -442,24 +448,26 @@ export default function GeneralSection() {
         />
       </SettingsGroup>
 
-      <SettingsGroup title={t("settings.updateSettings")}>
-        <SettingItem
-          title={t("settings.checkUpdatesOnStartup")}
-          description={t("settings.checkUpdatesOnStartupDescription")}
-          checked={checkUpdatesOnStartup}
-          onChange={handleCheckUpdatesOnStartupChange}
-          disabled={loading}
-          isLast={false}
-        />
-        <SettingItem
-          title={t("settings.autoInstallUpdates")}
-          description={t("settings.autoInstallUpdatesDescription")}
-          checked={autoInstallUpdates}
-          onChange={handleAutoInstallUpdatesChange}
-          disabled={loading || !checkUpdatesOnStartup}
-          isLast={true}
-        />
-      </SettingsGroup>
+      {!packageManaged && (
+        <SettingsGroup title={t("settings.updateSettings")}>
+          <SettingItem
+            title={t("settings.checkUpdatesOnStartup")}
+            description={t("settings.checkUpdatesOnStartupDescription")}
+            checked={checkUpdatesOnStartup}
+            onChange={handleCheckUpdatesOnStartupChange}
+            disabled={loading}
+            isLast={false}
+          />
+          <SettingItem
+            title={t("settings.autoInstallUpdates")}
+            description={t("settings.autoInstallUpdatesDescription")}
+            checked={autoInstallUpdates}
+            onChange={handleAutoInstallUpdatesChange}
+            disabled={loading || !checkUpdatesOnStartup}
+            isLast={true}
+          />
+        </SettingsGroup>
+      )}
 
       <SettingsGroup title={t("settings.languageSettings")}>
         <SettingSelectItem

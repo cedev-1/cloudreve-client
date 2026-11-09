@@ -15,6 +15,7 @@ use tokio::sync::OnceCell;
 use crate::commands::{show_add_drive_window_impl, show_main_window, show_settings_window_impl};
 mod commands;
 mod event_handler;
+mod packaging;
 
 #[macro_use]
 extern crate rust_i18n;
@@ -113,8 +114,9 @@ fn send_update_notification(app_handle: &AppHandle, title: &str, body: &str) {
 
 /// Spawn the automatic update check on startup
 async fn spawn_auto_update_check(app_handle: AppHandle) {
-    if !ConfigManager::get().check_updates_on_startup() {
-        tracing::info!(target: "updater", "Auto update check disabled");
+    let package_managed = packaging::package_managed();
+    if !packaging::should_check_for_updates(package_managed, ConfigManager::get().check_updates_on_startup()) {
+        tracing::info!(target: "updater", package_managed, "Auto update check disabled");
         return;
     }
 
@@ -279,7 +281,13 @@ pub fn run() {
 
             #[cfg(desktop)]
             {
-                if let Err(e) = app.deep_link().register("cloudreve") {
+                // A package-managed Linux build ships a .desktop entry that
+                // already declares `x-scheme-handler/cloudreve`; registering
+                // again would point the handler at the unwrapped store binary.
+                // See `packaging`.
+                if cfg!(target_os = "linux") && packaging::package_managed() {
+                    tracing::info!(target: "main", "Package-managed build, deep link handled by the packaged .desktop entry");
+                } else if let Err(e) = app.deep_link().register("cloudreve") {
                     tracing::warn!(target: "main", error = %e, "Failed to register deep link scheme via plugin, trying lsregister");
                     // On macOS in dev mode, try registering via lsregister directly
                     #[cfg(target_os = "macos")]
