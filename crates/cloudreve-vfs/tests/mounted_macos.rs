@@ -918,11 +918,13 @@ async fn the_mount_is_nobrowse_and_opts_out_of_spotlight() {
 
 /// The Cloudreve logo `cloudreve_sync::sidebar` puts on the drive folder,
 /// set the way the app sets it (`NSWorkspace.setIcon(_:forFile:options:)`,
-/// through JXA here) on the mounted root. AppKit writes an `Icon\r` file
-/// whose resource fork holds the image, and sets the custom-icon bit in the
-/// root's `com.apple.FinderInfo`; NFSv3 has no xattrs, so both land in
-/// AppleDouble sidecars. All of it must work (Finder reads the icon back
-/// from there) and none of it may reach the server.
+/// through JXA here) on the mounted root. AppKit sets the custom-icon bit in
+/// the root's `com.apple.FinderInfo` and stores the image either in an
+/// `Icon\r` file's resource fork (a folder) or, the mount root being a
+/// volume root, in `.VolumeIcon.icns` (the first CI run found no `Icon\r`
+/// fork; the `DRIVE-ICON` line logs which). NFSv3 has no xattrs: the
+/// FinderInfo lands in an AppleDouble sidecar. All of it must work (Finder
+/// reads the icon back from there) and none of it may reach the server.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_drive_folder_icon_set_on_the_mount_root_reads_back_and_is_never_uploaded() {
     let env = VfsTestEnv::new().await;
@@ -940,7 +942,7 @@ async fn the_drive_folder_icon_set_on_the_mount_root_reads_back_and_is_never_upl
 
     let icns = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../src-tauri/icons/icon.icns");
     let mp2 = mountpoint.clone();
-    let (set_out, finder_info, fork_len, names) = blocking_with_timeout(move || {
+    let (set_out, finder_info, fork_len, volume_icon_len, names) = blocking_with_timeout(move || {
         let script = "ObjC.import('AppKit'); function run(a) { \
             var img = $.NSImage.alloc.initWithContentsOfFile(a[1]); \
             return $.NSWorkspace.sharedWorkspace.setIconForFileOptions(img, a[0], 0); }";
@@ -965,7 +967,10 @@ async fn the_drive_folder_icon_set_on_the_mount_root_reads_back_and_is_never_upl
             .unwrap_or(0);
         let names: Vec<String> =
             std::fs::read_dir(&mp2).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
-        (set_out, finder_info, fork_len, names)
+        // The mount root is a VOLUME root: AppKit may store its icon as the
+        // volume icon instead of an `Icon\r` file.
+        let volume_icon_len = std::fs::metadata(mp2.join(".VolumeIcon.icns")).map(|m| m.len()).unwrap_or(0);
+        (set_out, finder_info, fork_len, volume_icon_len, names)
     })
     .await;
     vfs.wait_for_writeback_idle().await;
@@ -976,7 +981,11 @@ async fn the_drive_folder_icon_set_on_the_mount_root_reads_back_and_is_never_upl
     assert_eq!(finder_info.len(), 32, "no FinderInfo on the root: {finder_info:?}");
     let flags = u8::from_str_radix(&finder_info[8], 16).unwrap();
     assert!(flags & 0x04 != 0, "the custom-icon bit is not set: {finder_info:?}");
-    assert!(fork_len > 1000, "Icon\\r has no icon in its resource fork ({fork_len} bytes)");
+    eprintln!("DRIVE-ICON Icon\\r resource fork: {fork_len} bytes, .VolumeIcon.icns: {volume_icon_len} bytes");
+    assert!(
+        fork_len > 1000 || volume_icon_len > 1000,
+        "the icon image is nowhere: Icon\\r fork {fork_len} bytes, .VolumeIcon.icns {volume_icon_len} bytes"
+    );
     assert_eq!(names, vec!["a.txt".to_string()], "the icon file must stay hidden like any junk");
     assert!(
         env.uploaded_names().is_empty() && env.create_file_call_count() == 0,
