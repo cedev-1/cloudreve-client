@@ -149,6 +149,14 @@ impl TestEnv {
         Self::build(1024, Vec::new(), None, DriveMode::OnDemand, Some(sidebar), true).await
     }
 
+    /// A drive whose sync folder is `sync_dir` exactly as the caller left it
+    /// (missing, or already there with its own permissions), real
+    /// `Mount::start()` already run in `mode` — what adding a drive on a
+    /// chosen folder does.
+    pub async fn started_on(sync_dir: PathBuf, mode: DriveMode) -> Self {
+        Self::build_with(1024, Vec::new(), Some(sync_dir), mode, None, false, false).await
+    }
+
     async fn build(
         max_file_size_mb: u64,
         ignore_patterns: Vec<String>,
@@ -157,11 +165,25 @@ impl TestEnv {
         sidebar: Option<Arc<dyn SidebarBackend>>,
         real_mount: bool,
     ) -> Self {
+        Self::build_with(max_file_size_mb, ignore_patterns, sync_dir_override, mode, sidebar, real_mount, true).await
+    }
+
+    async fn build_with(
+        max_file_size_mb: u64,
+        ignore_patterns: Vec<String>,
+        sync_dir_override: Option<PathBuf>,
+        mode: DriveMode,
+        sidebar: Option<Arc<dyn SidebarBackend>>,
+        real_mount: bool,
+        precreate_sync_dir: bool,
+    ) -> Self {
         let tmp = TempDir::new().expect("create temp dir");
         // The inventory DB deliberately stays in the temp dir: on an overridden
         // sync volume it would eat into the very free space under test.
         let sync_dir = sync_dir_override.unwrap_or_else(|| tmp.path().join("sync"));
-        std::fs::create_dir_all(&sync_dir).expect("create sync dir");
+        if precreate_sync_dir {
+            std::fs::create_dir_all(&sync_dir).expect("create sync dir");
+        }
 
         let inventory = Arc::new(
             InventoryDb::with_path(tmp.path().join("meta.db")).expect("create inventory db"),
@@ -210,7 +232,7 @@ impl TestEnv {
         if let Some(sidebar) = &sidebar {
             mount.set_sidebar_backend(sidebar.clone());
         }
-        if mode == DriveMode::OnDemand || sidebar.is_some() {
+        if mode == DriveMode::OnDemand || sidebar.is_some() || !precreate_sync_dir {
             mount.start().await.expect("start the mount");
         }
 

@@ -105,7 +105,7 @@ pub fn is_clamped(cap: u64) -> bool {
 /// `Mount::start_on_demand`/`remount_on_demand`, before pre-clean ever
 /// ran — that was the bug).
 fn ensure_mountpoint_ready(mountpoint: &Path) -> Result<()> {
-    std::fs::create_dir_all(mountpoint).with_context(|| {
+    crate::utils::secure_fs::create_private_dir_all(mountpoint).with_context(|| {
         format!("failed to create the on-demand mountpoint {}", mountpoint.display())
     })?;
     let has_entries = std::fs::read_dir(mountpoint)

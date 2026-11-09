@@ -372,7 +372,7 @@ impl Mount {
             DriveMode::FullMirror => {
                 // Ensure the local sync directory exists
                 if !sync_path.exists() {
-                    std::fs::create_dir_all(&sync_path).with_context(|| {
+                    crate::utils::secure_fs::create_private_dir_all(&sync_path).with_context(|| {
                         format!("Failed to create sync directory: {}", sync_path.display())
                     })?;
                     tracing::info!(target: "drive::mounts", path = %sync_path.display(), "Created sync directory");
