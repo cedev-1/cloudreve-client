@@ -691,6 +691,8 @@ pub struct WriteBackQueue {
     /// instead of finishing with the tokens of a drive that no longer
     /// exists. A `watch` rather than a bare flag so a waiting task wakes.
     stopped: Arc<tokio::sync::watch::Sender<bool>>,
+    /// Names the drive in this queue's log lines — see `Vfs::set_drive_label`.
+    drive: Arc<StdMutex<Arc<str>>>,
 }
 
 /// Scope guard for `WriteBackQueue::run` (phase 4, this task): removes
@@ -760,11 +762,20 @@ impl WriteBackQueue {
             panic_next_upload: Arc::new(StdMutex::new(false)),
             discarded: Arc::new(StdMutex::new(HashSet::new())),
             stopped: Arc::new(tokio::sync::watch::channel(false).0),
+            drive: Arc::new(StdMutex::new(Arc::from(""))),
         }
     }
 
     fn is_stopped(&self) -> bool {
         *self.stopped.borrow()
+    }
+
+    pub(crate) fn set_drive_label(&self, label: &str) {
+        *self.drive.lock().unwrap() = Arc::from(label);
+    }
+
+    pub(crate) fn drive_label(&self) -> Arc<str> {
+        self.drive.lock().unwrap().clone()
     }
 
     /// Stops this queue for good — see `Vfs::shutdown`. Idempotent. Armed

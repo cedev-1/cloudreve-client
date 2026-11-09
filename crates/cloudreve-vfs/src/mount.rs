@@ -310,14 +310,12 @@ mod macos_impl {
     use std::time::Duration;
 
     use anyhow::{bail, Context, Result};
-    use nfs3_server::tcp::{NFSTcp, NFSTcpListener};
-    use tokio::task::JoinHandle;
 
     use super::{
         blocking_bounded, read_mount_marker, remove_mount_marker, resolve_mountpoint_for_comparison,
         run_ok, run_ok_bounded, write_mount_marker, DETECT_BUDGET, MOUNT_BUDGET, UMOUNT_STEP_BUDGET,
     };
-    use crate::nfs::VfsNfs;
+    use crate::nfs::{start_server, NfsServer, VfsNfs};
     use crate::vfs::Vfs;
 
     /// mount_nfs option string, minus the `port=`/`mountport=` pair this
@@ -510,16 +508,13 @@ mod macos_impl {
             );
         }
 
-        let listener = NFSTcpListener::bind("127.0.0.1:0", fs)
-            .await
-            .context("binding the in-process nfs3 server to 127.0.0.1:0")?;
-        let port = listener.get_listen_port();
+        // A GUI app starts with a soft limit of 256 descriptors; the
+        // server's accept loop must not be the first thing to run out.
+        raise_open_file_limit();
 
-        let server_task: JoinHandle<()> = tokio::spawn(async move {
-            if let Err(err) = listener.handle_forever().await {
-                tracing::warn!(?err, "vfs nfs3 server task exited");
-            }
-        });
+        let drive = vfs.drive_label();
+        let server = start_server(fs, drive.clone()).await?;
+        let port = server.port;
 
         let mountpoint_owned = mountpoint.to_path_buf();
         let opts_owned = mount_opts.to_string();
@@ -530,9 +525,10 @@ mod macos_impl {
         if let Err(err) = mount_result {
             // The OS never attached, so there is nothing mounted to clean up
             // — just stop the now-useless server task.
-            server_task.abort();
+            server.abort();
             return Err(err);
         }
+        tracing::info!(%drive, mountpoint = %mountpoint.display(), port, "vfs: mounted");
 
         if let Err(err) = write_mount_marker(cache_dir, &port.to_string()) {
             tracing::warn!(
@@ -549,9 +545,33 @@ mod macos_impl {
         Ok(MountedVfs {
             mountpoint: mountpoint.to_path_buf(),
             cache_dir: cache_dir.to_path_buf(),
-            server_task: Some(server_task),
+            stopped: server.stopped(),
+            server_task: Some(server),
             vfs,
         })
+    }
+
+    /// Raises this process's soft `RLIMIT_NOFILE` to its hard limit,
+    /// capped at `OPEN_MAX` (10240 — macOS refuses anything higher, even
+    /// under an unlimited hard limit). Best-effort and idempotent: a
+    /// failure only leaves the old limit in place.
+    pub(crate) fn raise_open_file_limit() {
+        const OPEN_MAX: libc::rlim_t = 10240;
+        // SAFETY: plain syscalls on a stack struct we own.
+        unsafe {
+            let mut lim: libc::rlimit = std::mem::zeroed();
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
+                return;
+            }
+            let target = lim.rlim_max.min(OPEN_MAX);
+            if lim.rlim_cur >= target {
+                return;
+            }
+            lim.rlim_cur = target;
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) != 0 {
+                tracing::warn!(err = %std::io::Error::last_os_error(), "vfs: could not raise the open file limit");
+            }
+        }
     }
 
     /// Runs `/sbin/mount_nfs` against the in-process server listening on
@@ -582,13 +602,24 @@ mod macos_impl {
     pub struct MountedVfs {
         mountpoint: PathBuf,
         cache_dir: PathBuf,
-        server_task: Option<JoinHandle<()>>,
+        server_task: Option<NfsServer>,
+        stopped: tokio::sync::watch::Receiver<Option<String>>,
         /// Held to stop its folder refreshes (`crate::nudge`) before the
         /// mount goes away.
         vfs: Arc<Vfs>,
     }
 
     impl MountedVfs {
+        /// Learn that the server behind this mount died on its own: the
+        /// value turns `Some(reason)` (an ERROR is logged too), and the
+        /// mount answers every app with errors until it is unmounted and
+        /// mounted again. `changed()` returning `Err` instead means the
+        /// mount was torn down on purpose (`unmount`, drop) — nothing to
+        /// report. Subscribe right after `mount` returns.
+        pub fn server_stopped(&self) -> tokio::sync::watch::Receiver<Option<String>> {
+            self.stopped.clone()
+        }
+
         /// Unmounts cleanly: OS-level umount escalation chain first (each
         /// rung bounded — see [`UMOUNT_STEP_BUDGET`]), then this mount's
         /// identity marker is removed (best-effort — see
@@ -603,6 +634,7 @@ mod macos_impl {
             if let Some(task) = self.server_task.take() {
                 task.abort();
             }
+            tracing::info!(drive = %self.vfs.drive_label(), mountpoint = %self.mountpoint.display(), "vfs: unmounted");
             Ok(())
         }
 
@@ -923,7 +955,7 @@ mod linux_impl {
         blocking_bounded, read_mount_marker, remove_mount_marker, resolve_mountpoint_for_comparison,
         run_ok_bounded, write_mount_marker, DETECT_BUDGET, MOUNT_BUDGET, UMOUNT_STEP_BUDGET,
     };
-    use crate::fuse::VfsFuse;
+    use crate::fuse::{SessionEndNotifier, VfsFuse};
     use crate::vfs::Vfs;
 
     /// Mounts `vfs` as a real FUSE drive at `mountpoint` (D1). `mountpoint`
@@ -980,7 +1012,14 @@ mod linux_impl {
         }
 
         let rt = tokio::runtime::Handle::current();
-        let fs = VfsFuse::new(vfs.clone(), rt);
+        let drive = vfs.drive_label();
+        let (stopped_tx, stopped) = tokio::sync::watch::channel(None);
+        let deliberate = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fs = VfsFuse::new(vfs.clone(), rt).with_end_notifier(SessionEndNotifier {
+            tx: stopped_tx,
+            deliberate: deliberate.clone(),
+            drive: drive.clone(),
+        });
         let options = [
             fuser::MountOption::FSName(volume_name.to_string()),
             fuser::MountOption::Subtype("cloudreve".to_string()),
@@ -1005,12 +1044,15 @@ mod linux_impl {
 
         // Attached: from now on a remote change can refresh the folders a
         // file manager shows (`crate::nudge`).
+        tracing::info!(%drive, mountpoint = %mountpoint.display(), "vfs: mounted");
         vfs.start_nudging(crate::nudge::touch_through(mountpoint.to_path_buf()));
 
         Ok(MountedVfs {
             mountpoint: mountpoint.to_path_buf(),
             cache_dir: cache_dir.to_path_buf(),
             session: Some(session),
+            stopped,
+            deliberate,
             vfs,
         })
     }
@@ -1023,12 +1065,23 @@ mod linux_impl {
         mountpoint: PathBuf,
         cache_dir: PathBuf,
         session: Option<fuser::BackgroundSession>,
+        stopped: tokio::sync::watch::Receiver<Option<String>>,
+        /// Set before this mount tears its session down on purpose, so
+        /// the session's end is not reported (see `SessionEndNotifier`).
+        deliberate: Arc<std::sync::atomic::AtomicBool>,
         /// Held to stop its folder refreshes (`crate::nudge`) before the
         /// mount goes away.
         vfs: Arc<Vfs>,
     }
 
     impl MountedVfs {
+        /// Same contract as the macOS branch's: `Some(reason)` once the
+        /// FUSE session ended on its own; `changed()` returning `Err`
+        /// means the mount was torn down on purpose.
+        pub fn server_stopped(&self) -> tokio::sync::watch::Receiver<Option<String>> {
+            self.stopped.clone()
+        }
+
         /// Unmounts cleanly. See the module doc for why dropping `session`
         /// IS the actual unmount (fuser's own escalation), and why this
         /// does not call `BackgroundSession::join()`. Async (this task, for
@@ -1036,19 +1089,36 @@ mod linux_impl {
         /// below (confirming the mount is really gone) now goes through
         /// [`blocking_bounded`] rather than an unbounded direct
         /// `/proc/mounts` read.
+        ///
+        /// A mount still busy after the session drop (a terminal sitting
+        /// inside it: EBUSY) is detached lazily through the escalation
+        /// chain instead of being left attached — with a live session
+        /// behind it, a later resume would trip over our own pid marker
+        /// (a misleading "folder not empty") and a drive delete would
+        /// remove the cache under a live mount.
         pub async fn unmount(mut self) -> Result<()> {
             self.vfs.stop_nudging().await;
+            self.deliberate.store(true, std::sync::atomic::Ordering::SeqCst);
             if let Some(session) = self.session.take() {
                 drop(session);
             }
             if is_our_fuse_mount(&self.mountpoint).await? {
-                bail!(
-                    "failed to unmount {} — a fuse mount is still present after dropping the \
-                     session",
-                    self.mountpoint.display()
+                tracing::warn!(
+                    drive = %self.vfs.drive_label(),
+                    mountpoint = %self.mountpoint.display(),
+                    "vfs: the mount is still busy after the session drop; detaching it lazily"
                 );
+                let _ = escalate_unmount(&self.mountpoint).await;
+                if is_our_fuse_mount(&self.mountpoint).await? {
+                    bail!(
+                        "failed to unmount {} — a fuse mount is still present after dropping the \
+                         session and exhausting the escalation chain",
+                        self.mountpoint.display()
+                    );
+                }
             }
             remove_mount_marker(&self.cache_dir);
+            tracing::info!(drive = %self.vfs.drive_label(), mountpoint = %self.mountpoint.display(), "vfs: unmounted");
             Ok(())
         }
 
@@ -1092,6 +1162,7 @@ mod linux_impl {
     impl Drop for MountedVfs {
         fn drop(&mut self) {
             if self.session.is_some() {
+                self.deliberate.store(true, std::sync::atomic::Ordering::SeqCst);
                 self.vfs.stop_nudging_now();
                 tracing::debug!(
                     mountpoint = %self.mountpoint.display(),

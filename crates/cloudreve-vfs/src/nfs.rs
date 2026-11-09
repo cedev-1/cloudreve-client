@@ -224,6 +224,73 @@ impl VfsNfs {
     }
 }
 
+/// The in-process NFS server behind one mount, listening on `127.0.0.1`,
+/// with no OS mount attached yet — see [`start_server`].
+#[doc(hidden)]
+pub struct NfsServer {
+    pub port: u16,
+    task: tokio::task::AbortHandle,
+    stopped: tokio::sync::watch::Receiver<Option<String>>,
+}
+
+impl NfsServer {
+    /// Stops the server deliberately: [`NfsServer::stopped`] never reports
+    /// it (its channel just closes).
+    pub fn abort(&self) {
+        self.task.abort();
+    }
+
+    /// `Some(reason)` once the server stopped ON ITS OWN — it can no longer
+    /// answer the kernel, and every app touching the mount gets errors
+    /// until it is remounted. A deliberate [`NfsServer::abort`] (unmount)
+    /// leaves it `None` and closes the channel instead.
+    pub fn stopped(&self) -> tokio::sync::watch::Receiver<Option<String>> {
+        self.stopped.clone()
+    }
+}
+
+/// Binds `fs` on an ephemeral `127.0.0.1` port and serves it until
+/// aborted, logging an ERROR and flagging [`NfsServer::stopped`] if it
+/// ever ends on its own. `label` names the drive in that log line.
+#[doc(hidden)]
+pub async fn start_server(fs: VfsNfs, label: String) -> anyhow::Result<NfsServer> {
+    use anyhow::Context;
+    use nfs3_server::tcp::{NFSTcp, NFSTcpListener};
+
+    let listener = NFSTcpListener::bind("127.0.0.1:0", fs)
+        .await
+        .context("binding the in-process nfs3 server to 127.0.0.1:0")?;
+    let port = listener.get_listen_port();
+    let server = tokio::spawn(async move { listener.handle_forever().await });
+    Ok(supervise(server, label, port))
+}
+
+/// Watches the server task: its end is reported unless it was aborted.
+fn supervise(
+    server: JoinHandle<std::io::Result<()>>,
+    label: String,
+    port: u16,
+) -> NfsServer {
+    let task = server.abort_handle();
+    let (stopped_tx, stopped) = tokio::sync::watch::channel(None);
+    tokio::spawn(async move {
+        let reason = match server.await {
+            Ok(Ok(())) => "the nfs server stopped".to_string(),
+            Ok(Err(err)) => format!("the nfs server stopped: {err}"),
+            Err(err) if err.is_cancelled() => return, // unmounted on purpose
+            Err(err) => format!("the nfs server panicked: {err}"),
+        };
+        tracing::error!(
+            drive = %label,
+            port,
+            %reason,
+            "vfs: the nfs server behind a mounted drive died; the drive is unreachable until remounted"
+        );
+        stopped_tx.send_replace(Some(reason));
+    });
+    NfsServer { port, task, stopped }
+}
+
 /// Test-only RPC tally of one mount, see [`VfsNfs::with_rpc_counts`].
 #[doc(hidden)]
 #[derive(Debug, Default)]
@@ -758,5 +825,48 @@ mod tests {
     #[test]
     fn negative_mtime_clamps_to_zero() {
         assert_eq!(to_nfstime3(-5, 7).seconds, 0);
+    }
+
+    /// The server's accept loop returning an error (EMFILE once killed
+    /// it) must reach whoever owns the mount instead of going unnoticed.
+    #[tokio::test]
+    async fn a_server_that_ends_on_its_own_is_reported_stopped() {
+        let server = tokio::spawn(async {
+            Err(std::io::Error::from_raw_os_error(libc::EMFILE))
+        });
+        let server = supervise(server, "drive-1".into(), 4242);
+        let mut stopped = server.stopped();
+        tokio::time::timeout(Duration::from_secs(2), stopped.wait_for(Option::is_some))
+            .await
+            .expect("the stop must be reported")
+            .expect("the channel must still be open");
+        assert!(stopped.borrow().as_deref().unwrap().contains("stopped"));
+    }
+
+    #[tokio::test]
+    async fn a_panicking_server_is_reported_stopped() {
+        let server = tokio::spawn(async { panic!("boom") });
+        let server = supervise(server, "drive-1".into(), 4242);
+        let mut stopped = server.stopped();
+        tokio::time::timeout(Duration::from_secs(2), stopped.wait_for(Option::is_some))
+            .await
+            .expect("the stop must be reported")
+            .unwrap();
+        assert!(stopped.borrow().as_deref().unwrap().contains("panicked"));
+    }
+
+    /// Unmounting aborts the server on purpose: nothing to report, the
+    /// channel just closes.
+    #[tokio::test]
+    async fn an_aborted_server_is_not_reported_stopped() {
+        let server = tokio::spawn(std::future::pending::<std::io::Result<()>>());
+        let server = supervise(server, "drive-1".into(), 4242);
+        let mut stopped = server.stopped();
+        server.abort();
+        let changed = tokio::time::timeout(Duration::from_secs(2), stopped.changed())
+            .await
+            .expect("the channel must close");
+        assert!(changed.is_err(), "a deliberate stop must close the channel, not report");
+        assert!(stopped.borrow().is_none());
     }
 }

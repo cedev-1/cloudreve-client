@@ -153,11 +153,40 @@ pub struct VfsFuse {
     /// Captured once at construction — see the module doc's D6 section for
     /// why this is sound and what it requires of the caller (`mount.rs`).
     rt: tokio::runtime::Handle,
+    /// Reports the session ending on its own — see [`SessionEndNotifier`].
+    end_notifier: Option<SessionEndNotifier>,
+}
+
+/// Dropped with the [`VfsFuse`] it sits in, which fuser drops when its
+/// session loop ends — on purpose (`MountedVfs::unmount`/drop, which set
+/// `deliberate` first) or not (the kernel side went away, an error in the
+/// loop). Only the latter is reported, as `Some(reason)` on the channel
+/// `MountedVfs::server_stopped` hands out.
+pub(crate) struct SessionEndNotifier {
+    pub(crate) tx: tokio::sync::watch::Sender<Option<String>>,
+    pub(crate) deliberate: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) drive: String,
+}
+
+impl Drop for SessionEndNotifier {
+    fn drop(&mut self) {
+        if self.deliberate.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let reason = "the FUSE session ended".to_string();
+        tracing::error!(drive = %self.drive, %reason, "vfs: the FUSE session behind a mounted drive ended; the drive is unreachable until remounted");
+        self.tx.send_replace(Some(reason));
+    }
 }
 
 impl VfsFuse {
     pub fn new(vfs: Arc<Vfs>, rt: tokio::runtime::Handle) -> Self {
-        Self { vfs, rt }
+        Self { vfs, rt, end_notifier: None }
+    }
+
+    pub(crate) fn with_end_notifier(mut self, notifier: SessionEndNotifier) -> Self {
+        self.end_notifier = Some(notifier);
+        self
     }
 
     /// Runs one facade `.await` to completion on this adapter's captured

@@ -632,6 +632,7 @@ impl Vfs {
         cache_dir: &Path,
         cache_max_bytes: u64,
     ) -> Result<(Self, mpsc::UnboundedReceiver<VfsEvent>)> {
+        let remote_base_label = remote_base.clone();
         let tree = Arc::new(VfsTree::new(client.clone(), remote_base));
         // D1 TRAP: `BlockCache::open` deletes any directory under its root
         // that lacks a `meta.json` — pointing it at a root that also holds
@@ -709,6 +710,9 @@ impl Vfs {
         // calling `wait_for_writeback_idle` right after `Vfs::new` would
         // otherwise hit: it must never see a falsely idle queue with the
         // re-enqueue still pending.
+        // Until the app names the drive (`set_drive_label`), its logs carry
+        // its remote root.
+        write_queue.set_drive_label(&remote_base_label);
         write_queue.enqueue_immediate(resume_paths);
         Ok((
             Self {
@@ -739,6 +743,18 @@ impl Vfs {
 
     pub fn tree(&self) -> &VfsTree {
         &self.tree
+    }
+
+    /// Names this drive (its id, say) in every log line this crate writes
+    /// for it — mount/unmount, upload failures, server death. Without it
+    /// the logs carry the drive's remote root. Safe to call any time.
+    pub fn set_drive_label(&self, label: &str) {
+        self.write_queue.set_drive_label(label);
+    }
+
+    /// See [`Vfs::set_drive_label`].
+    pub fn drive_label(&self) -> String {
+        self.write_queue.drive_label().to_string()
     }
 
     /// The one entry point for "this remote path changed on the server"
