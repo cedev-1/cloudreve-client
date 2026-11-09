@@ -1029,7 +1029,7 @@ async fn the_mount_root_finder_info_is_still_read_and_written_once_the_root_was_
     let (listed, seeded, written, rewritten) = blocking_with_timeout(move || {
         let read = |p: &std::path::Path| {
             let out = std::process::Command::new("/usr/bin/xattr").args(["-px", "com.apple.FinderInfo"]).arg(p).output().unwrap();
-            String::from_utf8_lossy(&out.stdout).split_whitespace().collect::<String>()
+            String::from_utf8_lossy(&out.stdout).split_whitespace().collect::<String>().to_lowercase()
         };
         let listed = std::fs::read_dir(&mp2).unwrap().count();
         let seeded = read(&mp2);
