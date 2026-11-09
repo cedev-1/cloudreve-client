@@ -168,6 +168,12 @@ rustPlatform.buildRustPackage (finalAttrs: {
         cat "$desktopFile" >&2
         exit 1
       }
+      # Tauri writes `Exec=cloudreve-desktop` without a field code, so a
+      # launcher opening cloudreve://... may start the app without the URL.
+      # %u hands it over as argv[1], which the app reads (single-instance).
+      substituteInPlace "$desktopFile" --replace-fail \
+        "Exec=cloudreve-desktop" "Exec=cloudreve-desktop %u"
+      grep -qx 'Exec=cloudreve-desktop %u' "$desktopFile"
     '';
 
   passthru = {
