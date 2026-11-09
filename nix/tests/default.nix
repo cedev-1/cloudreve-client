@@ -220,8 +220,10 @@ in
     ++ lib.optionals isLinux [
       {
         ok =
-          managed.systemd.user.services.cloudreve-client.Service.ExecStart
-          == "${fakeApp}/bin/cloudreve-desktop";
+          # home-manager normalises ExecStart to a list
+          lib.toList managed.systemd.user.services.cloudreve-client.Service.ExecStart == [
+            "${fakeApp}/bin/cloudreve-desktop"
+          ];
         msg = "systemd service does not run the package";
       }
       {
