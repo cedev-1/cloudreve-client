@@ -1,0 +1,51 @@
+name: Nix
+
+on:
+  push:
+    branches: [main, feat/nix-package]
+    paths: &paths
+      - 'flake.nix'
+      - 'flake.lock'
+      - 'nix/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/**'
+      - 'src-tauri/**'
+      - 'locales/**'
+      - 'ui/**'
+      - '.github/workflows/nix.yml'
+  pull_request:
+    paths: *paths
+  workflow_dispatch:
+
+jobs:
+  nix:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      # KVM is enabled on Linux so the NixOS VM test runs at full speed.
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          enable_kvm: true
+
+      - name: Evaluate every system
+        run: nix flake check --all-systems --no-build
+
+      - name: Build the package
+        run: nix build -L .#cloudreve-client
+
+      - name: Show the installed files
+        run: |
+          find -L result -maxdepth 4 | head -50
+          if [ -d result/share/applications ]; then cat result/share/applications/*.desktop; fi
+
+      # Package, module tests and (x86_64-linux) the NixOS VM test.
+      - name: Run the checks
+        run: nix flake check -L
