@@ -85,7 +85,13 @@ let
         ''
     );
 
-  appConfigSource = builtins.readFile ../../crates/cloudreve-sync/src/config.rs;
+  # Body of `pub struct AppConfig { ... }` (no regex: brace escapes differ
+  # between the darwin and Linux regex engines).
+  appConfigFields = lib.head (
+    lib.splitString "\n}" (
+      lib.elemAt (lib.splitString "pub struct AppConfig {" (builtins.readFile ../../crates/cloudreve-sync/src/config.rs)) 1
+    )
+  );
 
   typedKeys = lib.attrNames (
     lib.filterAttrs (n: _: !(lib.hasPrefix "_" n)) (
@@ -160,7 +166,7 @@ in
   # ignores it (serde skips unknown keys).
   settings-match-app = check "settings-match-app" (
     map (key: {
-      ok = builtins.match ".*pub struct AppConfig \\{[^}]*pub ${key}: [^}]*\\}.*" appConfigSource != null;
+      ok = lib.hasInfix "pub ${key}: " appConfigFields;
       msg = "settings.${key} is not a field of AppConfig in crates/cloudreve-sync/src/config.rs";
     }) typedKeys
     ++ [
