@@ -489,6 +489,17 @@ impl DraftStore {
         Ok(())
     }
 
+    /// How many files have local changes the server does not have yet:
+    /// every draft, whatever its state (a draft is removed only once its
+    /// upload landed, or the file was deleted).
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     /// Remote paths of every draft waiting to be uploaded or currently
     /// being uploaded — what Task 8's flusher and startup resume loop
     /// iterate over.

@@ -1133,6 +1133,13 @@ impl Vfs {
         self.write_queue.retry_pending().await
     }
 
+    /// How many files have changes not on the server yet — being edited,
+    /// waiting for their upload, uploading, or parked after failed
+    /// attempts. What the app shows as "waiting to upload".
+    pub async fn unsynced_file_count(&self) -> usize {
+        self.drafts.lock().await.len()
+    }
+
     /// Resolves once the write-back queue has nothing armed, queued, or
     /// uploading. Test and shutdown hook.
     pub async fn wait_for_writeback_idle(&self) {
