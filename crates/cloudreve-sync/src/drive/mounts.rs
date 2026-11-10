@@ -478,6 +478,8 @@ impl Mount {
 
         let (vfs, events) =
             vfs_mode::build_vfs(self.cr_client.clone(), remote_path, &cache_dir, cap)?;
+        // Its log lines then name the drive by id, like every other line here.
+        vfs.set_drive_label(&self.id);
 
         // Kept BEFORE attaching, so a failed mount still leaves the facade
         // running: drafts left by the last session keep uploading (`Vfs::new`
@@ -1156,7 +1158,17 @@ impl Mount {
         tracing::info!(target: "drive::mounts", id = %self.id, "Drive resumed");
     }
 
+    /// Real teardown (app quit, a drive that failed to start): unmounts,
+    /// stops every worker, and cuts the on-demand vfs off the server
+    /// (`Vfs::shutdown`) — its drafts stay on disk for the next launch.
     pub async fn shutdown(&self) {
+        self.stop(true).await;
+    }
+
+    /// `stop_vfs`: whether to also cut the vfs off the server. `delete`
+    /// passes false, to give uploads already under way a last chance to
+    /// land, and cuts it itself afterwards.
+    async fn stop(&self, stop_vfs: bool) {
         tracing::info!(target: "drive::mounts", id = %self.id, "Shutting down mount");
 
         // D5: shutdown unmounts an on-demand drive the same way pause does
@@ -1177,6 +1189,9 @@ impl Mount {
         if let Some(h) = self.remote_event_handle.lock().await.take() {
             h.abort();
         }
+        if let Some(h) = self.periodic_sync_handle.lock().await.take() {
+            h.abort();
+        }
         if let Some(h) = self.props_refresh_handle.lock().await.take() {
             h.abort();
         }
@@ -1187,12 +1202,23 @@ impl Mount {
             h.abort();
         }
 
+        if stop_vfs {
+            self.shutdown_vfs().await;
+        }
+
         // Shutdown task queue
         self.task_queue.shutdown().await;
     }
 
+    /// See `Vfs::shutdown`. A no-op for a mirror drive.
+    async fn shutdown_vfs(&self) {
+        if let Some(vfs) = self.vfs.lock().await.clone() {
+            vfs.shutdown();
+        }
+    }
+
     pub async fn delete(&self) -> Result<()> {
-        self.shutdown().await;
+        self.stop(false).await;
 
         // After `shutdown()`: an on-demand volume is detached by now, so
         // `sidebar_state` reports its bare mountpoint as not writable and
@@ -1224,6 +1250,9 @@ impl Mount {
                     tracing::warn!(target: "drive::mounts", id = %self.id, left, "removing an on-demand drive with changes that were never uploaded");
                 }
             }
+            // Whatever did not land in time never will: no retry may run
+            // later with the tokens of a drive that no longer exists.
+            self.shutdown_vfs().await;
             match vfs_mode::cache_dir_for(&self.id) {
                 Ok(cache_dir) => {
                     if let Err(err) = std::fs::remove_dir_all(&cache_dir)
