@@ -170,6 +170,9 @@ pub struct VfsNfs {
     /// READs that outlived [`READ_JUKEBOX_AFTER`] and were answered with
     /// JUKEBOX, still running, waiting for the client's resend.
     slow_reads: Mutex<HashMap<ReadKey, (Instant, JoinHandle<ReadResult>)>>,
+    /// Recent exclusive CREATEs: (parent fileid, name) -> (verifier, fileid),
+    /// so a resent one is recognized — see `create_exclusive`.
+    exclusive_creates: Mutex<HashMap<(u64, String), ([u8; 8], u64)>>,
 }
 
 impl VfsNfs {
@@ -188,6 +191,7 @@ impl VfsNfs {
             read_log: None,
             rpc_counts: None,
             slow_reads: Mutex::new(HashMap::new()),
+            exclusive_creates: Mutex::new(HashMap::new()),
         }
     }
 
@@ -588,21 +592,45 @@ impl NfsFileSystem for VfsNfs {
         &self,
         dirid: &FileHandleU64,
         filename: &filename3<'_>,
-        _createverf: createverf3,
+        createverf: createverf3,
     ) -> Result<FileHandleU64, nfsstat3> {
-        // The facade has no separate exclusive-create primitive and nowhere
-        // to persist a verifier to dedupe a retried request against.
-        // `Vfs::create`'s own EEXIST guard already gives exclusive create's
-        // essential guarantee (never silently overwrite an existing name),
-        // so this just reuses it; the verifier is accepted and ignored.
+        // `Vfs::create`'s EEXIST guard gives exclusive create's essential
+        // guarantee (never overwrite an existing name). RFC 1813 also asks
+        // that a RESENT call (same verifier: its reply was lost) succeed
+        // with the file it created: the verifier is remembered here, in
+        // memory, for recent creates — the facade has no attribute to keep
+        // it in, and a resend arrives within seconds, not across restarts.
         let parent = NodeId(dirid.as_u64());
         let name = name_str(filename)?;
         if self.is_never_index(dirid, &name) {
             return Err(nfsstat3::NFS3ERR_EXIST);
         }
-        let (node, handle) = self.vfs.create(parent, &name).await.map_err(|e| to_errno(&e))?;
-        crate::frontend_util::close_logged(&self.vfs, handle).await;
-        Ok(FileHandleU64::new(node.0))
+        let key = (dirid.as_u64(), name.clone());
+        match self.vfs.create(parent, &name).await {
+            Ok((node, handle)) => {
+                crate::frontend_util::close_logged(&self.vfs, handle).await;
+                let mut recent = self.exclusive_creates.lock().unwrap();
+                if recent.len() >= 1024 {
+                    recent.clear();
+                }
+                recent.insert(key, (createverf.0, node.0));
+                Ok(FileHandleU64::new(node.0))
+            }
+            Err(err) => {
+                let errno = to_errno(&err);
+                let remembered = self.exclusive_creates.lock().unwrap().get(&key).copied();
+                if let (nfsstat3::NFS3ERR_EXIST, Some((verf, fileid))) = (errno, remembered) {
+                    if verf == createverf.0 {
+                        if let Ok(Some((id, _))) = self.vfs.lookup(parent, &name).await {
+                            if id.0 == fileid {
+                                return Ok(FileHandleU64::new(fileid));
+                            }
+                        }
+                    }
+                }
+                Err(errno)
+            }
+        }
     }
 
     async fn mkdir(

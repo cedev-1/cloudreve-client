@@ -629,3 +629,26 @@ async fn the_volume_root_lists_its_own_appledouble_sidecar_and_no_other_junk() {
     assert_eq!(data, sidecar);
     assert_eq!(env.upload_session_count() + env.create_file_call_count(), 0);
 }
+
+/// RFC 1813 exclusive CREATE: a client that resends the call (its first
+/// reply was lost) with the SAME verifier must get the file it created,
+/// not EEXIST — while a different client's (different verifier) still
+/// gets EEXIST.
+#[tokio::test]
+async fn a_retransmitted_exclusive_create_succeeds_and_a_different_one_does_not() {
+    use nfs3_server::nfs3_types::nfs3::createverf3;
+    let env = VfsTestEnv::new().await;
+    env.set_remote_files(vec![]).await;
+    let (vfs, _rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+    vfs.set_debounce_for_tests(Duration::from_secs(3600));
+    let fs = VfsNfs::new(Arc::new(vfs));
+    let root = fs.root_dir();
+
+    let first = fs.create_exclusive(&root, &fname("lock.pid"), createverf3([7; 8])).await.unwrap();
+    let again = fs.create_exclusive(&root, &fname("lock.pid"), createverf3([7; 8])).await;
+    assert_eq!(again.map(|h| h.as_u64()), Ok(first.as_u64()), "the resend must get the same file");
+    let other = fs.create_exclusive(&root, &fname("lock.pid"), createverf3([9; 8])).await;
+    assert_eq!(other.map(|h| h.as_u64()), Err(nfsstat3::NFS3ERR_EXIST));
+}

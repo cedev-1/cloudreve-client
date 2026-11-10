@@ -676,11 +676,20 @@ mod macos_impl {
             // module doc's sentinel note.
             if let Some(task) = self.server_task.take() {
                 self.vfs.stop_nudging_now();
-                if let Err(err) = escalate_unmount_sync(&self.mountpoint) {
+                // On a thread of its own, waited for at most a bounded
+                // time: a wedged `umount` used to block whatever (tokio
+                // worker) thread dropped this, forever.
+                let mountpoint = self.mountpoint.clone();
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = tx.send(escalate_unmount_sync(&mountpoint));
+                });
+                let outcome = rx.recv_timeout(UMOUNT_STEP_BUDGET * 3);
+                if !matches!(outcome, Ok(Ok(()))) {
                     tracing::warn!(
                         mountpoint = %self.mountpoint.display(),
-                        ?err,
-                        "best-effort unmount on drop failed"
+                        ?outcome,
+                        "best-effort unmount on drop failed or is still running"
                     );
                 }
                 task.abort();
@@ -812,6 +821,9 @@ mod macos_impl {
         bail!("failed to unmount {} after exhausting the escalation chain", mountpoint.display());
     }
 
+    /// (Now run on a thread of its own by `Drop`, which waits for it a
+    /// bounded time — see there.)
+    ///
     /// Synchronous counterpart of [`escalate_unmount`], used ONLY by `Drop`
     /// (which cannot `.await` — there is no async destructor in Rust). Kept
     /// as a byte-for-byte copy of the pre-this-task escalation: unbounded,

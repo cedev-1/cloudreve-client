@@ -681,9 +681,9 @@ pub struct Vfs {
     /// unconditionally overwrites — silently discards whatever the first
     /// caller already wrote and had acknowledged. Guarded by a
     /// `std::sync::Mutex` (never held across an await, only for the
-    /// instant it takes to get-or-insert one entry); entries are never
-    /// removed, bounded by the number of distinct files ever drafted in
-    /// this process — far too small to matter for a desktop sync client.
+    /// instant it takes to get-or-insert one entry). Entries nobody holds are
+    /// dropped once the map passes `LOCK_MAP_PRUNE_AT` (`prune_unheld`): it
+    /// used to keep one per file ever drafted, without bound.
     ///
     /// LOCK ORDERING RULE (with `open_locks` below): `namespace_lock` before
     /// `open_lock` before `draft_begin_lock`, ALWAYS — see `namespace_lock`'s
@@ -717,7 +717,7 @@ pub struct Vfs {
     /// to a pre-existing file (`open`) or a brand-new one still being
     /// created (`create`). See `draft_begin_locks`'s doc above for the
     /// ordering rule the two lock maps must keep with respect to each
-    /// other. Same non-removal/std-Mutex-only-for-the-instant-of-lookup
+    /// other. Same pruning/std-Mutex-only-for-the-instant-of-lookup
     /// discipline as `draft_begin_locks`.
     ///
     /// EXTENDED SCOPE (phase 4, deliverable C): `rename` now also takes the
@@ -1117,7 +1117,13 @@ impl Vfs {
                     let _ = self
                         .events
                         .send(VfsEvent::UploadCancelled { remote_path: attr.remote_path.clone() });
-                    drafts.set_state(&attr.remote_path, DraftState::Editing)?;
+                    if let Err(err) = drafts.set_state(&attr.remote_path, DraftState::Editing) {
+                        // No handle is registered: give back the retain
+                        // taken above, or the entry stays pinned forever.
+                        drop(drafts);
+                        self.cache.lock().await.release(&key);
+                        return Err(err);
+                    }
                 }
             }
         }
@@ -1535,6 +1541,12 @@ impl Vfs {
     /// `CreatePauseHook`'s doc for why this exists instead of a plain
     /// racing-tasks test. Same non-`#[cfg(test)]` reasoning as
     /// `set_debounce_for_tests`.
+    /// Test-only: entries in `(open_locks, draft_begin_locks)`.
+    #[doc(hidden)]
+    pub fn lock_map_sizes_for_tests(&self) -> (usize, usize) {
+        (self.open_locks.lock().unwrap().len(), self.draft_begin_locks.lock().unwrap().len())
+    }
+
     pub fn pause_create_before_registration_for_tests(&self, hook: Arc<CreatePauseHook>) {
         *self.create_pause_hook.lock().unwrap() = Some(hook);
     }
@@ -2440,9 +2452,10 @@ impl Vfs {
 
     /// Gets (creating if needed) the per-path async lock that serializes
     /// "begin a draft for this path" between concurrent callers. See
-    /// `draft_begin_locks`'s field doc for why entries are never removed.
+    /// `draft_begin_locks`'s field doc for when entries are dropped.
     fn draft_begin_lock_for(&self, remote_path: &str) -> Arc<Mutex<()>> {
         let mut locks = self.draft_begin_locks.lock().unwrap();
+        prune_unheld(&mut locks);
         locks
             .entry(remote_path.to_string())
             .or_insert_with(|| Arc::new(Mutex::new(())))
@@ -2453,6 +2466,7 @@ impl Vfs {
     /// share — see `open_locks`'s field doc for the race it closes.
     fn open_lock_for(&self, remote_path: &str) -> Arc<Mutex<()>> {
         let mut locks = self.open_locks.lock().unwrap();
+        prune_unheld(&mut locks);
         locks
             .entry(remote_path.to_string())
             .or_insert_with(|| Arc::new(Mutex::new(())))
@@ -2862,6 +2876,18 @@ async fn fetch_download_url(client: &cloudreve_api::Client, key: &FileKey) -> Re
 /// an inclusive `(first_missing_block, last_missing_block)` pair. Pure and
 /// allocation-light so both the foreground read path and the background
 /// readahead path can share it without either one owning the other.
+/// Once a per-path lock map grows past this, entries nobody holds are
+/// dropped (amortized: one sweep per this many new paths).
+const LOCK_MAP_PRUNE_AT: usize = 256;
+
+/// Drops the locks only the map still references (no caller holds or
+/// waits on them): recreated on demand, they serialize exactly as before.
+fn prune_unheld(locks: &mut HashMap<String, Arc<Mutex<()>>>) {
+    if locks.len() >= LOCK_MAP_PRUNE_AT {
+        locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+    }
+}
+
 /// Wall-clock seconds since the epoch, for a local-only junk file's mtime.
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
