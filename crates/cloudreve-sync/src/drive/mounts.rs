@@ -234,6 +234,14 @@ pub struct Mount {
     /// mounting fails at launch or on "Retry"; the drive stays listed and
     /// saved instead of vanishing — see `DriveManager::add_drive_inner`.
     mount_problem: std::sync::Mutex<Option<String>>,
+    /// On-demand only: held across an attach or a detach, so two of them
+    /// never interleave (two resumes racing used to stack two mounts on
+    /// one folder).
+    attach_lock: Mutex<()>,
+    /// On-demand only: whether the volume is attached right now. Not
+    /// `mounted_vfs.is_some()`: under `MountTestHook` an attach succeeds
+    /// with no OS handle.
+    vfs_attached: std::sync::atomic::AtomicBool,
     /// Where "show in sidebar" lands. [`NoSidebar`] until the `DriveManager`
     /// installs the platform one (`set_sidebar_backend`) before `start()`:
     /// a `Mount` built anywhere else (tests) never edits the real sidebar.
@@ -346,6 +354,8 @@ impl Mount {
             vfs_failed_uploads: std::sync::atomic::AtomicU64::new(0),
             vfs_mount_test_hook: Mutex::new(None),
             mount_problem: std::sync::Mutex::new(None),
+            attach_lock: Mutex::new(()),
+            vfs_attached: std::sync::atomic::AtomicBool::new(false),
             sidebar_backend: std::sync::RwLock::new(Arc::new(NoSidebar)),
             sync_lock: Mutex::new(()),
             cr_client,
@@ -503,6 +513,7 @@ impl Mount {
         let hook = self.vfs_mount_test_hook.lock().await.clone();
         let mounted = vfs_mode::attach(vfs, mountpoint, &name, &cache_dir, cap, hook.as_ref()).await?;
         *self.mounted_vfs.lock().await = mounted;
+        self.vfs_attached.store(true, std::sync::atomic::Ordering::SeqCst);
         // A new node behind the folder: its sidebar glyph must be re-attached.
         self.sidebar_backend().glyph_folder_remounted();
 
@@ -515,6 +526,10 @@ impl Mount {
     /// OS-level attachment was ever torn down (`unmount_on_demand`), so
     /// this never touches `Vfs::new`/`build_vfs` again.
     pub async fn remount_on_demand(&self) -> Result<()> {
+        let _attaching = self.attach_lock.lock().await;
+        if self.vfs_attached.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(());
+        }
         // Never built (the very first `start` failed before the facade
         // existed): build and attach it now, like `start` would have.
         let Some(vfs) = self.vfs.lock().await.clone() else {
@@ -538,6 +553,7 @@ impl Mount {
             vfs_mode::attach(vfs, &sync_path, &name, &cache_dir, cap, hook.as_ref()).await?;
 
         *self.mounted_vfs.lock().await = mounted;
+        self.vfs_attached.store(true, std::sync::atomic::Ordering::SeqCst);
         self.sidebar_backend().glyph_folder_remounted();
         Ok(())
     }
@@ -547,6 +563,8 @@ impl Mount {
     /// attachment goes away — so `remount_on_demand` can re-attach the same
     /// instance.
     async fn unmount_on_demand(&self) {
+        let _detaching = self.attach_lock.lock().await;
+        self.vfs_attached.store(false, std::sync::atomic::Ordering::SeqCst);
         let mountpoint = self.get_sync_path().await;
         let hook = self.vfs_mount_test_hook.lock().await.clone();
         let mounted = self.mounted_vfs.lock().await.take();
@@ -1153,9 +1171,14 @@ impl Mount {
 
     /// Resume sync: clears the flag. Callers (DriveManager) are responsible
     /// for restarting background workers and triggering a full sync.
-    pub async fn resume(&self) {
-        self.paused.store(false, std::sync::atomic::Ordering::Relaxed);
-        tracing::info!(target: "drive::mounts", id = %self.id, "Drive resumed");
+    /// Returns whether the drive WAS paused: of two resumes racing, only one
+    /// sees `true`, so only one restarts the workers and remounts.
+    pub async fn resume(&self) -> bool {
+        let was_paused = self.paused.swap(false, std::sync::atomic::Ordering::SeqCst);
+        if was_paused {
+            tracing::info!(target: "drive::mounts", id = %self.id, "Drive resumed");
+        }
+        was_paused
     }
 
     /// Real teardown (app quit, a drive that failed to start): unmounts,

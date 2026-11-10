@@ -675,7 +675,11 @@ impl DriveManager {
             .clone();
         drop(read_guard);
 
-        mount.resume().await;
+        // Not paused and not waiting for a "Retry": already running.
+        if !mount.resume().await && mount.mount_problem().is_none() {
+            tracing::debug!(target: "drive::manager", drive_id = %id, "Resume ignored: drive is not paused");
+            return Ok(());
+        }
 
         let mode = mount.get_config().await.mode;
         match mode {
@@ -1263,6 +1267,53 @@ mod tests {
             2,
             "DriveManager::resume_drive must remount a paused on-demand drive"
         );
+    }
+
+    /// Two "Resume" clicks (popup and tray, or a double click) arriving
+    /// together used to attach the volume twice: two NFS servers, two
+    /// mounts stacked on one folder, the first unreachable for unmount.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_concurrent_resumes_mount_the_drive_once() {
+        let (manager, drive_id, hook, _tmp) =
+            manager_with_one_on_demand_drive_at("http://127.0.0.1:1").await;
+        manager.pause_drive(&drive_id).await.expect("pause");
+        let before = hook.mount_count();
+
+        let (a, b) = tokio::join!(manager.resume_drive(&drive_id), manager.resume_drive(&drive_id));
+        a.expect("first resume");
+        b.expect("second resume");
+
+        assert_eq!(hook.mount_count(), before + 1, "the volume was attached more than once");
+    }
+
+    /// Same for two "Retry" clicks on a drive that failed to mount: a retry
+    /// goes ahead whether or not the drive is paused, so only the attach
+    /// itself can tell the second one there is nothing left to do.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_concurrent_retries_mount_the_drive_once() {
+        let (manager, drive_id, hook, _tmp) =
+            manager_with_one_on_demand_drive_at("http://127.0.0.1:1").await;
+        manager.pause_drive(&drive_id).await.expect("pause");
+        manager.get_drive(&drive_id).await.unwrap().set_mount_problem(Some("could not mount".into()));
+        let before = hook.mount_count();
+
+        let (a, b) = tokio::join!(manager.resume_drive(&drive_id), manager.resume_drive(&drive_id));
+        a.expect("first retry");
+        b.expect("second retry");
+
+        assert_eq!(hook.mount_count(), before + 1, "the volume was attached more than once");
+    }
+
+    /// Resuming a drive that is already running changes nothing.
+    #[tokio::test]
+    async fn resuming_a_drive_that_is_not_paused_does_not_mount_it_again() {
+        let (manager, drive_id, hook, _tmp) =
+            manager_with_one_on_demand_drive_at("http://127.0.0.1:1").await;
+        let before = hook.mount_count();
+
+        manager.resume_drive(&drive_id).await.expect("resume");
+
+        assert_eq!(hook.mount_count(), before);
     }
 
     /// D7: a mounted on-demand drive must report itself as synced/idle
