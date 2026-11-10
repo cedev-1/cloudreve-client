@@ -119,6 +119,11 @@ struct Entry {
     /// realistic case in tests and under load), so eviction picks the
     /// LRU victim by comparing `seq`, not `last_used_unix`.
     seq: u64,
+    /// Bytes this entry stores ([`BlockCache::entry_bytes_on_disk`]),
+    /// kept current so the cache total never needs a stat of every entry.
+    bytes: u64,
+    /// Blocks added since meta.json was last written — see `write_block`.
+    meta_dirty: bool,
 }
 
 pub struct BlockCache {
@@ -143,6 +148,10 @@ pub struct BlockCache {
     /// meta.json and never restored by `open()`.
     retains: HashMap<String, u32>,
     next_seq: u64,
+    /// Sum of every entry's `bytes`: what [`BlockCache::used_bytes`]
+    /// answers. Eviction used to recompute it (a stat per entry) for every
+    /// victim of every block written, under the cache lock.
+    used: u64,
 }
 
 impl BlockCache {
@@ -196,6 +205,8 @@ impl BlockCache {
                     blocks: meta.blocks.into_iter().collect(),
                     last_used_unix: meta.last_used_unix,
                     seq: 0, // assigned below, in last-used order
+                    bytes: 0,
+                    meta_dirty: false,
                 },
             ));
         }
@@ -214,7 +225,12 @@ impl BlockCache {
         // Retains are handle liveness, not persisted state: a fresh
         // `open()` always starts with nothing retained, even if the
         // process that crashed had files open (see the field doc above).
-        Ok(Self { root: root.to_path_buf(), max_bytes, entries, retains: HashMap::new(), next_seq })
+        let mut cache = Self { root: root.to_path_buf(), max_bytes, entries, retains: HashMap::new(), next_seq, used: 0 };
+        let hashes: Vec<String> = cache.entries.keys().cloned().collect();
+        for hash in hashes {
+            cache.refresh_entry_bytes(&hash);
+        }
+        Ok(cache)
     }
 
     /// `None` if the block is absent for this EXACT `(remote_path, etag)`
@@ -320,17 +336,54 @@ impl BlockCache {
             blocks: BTreeSet::new(),
             last_used_unix: 0,
             seq: 0,
+            bytes: 0,
+            meta_dirty: false,
         });
         entry.etag = key.etag.clone();
-        entry.blocks.insert(block_idx);
+        let added = entry.blocks.insert(block_idx);
         entry.last_used_unix = now_unix();
         entry.seq = seq;
+        self.refresh_entry_bytes(&hash);
 
-        let entry = self.entries.get(&hash).expect("just inserted/updated above");
-        self.write_meta(&hash, entry)?;
+        // A file still open is typically being streamed block after block:
+        // its block list is written once its last handle closes (`release`)
+        // instead of once per block. A crash meanwhile only forgets those
+        // blocks — a cache miss, never a block claimed that is not there.
+        let retained = self.retains.contains_key(&hash);
+        let entry = self.entries.get_mut(&hash).expect("just inserted/updated above");
+        if retained {
+            entry.meta_dirty |= added;
+        } else {
+            entry.meta_dirty = false;
+            let entry = self.entries.get(&hash).expect("just inserted/updated above");
+            self.write_meta(&hash, entry)?;
+        }
 
         self.evict_if_over_budget()?;
         Ok(())
+    }
+
+    /// Recomputes one entry's `bytes` (one stat) and the cache total.
+    fn refresh_entry_bytes(&mut self, hash: &str) {
+        let Some(entry) = self.entries.get(hash) else { return };
+        let bytes = self.entry_bytes_on_disk(hash, entry);
+        let entry = self.entries.get_mut(hash).expect("checked above");
+        self.used = self.used - entry.bytes + bytes;
+        entry.bytes = bytes;
+    }
+
+    /// Writes the meta.json of an entry whose block list changed while it
+    /// was open. Best-effort: a failure leaves those blocks unrecorded
+    /// (cache misses after a restart).
+    fn flush_meta(&mut self, hash: &str) {
+        let Some(entry) = self.entries.get_mut(hash) else { return };
+        if !std::mem::take(&mut entry.meta_dirty) {
+            return;
+        }
+        let entry = self.entries.get(hash).expect("checked above");
+        if let Err(err) = self.write_meta(hash, entry) {
+            tracing::warn!(hash, err = %format!("{err:#}"), "cache: failed to persist a block list");
+        }
     }
 
     /// Registers a live file handle: while retained, this key's entry (or
@@ -358,11 +411,16 @@ impl BlockCache {
     /// first.
     pub fn release(&mut self, key: &FileKey) {
         let hash = hash_key(&key.remote_path, &key.etag);
-        if let std::collections::hash_map::Entry::Occupied(mut occ) = self.retains.entry(hash) {
+        let mut last = false;
+        if let std::collections::hash_map::Entry::Occupied(mut occ) = self.retains.entry(hash.clone()) {
             *occ.get_mut() -= 1;
             if *occ.get() == 0 {
                 occ.remove();
+                last = true;
             }
+        }
+        if last {
+            self.flush_meta(&hash);
         }
     }
 
@@ -376,7 +434,7 @@ impl BlockCache {
     /// separately — cheap at the entry counts this cache deals with, and
     /// it avoids a second piece of state that could drift from disk.
     pub fn used_bytes(&self) -> u64 {
-        self.entries.iter().map(|(hash, entry)| self.entry_bytes_on_disk(hash, entry)).sum()
+        self.used
     }
 
     /// Bumps an entry's recency (`seq` and `last_used_unix`) in memory only
@@ -405,7 +463,7 @@ impl BlockCache {
     /// trades staying over budget for never evicting a file someone has
     /// open.
     fn evict_if_over_budget(&mut self) -> Result<()> {
-        while self.used_bytes() > self.max_bytes {
+        while self.used > self.max_bytes {
             let victim = self
                 .entries
                 .iter()
@@ -464,7 +522,9 @@ impl BlockCache {
     fn drop_block(&mut self, hash: &str, block_idx: u64) -> Result<()> {
         if let Some(entry) = self.entries.get_mut(hash) {
             entry.blocks.remove(&block_idx);
+            entry.meta_dirty = false;
         }
+        self.refresh_entry_bytes(hash);
         if let Some(entry) = self.entries.get(hash) {
             self.write_meta(hash, entry)?;
         }
@@ -504,7 +564,9 @@ impl BlockCache {
     }
 
     fn remove_entry(&mut self, hash: &str) -> Result<()> {
-        self.entries.remove(hash);
+        if let Some(entry) = self.entries.remove(hash) {
+            self.used -= entry.bytes;
+        }
         let dir = self.entry_dir(hash);
         if dir.exists() {
             fs::remove_dir_all(&dir)
@@ -523,6 +585,18 @@ impl BlockCache {
 
     fn meta_path(&self, hash: &str) -> PathBuf {
         self.entry_dir(hash).join("meta.json")
+    }
+}
+
+/// Block lists of files still open when the cache goes away (shutdown,
+/// unmount) are written now — see `write_block`.
+impl Drop for BlockCache {
+    fn drop(&mut self) {
+        let dirty: Vec<String> =
+            self.entries.iter().filter(|(_, e)| e.meta_dirty).map(|(h, _)| h.clone()).collect();
+        for hash in dirty {
+            self.flush_meta(&hash);
+        }
     }
 }
 
@@ -791,5 +865,51 @@ mod tests {
         assert!(c.read_block(&key("old", "e"), 0).unwrap().is_some(), "recently used, kept");
         assert!(c.read_block(&key("pinned", "e"), 0).unwrap().is_some(), "pinned, kept");
         assert!(c.read_block(&key("recent", "e"), 0).unwrap().is_none(), "LRU victim");
+    }
+
+    /// Streaming a big open file wrote meta.json once per 1 MiB block.
+    /// While the file is open its block list is kept in memory and written
+    /// when the last handle closes (a crash before that only loses the
+    /// record of those blocks: a cache miss, never a wrong hit).
+    #[test]
+    fn streaming_an_open_file_writes_its_block_list_once_at_close() {
+        let dir = TempDir::new().unwrap();
+        let mut c = BlockCache::open(dir.path(), 100 * BLOCK_SIZE).unwrap();
+        let k = key("movie.mkv", "e");
+        c.retain(&k);
+        for b in 0..20 {
+            c.write_block(&k, b, &[b as u8; 4096]).unwrap();
+        }
+        let meta = dir.path().join(hash_key("movie.mkv", "e")).join("meta.json");
+        let listed = |p: &Path| -> usize {
+            std::fs::read(p).ok().and_then(|raw| serde_json::from_slice::<MetaFile>(&raw).ok()).map_or(0, |m| m.blocks.len())
+        };
+        assert!(listed(&meta) < 20, "meta.json was rewritten for every block");
+        c.release(&k);
+        assert_eq!(listed(&meta), 20, "closing the file must persist its block list");
+    }
+
+    /// The total kept in memory (no stat of every entry per write) must
+    /// agree with what a fresh scan of the disk finds.
+    #[test]
+    fn the_running_byte_count_matches_a_fresh_scan() {
+        let dir = TempDir::new().unwrap();
+        let used = {
+            let mut c = BlockCache::open(dir.path(), 6 * BLOCK_SIZE).unwrap();
+            let full = vec![1u8; BLOCK_SIZE as usize];
+            c.write_block(&key("a", "e"), 0, &full).unwrap();
+            c.write_block(&key("a", "e"), 1, &[2u8; 1000]).unwrap();
+            c.write_block(&key("a", "e"), 1, &[2u8; 3000]).unwrap(); // rewritten longer
+            c.write_block(&key("b", "e"), 0, &full).unwrap();
+            c.write_block(&key("b", "e"), 4, &[3u8; 10]).unwrap();
+            for name in ["c", "d", "f", "g"] {
+                c.write_block(&key(name, "e"), 0, &full).unwrap(); // forces evictions
+            }
+            c.purge("g").unwrap();
+            assert!(c.used_bytes() <= 6 * BLOCK_SIZE);
+            c.used_bytes()
+        };
+        let reopened = BlockCache::open(dir.path(), 6 * BLOCK_SIZE).unwrap();
+        assert_eq!(reopened.used_bytes(), used);
     }
 }
