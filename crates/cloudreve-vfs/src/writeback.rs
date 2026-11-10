@@ -696,6 +696,9 @@ pub struct WriteBackQueue {
     /// pin the `in_flight` scope-guard fix above: `Vfs::
     /// panic_next_upload_for_tests`/`tests/write_back.rs`'s panic test.
     panic_next_upload: Arc<StdMutex<bool>>,
+    /// Test-only pause right after the upload, past the first "deleted
+    /// mid-upload?" check — see `pause_before_settle_for_tests`.
+    settle_pause: Arc<StdMutex<Option<Arc<crate::vfs::CreatePauseHook>>>>,
     /// Paths deleted (`Vfs::unlink`) while their upload was in flight —
     /// see [`WriteBackQueue::discard_in_flight`]. `process` checks it at
     /// the end of the cycle and undoes whatever the upload put on the
@@ -780,6 +783,7 @@ impl WriteBackQueue {
             parked_retry_streak: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             in_flight: Arc::new(StdMutex::new(HashSet::new())),
             panic_next_upload: Arc::new(StdMutex::new(false)),
+            settle_pause: Arc::new(StdMutex::new(None)),
             discarded: Arc::new(StdMutex::new(HashSet::new())),
             stopped: Arc::new(tokio::sync::watch::channel(false).0),
             drive: Arc::new(StdMutex::new(Arc::from(""))),
@@ -816,6 +820,13 @@ impl WriteBackQueue {
     /// Test-only: makes the very next `process` call panic right before it
     /// would hand the draft's bytes to the uploader — see the
     /// `panic_next_upload` field's doc.
+    /// Test-only: every upload pauses once it landed and passed its first
+    /// "deleted mid-upload?" check, until `hook.resume` — the window an
+    /// unlink used to slip through (see `settle_uploaded_draft`).
+    pub fn pause_before_settle_for_tests(&self, hook: Arc<crate::vfs::CreatePauseHook>) {
+        *self.settle_pause.lock().unwrap() = Some(hook);
+    }
+
     pub fn panic_next_upload_for_tests(&self) {
         *self.panic_next_upload.lock().unwrap() = true;
     }
@@ -1273,6 +1284,7 @@ impl WriteBackQueue {
             }
         }
 
+        let started = std::time::Instant::now();
         let backoff = *self.retry_backoff.lock().unwrap();
         let uploader =
             Uploader::new(self.client.clone(), Arc::new(NoSessionStore), UploaderConfig::default());
@@ -1313,6 +1325,12 @@ impl WriteBackQueue {
             return;
         }
 
+        let pause = self.settle_pause.lock().unwrap().clone();
+        if let Some(hook) = pause {
+            hook.parked.notify_one();
+            hook.resume.notified().await;
+        }
+
         match last_err {
             None => match conflict_copy {
                 Some(conflict_path) => {
@@ -1327,7 +1345,16 @@ impl WriteBackQueue {
                     // — see `settle_uploaded_draft`.
                     self.tree.invalidate_path(&conflict_path).await;
                     self.tree.invalidate_path(remote_path).await;
-                    let rearm = self.settle_uploaded_draft(remote_path, snapshot_seq, None).await;
+                    let Some(rearm) = self.settle_uploaded_draft(remote_path, snapshot_seq, None).await else {
+                        self.finish_discarded(remote_path, &conflict_path).await;
+                        return;
+                    };
+                    tracing::info!(
+                        drive = %self.drive_label(),
+                        original = remote_path,
+                        copy = %conflict_path,
+                        "writeback: changed on the server meanwhile, local version saved as a conflict copy"
+                    );
                     let _ = self.events.send(crate::vfs::VfsEvent::ConflictSaved {
                         original: remote_path.to_string(),
                         conflict_copy: conflict_path,
@@ -1362,9 +1389,19 @@ impl WriteBackQueue {
                             "writeback: failed to purge stale blocks after upload"
                         );
                     }
-                    let rearm = self
-                        .settle_uploaded_draft(remote_path, snapshot_seq, Some(&new_etag))
-                        .await;
+                    let Some(rearm) =
+                        self.settle_uploaded_draft(remote_path, snapshot_seq, Some(&new_etag)).await
+                    else {
+                        self.finish_discarded(remote_path, remote_path).await;
+                        return;
+                    };
+                    tracing::info!(
+                        drive = %self.drive_label(),
+                        remote_path,
+                        bytes = size,
+                        duration_ms = started.elapsed().as_millis() as u64,
+                        "writeback: upload done"
+                    );
                     self.parked_retry_streak.store(0, Ordering::SeqCst);
                     let _ = self.events.send(crate::vfs::VfsEvent::UploadSucceeded {
                         remote_path: remote_path.to_string(),
@@ -1438,9 +1475,17 @@ impl WriteBackQueue {
         remote_path: &str,
         snapshot_seq: u64,
         landed_etag: Option<&str>,
-    ) -> bool {
+    ) -> Option<bool> {
         let mut drafts = self.drafts.lock().await;
-        match drafts.write_seq(remote_path) {
+        // Deleted after `process`'s own check (while the etag refresh
+        // ran): checked again here, under the lock `Vfs::unlink` holds
+        // while it marks the path discarded and drops the draft, so no
+        // unlink can slip between this check and the settling below.
+        // `None` tells the caller to undo the upload instead.
+        if self.is_discarded(remote_path) {
+            return None;
+        }
+        Some(match drafts.write_seq(remote_path) {
             Some(current_seq) if current_seq != snapshot_seq => {
                 if let Some(etag) = landed_etag {
                     if !etag.is_empty() {
@@ -1466,7 +1511,7 @@ impl WriteBackQueue {
                 let _ = drafts.remove(remote_path);
                 false
             }
-        }
+        })
     }
 }
 

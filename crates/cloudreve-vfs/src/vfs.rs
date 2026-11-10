@@ -1380,6 +1380,11 @@ impl Vfs {
         self.write_queue.panic_next_upload_for_tests();
     }
 
+    /// Test-only: see `WriteBackQueue::pause_before_settle_for_tests`.
+    pub fn pause_upload_before_settle_for_tests(&self, hook: Arc<CreatePauseHook>) {
+        self.write_queue.pause_before_settle_for_tests(hook);
+    }
+
     /// Test-only: makes the very next `DraftStore::set_state` call anywhere
     /// (e.g. inside `open`'s reopen-cancel, or `close`'s arm) fail as if its
     /// disk persist step failed, without touching disk. Pins the ordering
