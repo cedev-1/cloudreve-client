@@ -7,3 +7,9 @@
 void cloudreve_finder_sync_log(const char *message) {
     os_log(OS_LOG_DEFAULT, "%{public}s", message);
 }
+
+// Debug level: not persisted unless debug logging is turned on for the
+// process. For what may name the user's folders.
+void cloudreve_finder_sync_log_debug(const char *message) {
+    os_log_debug(OS_LOG_DEFAULT, "%{public}s", message);
+}

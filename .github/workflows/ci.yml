@@ -231,7 +231,7 @@ jobs:
             if pluginkit -m -v -i $ID | grep -q "^+.*Cloudreve.app/Contents/Helpers" \
               && pgrep -f CloudreveFinderSync.appex >/dev/null \
               && /usr/bin/log show --last 5m --style compact --predicate 'process == "CloudreveFinderSync"' \
-                 | grep -F "directoryURLs = [\"$DRIVE\"]"; then
+                 | grep -F "directoryURLs set, 1 folder(s)"; then
               ok=1; break
             fi
           done

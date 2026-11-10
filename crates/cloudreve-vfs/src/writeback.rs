@@ -699,6 +699,8 @@ pub struct WriteBackQueue {
     /// Test-only pause right after the upload, past the first "deleted
     /// mid-upload?" check — see `pause_before_settle_for_tests`.
     settle_pause: Arc<StdMutex<Option<Arc<crate::vfs::CreatePauseHook>>>>,
+    /// Rate-limits the per-file upload failure WARN.
+    log_limiter: Arc<crate::ratelimit::RateLimiter>,
     /// Paths deleted (`Vfs::unlink`) while their upload was in flight —
     /// see [`WriteBackQueue::discard_in_flight`]. `process` checks it at
     /// the end of the cycle and undoes whatever the upload put on the
@@ -784,6 +786,7 @@ impl WriteBackQueue {
             in_flight: Arc::new(StdMutex::new(HashSet::new())),
             panic_next_upload: Arc::new(StdMutex::new(false)),
             settle_pause: Arc::new(StdMutex::new(None)),
+            log_limiter: Arc::default(),
             discarded: Arc::new(StdMutex::new(HashSet::new())),
             stopped: Arc::new(tokio::sync::watch::channel(false).0),
             drive: Arc::new(StdMutex::new(Arc::from(""))),
@@ -1417,6 +1420,18 @@ impl WriteBackQueue {
                     self.drafts.lock().await.set_state(remote_path, DraftState::Pending)
                 {
                     tracing::warn!(remote_path, err = %format!("{e:#}"), "writeback: failed to park draft back to Pending");
+                }
+                // Once per file per few minutes: a parked draft is retried every
+                // 30 s to 10 min, each cycle ending here.
+                if self.log_limiter.allow(remote_path, Duration::from_secs(300)) {
+                    tracing::warn!(
+                        drive = %self.drive_label(),
+                        remote_path,
+                        attempts = UPLOAD_RETRIES,
+                        will_retry = !terminal,
+                        err = %format!("{err:#}"),
+                        "writeback: upload failed"
+                    );
                 }
                 // `terminal` (phase 4 task 3, R3): `true` only for the ONE
                 // fallback case `upload_plain_with_adoption` itself

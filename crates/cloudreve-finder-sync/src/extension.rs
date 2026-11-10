@@ -39,6 +39,7 @@ unsafe extern "C" {
 unsafe extern "C" {
     // src/oslog.c
     fn cloudreve_finder_sync_log(message: *const c_char);
+    fn cloudreve_finder_sync_log_debug(message: *const c_char);
 }
 
 /// To the unified log, readable: CI checks the extension through it
@@ -46,6 +47,13 @@ unsafe extern "C" {
 fn log(message: &str) {
     let message = CString::new(message.replace('\0', " ")).unwrap_or_default();
     unsafe { cloudreve_finder_sync_log(message.as_ptr()) };
+}
+
+/// Debug level, kept out of the persisted unified log: folder paths name
+/// the user's files, and every process can read that log.
+fn log_debug(message: &str) {
+    let message = CString::new(message.replace('\0', " ")).unwrap_or_default();
+    unsafe { cloudreve_finder_sync_log_debug(message.as_ptr()) };
 }
 
 /// The user's real home: inside the sandbox `$HOME` is the container.
@@ -71,7 +79,8 @@ fn read_folders() -> Vec<PathBuf> {
     match std::fs::read_to_string(&file) {
         Ok(content) => decode_folders(&content),
         Err(err) => {
-            log(&format!("CloudreveFinderSync: cannot read {}: {err}", file.display()));
+            log(&format!("CloudreveFinderSync: cannot read the folder list: {err}"));
+            log_debug(&format!("CloudreveFinderSync: cannot read {}: {err}", file.display()));
             Vec::new()
         }
     }
@@ -137,7 +146,8 @@ fn apply_folders() {
         controller.setDirectoryURLs(Some(&NSSet::from_retained_slice(&urls)));
     }
     let shown: Vec<String> = folders.iter().map(|f| f.display().to_string()).collect();
-    log(&format!("CloudreveFinderSync: directoryURLs = {shown:?}"));
+    log(&format!("CloudreveFinderSync: directoryURLs set, {} folder(s)", shown.len()));
+    log_debug(&format!("CloudreveFinderSync: directoryURLs = {shown:?}"));
 }
 
 impl CloudreveFinderSync {
