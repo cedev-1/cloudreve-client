@@ -210,7 +210,7 @@ async fn shutdown() {
         state.event_broadcaster.connection_status_changed(false);
         state.drive_manager.shutdown().await;
         if let Err(e) = state.drive_manager.persist().await {
-            tracing::error!(target: "main", error = %e, "Failed to persist drive configurations");
+            tracing::error!(target: "main", error = %format_args!("{e:#}"), "Failed to persist drive configurations");
         }
     }
     tracing::info!(target: "main", "Shutdown complete");
@@ -281,13 +281,13 @@ pub fn run() {
             let _ = app.handle().plugin(tauri_plugin_positioner::init());
 
             if let Err(e) = setup_tray(app) {
-                tracing::error!(target: "main", error = %e, "Failed to setup tray (continuing)");
+                tracing::error!(target: "main", error = %format_args!("{e:#}"), "Failed to setup tray (continuing)");
             }
 
             #[cfg(desktop)]
             {
                 if let Err(e) = app.deep_link().register("cloudreve") {
-                    tracing::warn!(target: "main", error = %e, "Failed to register deep link scheme via plugin, trying lsregister");
+                    tracing::warn!(target: "main", error = %format_args!("{e:#}"), "Failed to register deep link scheme via plugin, trying lsregister");
                     // On macOS in dev mode, try registering via lsregister directly
                     #[cfg(target_os = "macos")]
                     if let Ok(exe) = std::env::current_exe() {
@@ -327,7 +327,7 @@ pub fn run() {
                         .body(&body)
                         .show()
                     {
-                        tracing::warn!(target: "toast", error = %e, "Failed to send OS notification");
+                        tracing::warn!(target: "toast", error = %format_args!("{e:#}"), "Failed to send OS notification");
                     }
                 }
             });
@@ -335,7 +335,7 @@ pub fn run() {
             let app_handle = app.handle().clone();
             spawn(async move {
                 if let Err(e) = init_sync_service(app_handle).await {
-                    tracing::error!(target: "main", error = %e, "Failed to initialize sync service");
+                    tracing::error!(target: "main", error = %format_args!("{e:#}"), "Failed to initialize sync service");
                 }
             });
 

@@ -291,7 +291,7 @@ impl Mount {
             Box::pin(async move {
                 let command = MountCommand::RefreshCredentials { credentials: token };
                 if let Err(e) = command_tx.send(command) {
-                    tracing::error!(target: "drive::mounts", error = %e, "Failed to send RefreshCredentials command");
+                    tracing::error!(target: "drive::mounts", error = %format_args!("{e:#}"), "Failed to send RefreshCredentials command");
                 }
             })
         }));
@@ -301,7 +301,7 @@ impl Mount {
             let command_tx = command_tx_invalid.clone();
             Box::pin(async move {
                 if let Err(e) = command_tx.send(MountCommand::CredentialInvalid) {
-                    tracing::error!(target: "drive::mounts", error = %e, "Failed to send CredentialInvalid command");
+                    tracing::error!(target: "drive::mounts", error = %format_args!("{e:#}"), "Failed to send CredentialInvalid command");
                 }
             })
         }));
@@ -729,7 +729,7 @@ impl Mount {
                     spawn(async move {
                         let _lock = mount.sync_lock.lock().await;
                         if let Err(e) = mount.perform_sync(local_paths, mode, user_initiated).await {
-                            tracing::error!(target: "drive::mounts", error = %e, "Sync failed");
+                            tracing::error!(target: "drive::mounts", error = %format_args!("{e:#}"), "Sync failed");
                         }
                     });
                 }
@@ -772,7 +772,7 @@ impl Mount {
                             return;
                         }
                         if let Err(e) = mount_clone.re_enqueue_offline_tasks().await {
-                            tracing::warn!(target: "drive::mounts", error = %e, "Failed to re-enqueue offline tasks");
+                            tracing::warn!(target: "drive::mounts", error = %format_args!("{e:#}"), "Failed to re-enqueue offline tasks");
                         }
                         let _lock = mount_clone.sync_lock.lock().await;
                         match mount_clone.perform_full_sync().await {
@@ -780,7 +780,7 @@ impl Mount {
                                 mount_clone.set_initial_sync_completed(true).await;
                             }
                             Err(e) => {
-                                tracing::error!(target: "drive::mounts", error = %e, "Full sync failed");
+                                tracing::error!(target: "drive::mounts", error = %format_args!("{e:#}"), "Full sync failed");
                             }
                         }
                     });
@@ -1018,7 +1018,7 @@ impl Mount {
                 if let Some(problem) = newly {
                     let name = self.config.read().await.name.clone();
                     let message = upload_health::problem_message(problem, &name);
-                    tracing::warn!(target: "drive::mounts", id = %self.id, ?problem, error = %error, "Uploads keep failing");
+                    tracing::warn!(target: "drive::mounts", id = %self.id, ?problem, error = %format_args!("{error:#}"), "Uploads keep failing");
                     *self.upload_problem.lock().unwrap() = Some(message.clone());
                     toast::send_upload_problem_toast(&self.id, &message);
                 }
@@ -1084,7 +1084,7 @@ impl Mount {
             loop {
                 tokio::time::sleep(Duration::from_secs(300)).await;
                 if let Err(e) = mount.refresh_drive_props().await {
-                    tracing::warn!(target: "drive::mounts", id = %mount.id, error = %e, "Failed to refresh drive props");
+                    tracing::warn!(target: "drive::mounts", id = %mount.id, error = %format_args!("{e:#}"), "Failed to refresh drive props");
                 }
             }
         });

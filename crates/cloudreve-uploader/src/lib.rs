@@ -178,7 +178,7 @@ impl Uploader {
                     warn!(
                         target: "uploader",
                         session_id = %session.session_id(),
-                        error = %e,
+                        error = %format_args!("{e:#}"),
                         "Failed to delete remote upload session, will continue with new session"
                     );
                 }
@@ -225,14 +225,14 @@ impl Uploader {
                 error!(
                     target: "uploader",
                     local_path = %params.local_path.display(),
-                    error = %e,
+                    error = %format_args!("{e:#}"),
                     "Upload failed"
                 );
                 if let Err(e) = self.delete_remote_session(&session).await {
                     warn!(
                         target: "uploader",
                         local_path = %params.local_path.display(),
-                        error = %e,
+                        error = %format_args!("{e:#}"),
                         "Failed to delete remote upload session"
                     );
                 }
@@ -280,7 +280,7 @@ impl Uploader {
                             target: "uploader",
                             task_id = %params.task_id,
                             session_id = %session.id,
-                            error = %e,
+                            error = %format_args!("{e:#}"),
                             "Failed to delete expired upload session"
                         );
                     }
@@ -294,7 +294,7 @@ impl Uploader {
                 warn!(
                     target: "uploader",
                     task_id = %params.task_id,
-                    error = %e,
+                    error = %format_args!("{e:#}"),
                     "Failed to load existing session, will create new one"
                 );
                 Ok(None)

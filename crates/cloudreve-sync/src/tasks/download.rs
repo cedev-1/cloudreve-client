@@ -249,7 +249,7 @@ impl<'a> DownloadTask<'a> {
                             target: "tasks::download",
                             task_id = %self.task.task_id,
                             path = %local_path.display(),
-                            error = %e,
+                            error = %format_args!("{e:#}"),
                             "Failed to remove local file mirroring remote deletion"
                         );
                     }
@@ -405,7 +405,7 @@ impl<'a> DownloadTask<'a> {
                             .with_size(file_info.size)
                             .with_local_mtime(local_mtime_secs(&local_path));
                         if let Err(e) = self.inventory.upsert(&entry) {
-                            warn!(target: "tasks::download", task_id = %self.task.task_id, error = %e, "Failed to update inventory after download");
+                            warn!(target: "tasks::download", task_id = %self.task.task_id, error = %format_args!("{e:#}"), "Failed to update inventory after download");
                         }
                     }
                 }

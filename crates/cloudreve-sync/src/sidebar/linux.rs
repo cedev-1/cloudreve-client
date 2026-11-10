@@ -84,7 +84,7 @@ impl LinuxPlaces {
         match Command::new("gio").args(args).output() {
             Ok(out) if out.status.success() => {}
             Ok(out) => tracing::debug!(target: "sidebar", stderr = %String::from_utf8_lossy(&out.stderr), "gio refused the folder icon"),
-            Err(err) => tracing::debug!(target: "sidebar", %err, "gio is not available"),
+            Err(err) => tracing::debug!(target: "sidebar", error = %format_args!("{err:#}"), "gio is not available"),
         }
     }
 }

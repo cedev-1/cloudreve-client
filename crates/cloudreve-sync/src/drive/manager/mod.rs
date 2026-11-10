@@ -36,6 +36,19 @@ pub struct DriveManager {
     /// test can drive `load()`/`add_drive`/`resume_drive` without a real
     /// OS mount (see `vfs_mode::MountTestHook`). `None` in production.
     vfs_mount_test_hook: std::sync::Mutex<Option<Arc<MountTestHook>>>,
+    /// Sidebar glyph updates, run off the save path: see
+    /// `publish_sidebar_glyphs`.
+    glyphs: GlyphPublisher,
+}
+
+/// Orders the background glyph updates: each save takes a generation, and
+/// an update older than the one already applied is dropped, so the last
+/// save always wins however the blocking threads get scheduled.
+#[derive(Default)]
+struct GlyphPublisher {
+    requested: Arc<std::sync::atomic::AtomicU64>,
+    applied: Arc<std::sync::Mutex<u64>>,
+    last: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl DriveManager {
@@ -69,6 +82,7 @@ impl DriveManager {
             heartbeat_manager,
             sidebar_backend: sidebar::platform_backend(),
             vfs_mount_test_hook: std::sync::Mutex::new(None),
+            glyphs: GlyphPublisher::default(),
         })
     }
 
@@ -165,8 +179,6 @@ impl DriveManager {
         let config_file = self.get_config_file();
         let write_guard = self.drives.write().await;
 
-        tracing::debug!(target: "drive", path = %config_file.display(), count = write_guard.len(), "Persisting drive configurations");
-
         let mut new_state = DriveState::default();
 
         // Update drive states from underlying mounts
@@ -181,7 +193,8 @@ impl DriveManager {
         crate::utils::secure_fs::write_private(&config_file, content)
             .context("Failed to write drive config file")?;
 
-        tracing::info!(target: "drive", count = new_state.drives.len(), "Persisted drive(s) to config");
+        // Runs on every token refresh and toggle: one line, at debug.
+        tracing::debug!(target: "drive", path = %config_file.display(), count = new_state.drives.len(), "Persisted drive configurations");
         drop(write_guard);
 
         // Every change of a toggle, every added or removed drive ends here.
@@ -193,14 +206,35 @@ impl DriveManager {
     /// Hands the platform sidebar the folders whose row gets the Cloudreve
     /// glyph (`SidebarBackend::set_glyph_folders`): every drive whose "show
     /// in sidebar" toggle is on. A failure only costs the glyph.
+    ///
+    /// In the background: the macOS backend may block on PlugInKit for
+    /// seconds, and every token refresh and settings toggle waits for
+    /// `persist()`.
     async fn publish_sidebar_glyphs(&self, drives: &[DriveConfig]) {
         let folders: Vec<PathBuf> =
             drives.iter().filter(|d| d.sidebar.enabled).map(|d| d.sync_path.clone()).collect();
         let backend = self.sidebar_backend.clone();
-        match tokio::task::spawn_blocking(move || backend.set_glyph_folders(&folders)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => tracing::warn!(target: "drive", ?err, "failed to give the drive folders their sidebar glyph"),
-            Err(err) => tracing::warn!(target: "drive", ?err, "sidebar glyph update panicked"),
+        let generation = self.glyphs.requested.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let applied = self.glyphs.applied.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            let mut applied = applied.lock().unwrap();
+            if *applied > generation {
+                return;
+            }
+            *applied = generation;
+            if let Err(err) = backend.set_glyph_folders(&folders) {
+                tracing::warn!(target: "drive", error = %format_args!("{err:#}"), "failed to give the drive folders their sidebar glyph");
+            }
+        });
+        *self.glyphs.last.lock().unwrap() = Some(task);
+    }
+
+    /// Test-only: waits for the glyph update the last save started.
+    #[cfg(test)]
+    async fn glyphs_published(&self) {
+        let task = self.glyphs.last.lock().unwrap().take();
+        if let Some(task) = task {
+            let _ = task.await;
         }
     }
 
@@ -271,7 +305,7 @@ impl DriveManager {
                     config.raw_icon_path = Some(result.raw_path);
                 }
                 Err(e) => {
-                    tracing::warn!(target: "drive", error = %e, "Failed to fetch favicon, continuing without icon");
+                    tracing::warn!(target: "drive", error = %format_args!("{e:#}"), "Failed to fetch favicon, continuing without icon");
                 }
             }
         }
@@ -374,7 +408,7 @@ impl DriveManager {
         // anyway (see its own unreachable guard).
         if mode == DriveMode::FullMirror {
             if let Err(e) = command_tx.send(MountCommand::FullSync) {
-                tracing::warn!(target: "drive::manager", drive_id = %id, error = %e, "Failed to send initial FullSync command");
+                tracing::warn!(target: "drive::manager", drive_id = %id, error = %format_args!("{e:#}"), "Failed to send initial FullSync command");
             } else {
                 tracing::info!(target: "drive::manager", drive_id = %id, "Initial FullSync scheduled");
             }
@@ -516,14 +550,14 @@ impl DriveManager {
         if let Some(ref ico_path) = config.icon_path {
             if std::path::Path::new(ico_path).exists() {
                 if let Err(e) = std::fs::remove_file(ico_path) {
-                    tracing::warn!(target: "drive::manager", drive_id = %id, error = %e, "Failed to remove old ICO file");
+                    tracing::warn!(target: "drive::manager", drive_id = %id, error = %format_args!("{e:#}"), "Failed to remove old ICO file");
                 }
             }
         }
         if let Some(ref raw_path) = config.raw_icon_path {
             if std::path::Path::new(raw_path).exists() {
                 if let Err(e) = std::fs::remove_file(raw_path) {
-                    tracing::warn!(target: "drive::manager", drive_id = %id, error = %e, "Failed to remove old raw icon file");
+                    tracing::warn!(target: "drive::manager", drive_id = %id, error = %format_args!("{e:#}"), "Failed to remove old raw icon file");
                 }
             }
         }
@@ -545,7 +579,7 @@ impl DriveManager {
                 config.raw_icon_path = Some(result.raw_path);
             }
             Err(e) => {
-                tracing::warn!(target: "drive::manager", drive_id = %id, error = %e, "Failed to re-fetch favicon, continuing without icon");
+                tracing::warn!(target: "drive::manager", drive_id = %id, error = %format_args!("{e:#}"), "Failed to re-fetch favicon, continuing without icon");
             }
         }
 
@@ -1140,7 +1174,7 @@ impl DriveManager {
             }),
             Ok(None) => None,
             Err(e) => {
-                tracing::warn!(target: "drive::manager", drive_id = %drive_id, error = %e, "Failed to get drive props");
+                tracing::warn!(target: "drive::manager", drive_id = %drive_id, error = %format_args!("{e:#}"), "Failed to get drive props");
                 None
             }
         }
@@ -1284,6 +1318,7 @@ mod tests {
             heartbeat_manager,
             sidebar_backend: Arc::new(crate::sidebar::NoSidebar),
             vfs_mount_test_hook: std::sync::Mutex::new(None),
+            glyphs: Default::default(),
         };
 
         (manager, drive_id, hook, tmp)
@@ -1602,6 +1637,7 @@ mod tests {
             heartbeat_manager,
             sidebar_backend: sidebar,
             vfs_mount_test_hook: std::sync::Mutex::new(None),
+            glyphs: Default::default(),
         };
         (manager, tmp)
     }
@@ -1799,6 +1835,7 @@ mod tests {
             vec![on_demand_drive(tmp, "Cloudreve", true), on_demand_drive(tmp, "Archives", false)]
         })
         .await;
+        manager.glyphs_published().await;
 
         assert_eq!(sidebar.glyph_folders(), Some(vec![drives[0].sync_path.clone()]));
         cleanup(manager, &drives).await;
@@ -1812,14 +1849,38 @@ mod tests {
         .await;
 
         manager.set_drive_sidebar(&drives[0].id, false).await.expect("toggle off");
+        manager.glyphs_published().await;
         assert_eq!(sidebar.glyph_folders(), Some(vec![drives[1].sync_path.clone()]));
 
         manager.set_drive_sidebar(&drives[0].id, true).await.expect("toggle on");
+        manager.glyphs_published().await;
         let mut both = sidebar.glyph_folders().unwrap();
         both.sort();
         let mut expected = vec![drives[0].sync_path.clone(), drives[1].sync_path.clone()];
         expected.sort();
         assert_eq!(both, expected);
+        cleanup(manager, &drives).await;
+    }
+
+    /// Updating the glyph can block (PlugInKit retries a second apart):
+    /// never the save of drives.json — which every token refresh and every
+    /// settings toggle waits for — and the last save still wins.
+    #[tokio::test]
+    async fn a_slow_glyph_update_does_not_hold_up_saving_the_drives() {
+        let (manager, sidebar, drives, _tmp) = launch_with(|tmp| {
+            vec![on_demand_drive(tmp, "Cloudreve", true), on_demand_drive(tmp, "Work", true)]
+        })
+        .await;
+        manager.glyphs_published().await;
+        *sidebar.glyph_delay.lock().unwrap() = Duration::from_millis(1500);
+
+        let started = std::time::Instant::now();
+        manager.set_drive_sidebar(&drives[0].id, false).await.expect("toggle off");
+        manager.set_drive_sidebar(&drives[1].id, false).await.expect("toggle off");
+        assert!(started.elapsed() < Duration::from_millis(1000), "saving waited {:?} for the glyph", started.elapsed());
+
+        manager.glyphs_published().await;
+        assert_eq!(sidebar.glyph_folders(), Some(vec![]), "the last save wins");
         cleanup(manager, &drives).await;
     }
 
@@ -1830,6 +1891,7 @@ mod tests {
 
         manager.remove_drive(&drives[0].id).await.expect("remove");
         manager.persist().await.expect("persist");
+        manager.glyphs_published().await;
 
         assert_eq!(sidebar.glyph_folders(), Some(vec![]));
         cleanup(manager, &drives).await;

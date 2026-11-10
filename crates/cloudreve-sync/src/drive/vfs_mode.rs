@@ -75,7 +75,7 @@ pub fn effective_cache_cap(cache_dir: &Path) -> u64 {
             tracing::warn!(
                 target: "drive::vfs_mode",
                 cache_dir = %cache_dir.display(),
-                %err,
+                error = %format_args!("{err:#}"),
                 "failed to query available disk space for the on-demand cache; using the default cap"
             );
             DEFAULT_CACHE_MAX_BYTES

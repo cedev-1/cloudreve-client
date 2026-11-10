@@ -35,13 +35,13 @@ impl DriveManager {
                 ManagerCommand::ViewOnline { path } => {
                     spawn(async move {
                         if let Err(e) = manager.handle_view_online(path.clone()).await {
-                            tracing::error!(target: "drive::manager", path = %path.display(), error = %e, "ViewOnline failed");
+                            tracing::error!(target: "drive::manager", path = %path.display(), error = %format_args!("{e:#}"), "ViewOnline failed");
                         }
                     });
                 }
                 ManagerCommand::PersistConfig => {
                     if let Err(e) = manager.persist().await {
-                        tracing::error!(target: "drive::manager", error = %e, "Failed to persist config");
+                        tracing::error!(target: "drive::manager", error = %format_args!("{e:#}"), "Failed to persist config");
                     }
                 }
                 ManagerCommand::SyncNow { paths, mode } => {

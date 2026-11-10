@@ -358,7 +358,7 @@ fn show_main_window_at_position(app: &AppHandle, position: Position) {
             let _ = window.set_focus();
         }
         Err(e) => {
-            tracing::error!(target: "main_popup", error = %e, "Failed to create main window");
+            tracing::error!(target: "main_popup", error = %format_args!("{e:#}"), "Failed to create main window");
         }
     }
 }
@@ -434,7 +434,7 @@ fn show_drive_window_internal(app: &AppHandle, title: &str, url_path: &str) {
             let _ = window.set_focus();
         }
         Err(e) => {
-            tracing::error!(target: "main", error = %e, "Failed to create window: {}", title);
+            tracing::error!(target: "main", error = %format_args!("{e:#}"), "Failed to create window: {}", title);
         }
     }
 }
@@ -475,7 +475,7 @@ pub fn show_settings_window_impl(app: &AppHandle) {
             let _ = window.set_focus();
         }
         Err(e) => {
-            tracing::error!(target: "main", error = %e, "Failed to create settings window");
+            tracing::error!(target: "main", error = %format_args!("{e:#}"), "Failed to create settings window");
         }
     }
 }

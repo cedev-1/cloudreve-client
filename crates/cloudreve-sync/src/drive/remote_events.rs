@@ -64,6 +64,15 @@ fn local_event_path(sync_root: &Path, event_path: &str) -> Option<PathBuf> {
     }
 }
 
+/// Consecutive failures after which the outage is logged as an error.
+const ERROR_AFTER_FAILURES: u32 = 5;
+
+/// How to log the `retry_count`-th consecutive subscription failure: a
+/// warning each time, and one error when the outage starts to last.
+fn failure_log_level(retry_count: u32) -> Option<tracing::Level> {
+    if retry_count == ERROR_AFTER_FAILURES { Some(tracing::Level::ERROR) } else { Some(tracing::Level::WARN) }
+}
+
 #[cfg(test)]
 mod backoff_tests {
     use super::*;
@@ -84,6 +93,18 @@ mod backoff_tests {
             Duration::from_secs(MAX_BACKOFF_SECS),
             "repeated failures must settle at the max delay, not stop"
         );
+    }
+
+    /// A server unreachable for a moment (a laptop waking up, a proxy
+    /// restart) is routine: warnings. Still failing after a while, it is an
+    /// error — logged once, not on every retry.
+    #[test]
+    fn only_a_lasting_outage_is_logged_as_an_error_and_only_once() {
+        let levels: Vec<_> = (1..=12).map(failure_log_level).collect();
+        assert_eq!(levels.iter().filter(|l| **l == Some(tracing::Level::ERROR)).count(), 1, "{levels:?}");
+        assert_eq!(levels[0], Some(tracing::Level::WARN));
+        assert_eq!(levels[1], Some(tracing::Level::WARN));
+        assert!(levels[11].is_some(), "a lasting outage still shows in the log: {levels:?}");
     }
 
     /// A successful connection resets the backoff to the initial delay.
@@ -137,13 +158,12 @@ impl Mount {
                 }
                 ListenResult::Error(e) => {
                     let delay = backoff.next_delay();
-                    tracing::error!(
-                        target: "drive::remote_events",
-                        error = %e,
-                        retry_count = backoff.retry_count,
-                        delay_secs = delay.as_secs(),
-                        "Failed to listen to remote events, retrying"
-                    );
+                    // The one log line per failure (`listen_remote_events` logs none).
+                    if failure_log_level(backoff.retry_count) == Some(tracing::Level::ERROR) {
+                        tracing::error!(target: "drive::remote_events", id = %s.id, error = %format_args!("{e:#}"), retry_count = backoff.retry_count, delay_secs = delay.as_secs(), "Remote events still unreachable, retrying");
+                    } else {
+                        tracing::warn!(target: "drive::remote_events", id = %s.id, error = %format_args!("{e:#}"), retry_count = backoff.retry_count, delay_secs = delay.as_secs(), "Failed to listen to remote events, retrying");
+                    }
                     tokio::time::sleep(delay).await;
                 }
             }
@@ -163,7 +183,6 @@ impl Mount {
                 sub
             }
             Err(e) => {
-                tracing::warn!(target: "drive::remote_events", id = %self.id, remote_base = %remote_base, error = %e, "SSE subscription failed");
                 self.set_event_push_subscribed(false).await;
                 return ListenResult::Error(e.into());
             }
@@ -271,7 +290,7 @@ impl Mount {
             return;
         }
         if let Err(e) = self.re_enqueue_offline_tasks().await {
-            tracing::warn!(target: "drive::remote_events", error = %e, "Failed to re-enqueue offline tasks on reconnect");
+            tracing::warn!(target: "drive::remote_events", error = %format_args!("{e:#}"), "Failed to re-enqueue offline tasks on reconnect");
         }
     }
 
@@ -358,7 +377,7 @@ impl Mount {
                     tracing::warn!(
                         target: "drive::remote_events",
                         path = %local_from.display(),
-                        error = %e,
+                        error = %format_args!("{e:#}"),
                         "Failed to cancel tasks for renamed-from path"
                     );
                 }

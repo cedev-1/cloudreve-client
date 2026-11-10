@@ -177,7 +177,7 @@ impl IgnoreMatcher {
                     tracing::warn!(
                         target: "drive::ignore",
                         pattern = %pattern,
-                        error = %e,
+                        error = %format_args!("{e:#}"),
                         "Skipping invalid ignore pattern"
                     );
                     continue;

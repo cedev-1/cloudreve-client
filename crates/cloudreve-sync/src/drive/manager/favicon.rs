@@ -169,7 +169,7 @@ pub async fn fetch_and_save_favicon(instance_url: &str) -> Result<FaviconResult>
     match fetch_icons_from_remote(instance_url, &icons_dir, hash).await {
         Ok(result) => return Ok(result),
         Err(e) => {
-            tracing::warn!(target: "drive::favicon", error = %e, "Failed to fetch favicon from remote, using fallback");
+            tracing::warn!(target: "drive::favicon", error = %format_args!("{e:#}"), "Failed to fetch favicon from remote, using fallback");
         }
     }
 
@@ -241,7 +241,7 @@ async fn fetch_icons_from_remote(instance_url: &str, icons_dir: &PathBuf, hash: 
     let small_bytes = match download_icon(&client, &smallest_icon_url).await {
         Ok(bytes) => bytes.to_vec(),
         Err(e) => {
-            tracing::warn!(target: "drive::favicon", error = %e, "Failed to download small icon, using fallback");
+            tracing::warn!(target: "drive::favicon", error = %format_args!("{e:#}"), "Failed to download small icon, using fallback");
             get_fallback_icon(IconType::Small)?
         }
     };
@@ -253,7 +253,7 @@ async fn fetch_icons_from_remote(instance_url: &str, icons_dir: &PathBuf, hash: 
         match download_icon(&client, &largest_icon_url).await {
             Ok(bytes) => bytes.to_vec(),
             Err(e) => {
-                tracing::warn!(target: "drive::favicon", error = %e, "Failed to download large icon, using fallback");
+                tracing::warn!(target: "drive::favicon", error = %format_args!("{e:#}"), "Failed to download large icon, using fallback");
                 get_fallback_icon(IconType::Large)?
             }
         }

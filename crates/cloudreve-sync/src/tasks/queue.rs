@@ -129,7 +129,7 @@ impl TaskQueue {
             warn!(
                 target: "tasks::queue",
                 drive = %queue.drive_id,
-                error = %err,
+                error = %format_args!("{err:#}"),
                 "Failed to resume pending tasks from inventory"
             );
         }
@@ -292,7 +292,7 @@ impl TaskQueue {
         self.cancel_requested.store(true, Ordering::SeqCst);
 
         if let Err(err) = self.command_tx.send(QueueCommand::Shutdown) {
-            warn!(target: "tasks::queue", error = %err, "Task queue dispatcher already closed");
+            warn!(target: "tasks::queue", error = %format_args!("{err:#}"), "Task queue dispatcher already closed");
         }
 
         if let Some(handle) = self.dispatcher_handle.lock().await.take() {
@@ -386,7 +386,7 @@ impl TaskQueue {
             let payload = match Self::payload_from_record(&record) {
                 Ok(p) => p,
                 Err(err) => {
-                    warn!(target: "tasks::queue", task_id = %record.id, error = %err, "Failed to build payload");
+                    warn!(target: "tasks::queue", task_id = %record.id, error = %format_args!("{err:#}"), "Failed to build payload");
                     continue;
                 }
             };
@@ -540,7 +540,7 @@ impl TaskQueue {
 
         // Cancel pending tasks in the DB
         if let Err(e) = self.inventory.cancel_all_active_tasks(&self.drive_id) {
-            warn!(target: "tasks::queue", error = %e, "Failed to cancel active tasks in inventory");
+            warn!(target: "tasks::queue", error = %format_args!("{e:#}"), "Failed to cancel active tasks in inventory");
         }
 
         self.notifier.notify();
@@ -593,7 +593,7 @@ impl TaskQueue {
                 error!(
                     target: "tasks::queue",
                     drive = %self.drive_id,
-                    error = %err,
+                    error = %format_args!("{err:#}"),
                     "Failed to acquire semaphore permit"
                 );
                 if let Err(update_err) = self.inventory.update_task(
@@ -692,7 +692,7 @@ impl TaskQueue {
                     target: "tasks::queue",
                     drive = %self.drive_id,
                     task_id = %task.task_id,
-                    error = %err,
+                    error = %format_args!("{err:#}"),
                     "Failed to check task status, proceeding with execution"
                 );
             }
@@ -710,7 +710,7 @@ impl TaskQueue {
                 target: "tasks::queue",
                 drive = %self.drive_id,
                 task_id = %task.task_id,
-                error = %err,
+                error = %format_args!("{err:#}"),
                 "Failed to mark task as running"
             );
             return;
@@ -736,7 +736,7 @@ impl TaskQueue {
                         target: "tasks::queue",
                         drive = %self.drive_id,
                         task_id = %task.task_id,
-                        error = %err,
+                        error = %format_args!("{err:#}"),
                         "Failed to mark task as completed"
                     );
                 }
@@ -754,7 +754,7 @@ impl TaskQueue {
                         target: "tasks::queue",
                         drive = %self.drive_id,
                         task_id = %task.task_id,
-                        error = %err,
+                        error = %format_args!("{err:#}"),
                         "Failed to mark task as cancelled"
                     );
                 }
@@ -909,7 +909,7 @@ impl TaskQueue {
         //             target: "tasks::queue",
         //             drive = %self.drive_id,
         //             task_id = %task.task_id,
-        //             error = %err,
+        //             error = %format_args!("{err:#}"),
         //             "Failed to persist placeholder progress"
         //         );
         //     }
@@ -1015,7 +1015,7 @@ impl TaskQueue {
                         target: "tasks::queue",
                         drive = %self.drive_id,
                         task_id = %record.id,
-                        error = %err,
+                        error = %format_args!("{err:#}"),
                         "Failed to build payload for resumed task"
                     );
                     continue;

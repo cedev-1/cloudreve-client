@@ -121,7 +121,7 @@ async fn warn_if_sync_will_not_fit(mount: &Mount, local_root: &PathBuf, needed: 
             tracing::warn!(
                 target: "drive::sync",
                 id = %mount.id,
-                error = %e,
+                error = %format_args!("{e:#}"),
                 "Failed to query available disk space"
             );
         }
