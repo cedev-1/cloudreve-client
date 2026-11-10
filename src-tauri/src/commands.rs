@@ -692,10 +692,12 @@ mod tests {
             paused_drives: vec![],
             pending_uploads: [("d1".to_string(), 2u64)].into_iter().collect(),
             mount_errors: [("d1".to_string(), "reason".to_string())].into_iter().collect(),
+            upload_problems: [("d1".to_string(), "storage full".to_string())].into_iter().collect(),
         };
         let json = serde_json::to_value(&summary).unwrap();
         assert_eq!(json["mount_errors"]["d1"], "reason");
         assert_eq!(json["pending_uploads"]["d1"], 2);
+        assert_eq!(json["upload_problems"]["d1"], "storage full");
     }
 
     /// `AddDriveArgs.mode` must default to `FullMirror` when the field is

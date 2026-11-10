@@ -75,6 +75,7 @@
     "conflictKeepBothHint": "Benennt die lokale Kopie um",
     "pendingUploads": "{{count}} Datei(en) warten auf Upload",
     "mountFailed": "„{{name}}“ ist nicht verfügbar",
+    "uploadProblem": "Uploads auf „{{name}}“ hängen fest",
     "retry": "Erneut versuchen"
   },
   "settings": {

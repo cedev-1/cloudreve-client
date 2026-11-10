@@ -75,6 +75,7 @@
     "conflictKeepBothHint": "Zmienia nazwę lokalnej kopii",
     "pendingUploads": "{{count}} plik(ów) czeka na wysłanie",
     "mountFailed": "„{{name}}” jest niedostępny",
+    "uploadProblem": "Zmiany na „{{name}}” nie są wysyłane",
     "retry": "Ponów"
   },
   "settings": {

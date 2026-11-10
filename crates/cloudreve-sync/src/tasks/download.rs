@@ -308,7 +308,7 @@ impl<'a> DownloadTask<'a> {
                             warn!(target: "tasks::download", error = ?e, "Failed to mark conflict");
                         }
                     }
-                    send_conflict_toast(self.drive_id, &local_path, meta.id);
+                    send_conflict_toast(self.drive_id, &local_path, None);
                     return Ok(());
                 }
             }

@@ -67,6 +67,9 @@ export interface StatusSummary {
   // On-demand drives whose folder is not mounted: drive id -> localized,
   // plain-language reason (`StatusSummary::mount_errors`).
   mount_errors?: Record<string, string>;
+  // On-demand drives whose uploads keep failing: drive id -> localized,
+  // plain-language reason (`StatusSummary::upload_problems`).
+  upload_problems?: Record<string, string>;
 }
 
 export interface FileIconResponse {

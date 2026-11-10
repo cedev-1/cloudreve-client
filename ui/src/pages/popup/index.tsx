@@ -261,6 +261,24 @@ export default function Popup() {
             </Alert>
           );
         })}
+
+        {/* Uploads the server keeps refusing (full account, file too large,
+            no write access, or failing again and again): why, in words the
+            user can act on. The changes are safe on this computer. */}
+        {Object.entries(summary?.upload_problems ?? {}).map(([driveId, message]) => {
+          const name = summary?.drives.find((d) => d.id === driveId)?.name ?? "";
+          return (
+            <Alert
+              key={`upload-${driveId}`}
+              severity="warning"
+              sx={{ mt: 1, py: 0, "& .MuiAlert-message": { fontSize: 12 } }}
+            >
+              <strong>{t("popup.uploadProblem", { name })}</strong>
+              <br />
+              {message}
+            </Alert>
+          );
+        })}
       </Box>
 
       {/* Task List */}

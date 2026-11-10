@@ -373,7 +373,7 @@ pub async fn full_sync(mount: &Mount, local_root: &PathBuf, remote_path: &str) -
                         crate::utils::toast::send_conflict_toast(
                             &mount.id,
                             &local_path,
-                            db_entry.id,
+                            None,
                         );
                         mount.task_queue.notifier().notify();
                         continue;

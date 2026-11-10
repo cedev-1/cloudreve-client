@@ -75,6 +75,7 @@
     "conflictKeepBothHint": "Переименует локальную копию",
     "pendingUploads": "Файлов в очереди на отправку: {{count}}",
     "mountFailed": "«{{name}}» недоступен",
+    "uploadProblem": "Изменения на «{{name}}» не отправляются",
     "retry": "Повторить"
   },
   "settings": {

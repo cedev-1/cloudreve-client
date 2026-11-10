@@ -75,6 +75,7 @@
     "conflictKeepBothHint": "Renomme la copie locale",
     "pendingUploads": "{{count}} fichier(s) en attente d'envoi",
     "mountFailed": "« {{name}} » est indisponible",
+    "uploadProblem": "Les modifications sur « {{name}} » ne sont pas envoyées",
     "retry": "Réessayer"
   },
   "settings": {

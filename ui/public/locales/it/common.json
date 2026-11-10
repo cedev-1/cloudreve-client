@@ -75,6 +75,7 @@
     "conflictKeepBothHint": "Rinomina la copia locale",
     "pendingUploads": "{{count}} file in attesa di caricamento",
     "mountFailed": "\"{{name}}\" non è disponibile",
+    "uploadProblem": "Le modifiche su \"{{name}}\" non vengono caricate",
     "retry": "Riprova"
   },
   "settings": {

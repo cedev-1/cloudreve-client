@@ -75,6 +75,7 @@
     "conflictKeepBothHint": "将重命名本地副本",
     "pendingUploads": "{{count}} 个文件等待上传",
     "mountFailed": "“{{name}}”不可用",
+    "uploadProblem": "“{{name}}”上的更改未能上传",
     "retry": "重试"
   },
   "settings": {

@@ -2,6 +2,7 @@ use crate::drive::commands::{ManagerCommand, MountCommand};
 use crate::drive::event_blocker::EventBlocker;
 use crate::drive::ignore::IgnoreMatcher;
 use crate::drive::sync::group_fs_events;
+use crate::drive::upload_health::{self, UploadHealth};
 use crate::drive::vfs_mode::{self, MountTestHook};
 use crate::events::SummaryNotifier;
 use crate::inventory::{DrivePropsUpdate, InventoryDb};
@@ -194,7 +195,7 @@ pub struct Mount {
     /// this.
     pub vfs_events: Mutex<Option<mpsc::UnboundedReceiver<VfsEvent>>>,
     /// D6: background worker draining `vfs_events` into
-    /// `vfs_pending_uploads`/`vfs_failed_uploads` and toasts — see
+    /// `vfs_pending_uploads`, `upload_health` and toasts — see
     /// `spawn_vfs_event_pump`'s doc. Unlike every other `*_handle` slot
     /// below, `pause()` deliberately never aborts this one: see
     /// `spawn_vfs_event_pump`'s doc for why.
@@ -212,19 +213,13 @@ pub struct Mount {
     /// drains — see `spawn_vfs_event_pump`'s doc for why none of those
     /// startup events are ever lost.
     pub vfs_pending_uploads: std::sync::atomic::AtomicU64,
-    /// On-demand mode only (D6): count of `VfsEvent::UploadFailed
-    /// { will_retry: false }` events observed since this `Mount` was
-    /// constructed — a permanent give-up for that particular upload cycle
-    /// (the draft itself survives, parked back `Pending` for a future
-    /// manual/automatic retry, which starts a brand new `UploadQueued`/
-    /// terminal cycle of its own rather than clearing this count). Purely
-    /// an in-session counter: `DraftState` has no on-disk "failed" variant
-    /// to reconcile against (unlike `vfs_pending_uploads` above) — a give-
-    /// up is persisted identically to an ordinary still-pending draft, so
-    /// there is nothing on disk this could resync from even if it wanted
-    /// to. A coarse dashboard signal (D6: "no task-row parity with
-    /// full-mirror in 1.1"), not an exact per-file ledger.
-    pub vfs_failed_uploads: std::sync::atomic::AtomicU64,
+    /// On-demand mode only: consecutive upload failures, and the reason
+    /// shown to the user once they stop looking transient (see
+    /// `drive::upload_health`). Folded by `fold_vfs_event`.
+    upload_health: std::sync::Mutex<UploadHealth>,
+    /// The plain-language message for `upload_health`'s current problem,
+    /// `None` while uploads go through. Read by `get_status_summary`.
+    upload_problem: std::sync::Mutex<Option<String>>,
     /// Test-only: see `vfs_mode::MountTestHook`'s doc. `None` on every
     /// production path.
     vfs_mount_test_hook: Mutex<Option<Arc<MountTestHook>>>,
@@ -351,7 +346,8 @@ impl Mount {
             vfs_events: Mutex::new(None),
             vfs_event_pump_handle: Arc::new(Mutex::new(None)),
             vfs_pending_uploads: std::sync::atomic::AtomicU64::new(0),
-            vfs_failed_uploads: std::sync::atomic::AtomicU64::new(0),
+            upload_health: std::sync::Mutex::new(UploadHealth::default()),
+            upload_problem: std::sync::Mutex::new(None),
             vfs_mount_test_hook: Mutex::new(None),
             mount_problem: std::sync::Mutex::new(None),
             attach_lock: Mutex::new(()),
@@ -591,6 +587,12 @@ impl Mount {
             Some(vfs) => vfs.unsynced_file_count().await as u64,
             None => 0,
         }
+    }
+
+    /// Why this drive's uploads keep failing, in plain language, or `None`
+    /// while they go through (see `upload_health`).
+    pub fn upload_problem(&self) -> Option<String> {
+        self.upload_problem.lock().unwrap().clone()
     }
 
     /// See `mount_problem`'s field doc.
@@ -892,9 +894,8 @@ impl Mount {
 
     /// D6: spawn the `VfsEvent` pump — takes ownership of `vfs_events` (the
     /// receiver `start_on_demand` populated) and folds every event it sees
-    /// into `vfs_pending_uploads`/`vfs_failed_uploads` plus a toast for the
-    /// two user-facing terminals (`ConflictSaved`, `UploadFailed` with
-    /// `will_retry: false`). A no-op for a `FullMirror` drive, or if this
+    /// into `vfs_pending_uploads` and `upload_health`, plus a toast for a
+    /// conflict copy and for uploads that keep failing. A no-op for a `FullMirror` drive, or if this
     /// is called a second time for the same on-demand drive: `vfs_events`
     /// is `Mutex<Option<...>>` and `.take()`n exactly once, mirroring
     /// `mounted_vfs`/`vfs`'s own "only ever set once per lifetime" shape —
@@ -932,8 +933,8 @@ impl Mount {
     }
 
     /// D6: folds one `VfsEvent` into the counters/toasts — see
-    /// `spawn_vfs_event_pump`'s doc and `vfs_pending_uploads`/
-    /// `vfs_failed_uploads`'s field docs for the accounting rules. Every
+    /// `spawn_vfs_event_pump`'s doc and the `vfs_pending_uploads` and
+    /// `upload_health` field docs for the accounting rules. Every
     /// terminal variant (all but `UploadQueued`) decrements
     /// `vfs_pending_uploads` exactly once, matching the "one `UploadQueued`,
     /// exactly one terminal" contract documented on `VfsEvent` itself —
@@ -941,7 +942,7 @@ impl Mount {
     /// `UploadQueued` (per that same contract) re-increments it right back,
     /// net zero, correctly reflecting that the cycle merely continued under
     /// a new name rather than actually finishing.
-    async fn fold_vfs_event(&self, event: VfsEvent) {
+    pub(crate) async fn fold_vfs_event(&self, event: VfsEvent) {
         use std::sync::atomic::Ordering;
 
         let dec_pending = || {
@@ -956,6 +957,10 @@ impl Mount {
             }
             VfsEvent::UploadSucceeded { .. } => {
                 dec_pending();
+                self.upload_health.lock().unwrap().on_success();
+                if self.upload_problem.lock().unwrap().take().is_some() {
+                    tracing::info!(target: "drive::mounts", id = %self.id, "Uploads go through again");
+                }
             }
             VfsEvent::UploadCancelled { .. } => {
                 dec_pending();
@@ -963,22 +968,18 @@ impl Mount {
             VfsEvent::UploadRenamed { .. } => {
                 dec_pending();
             }
-            VfsEvent::UploadFailed { remote_path, error, will_retry } => {
+            VfsEvent::UploadFailed { error, will_retry, .. } => {
                 dec_pending();
-                if !will_retry {
-                    self.vfs_failed_uploads.fetch_add(1, Ordering::Relaxed);
-                    let display_path = self.remote_uri_to_display_path(&remote_path).await;
-                    toast::send_warning_toast(
-                        &t!("uploadFailedTitle"),
-                        &t!(
-                            "uploadFailedMessage",
-                            path = display_path.display().to_string(),
-                            error = error.as_str()
-                        ),
-                    );
+                let newly = self.upload_health.lock().unwrap().on_failure(&error, !will_retry);
+                if let Some(problem) = newly {
+                    let name = self.config.read().await.name.clone();
+                    let message = upload_health::problem_message(problem, &name);
+                    tracing::warn!(target: "drive::mounts", id = %self.id, ?problem, error = %error, "Uploads keep failing");
+                    *self.upload_problem.lock().unwrap() = Some(message.clone());
+                    toast::send_upload_problem_toast(&self.id, &message);
                 }
             }
-            VfsEvent::ConflictSaved { original, conflict_copy: _ } => {
+            VfsEvent::ConflictSaved { original, conflict_copy } => {
                 dec_pending();
                 // Reviewer fix (Task 5): `original` is a facade-internal
                 // `cloudreve://…` remote uri (`VfsEvent`'s own doc; traced
@@ -996,7 +997,8 @@ impl Mount {
                 // drive's local mounted path first, the exact inverse of
                 // D8's `handle_view_online` mapping.
                 let display_path = self.remote_uri_to_display_path(&original).await;
-                toast::send_conflict_toast(&self.id, &display_path, 0);
+                let copy_path = self.remote_uri_to_display_path(&conflict_copy).await;
+                toast::send_conflict_toast(&self.id, &display_path, Some(&copy_path));
             }
         }
     }
@@ -1202,6 +1204,10 @@ impl Mount {
             }
             DriveMode::OnDemand => {
                 self.unmount_on_demand().await;
+                // Its cache no longer takes a share of the volume.
+                if let Ok(cache_dir) = vfs_mode::cache_dir_for(&self.id) {
+                    vfs_mode::forget_running_cache(&cache_dir);
+                }
             }
         }
 

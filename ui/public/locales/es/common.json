@@ -75,6 +75,7 @@
     "conflictKeepBothHint": "Renombra la copia local",
     "pendingUploads": "{{count}} archivo(s) esperando subida",
     "mountFailed": "\"{{name}}\" no está disponible",
+    "uploadProblem": "Los cambios en \"{{name}}\" no se suben",
     "retry": "Reintentar"
   },
   "settings": {

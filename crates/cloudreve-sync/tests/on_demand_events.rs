@@ -396,6 +396,9 @@ async fn a_conflict_saved_event_produces_a_conflict_toast() {
         body.contains(&expected_local_path),
         "notification should name the conflicted file by its LOCAL mounted path ({expected_local_path}), got body: {body}"
     );
+    // And where the other version went: the copy, by its local path too.
+    let expected_copy = env.local_path("shared (conflict ").display().to_string();
+    assert!(body.contains(&expected_copy), "notification should say where the conflict copy is ({expected_copy}...), got body: {body}");
 }
 
 // ---------------------------------------------------------------------

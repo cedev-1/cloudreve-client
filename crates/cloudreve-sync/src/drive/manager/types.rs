@@ -72,6 +72,10 @@ pub struct StatusSummary {
     /// plain-language reason and what to do (`Mount::mount_problem`).
     #[serde(default)]
     pub mount_errors: HashMap<String, String>,
+    /// On-demand drives whose uploads keep failing, by drive id: why, in
+    /// plain language (`Mount::upload_problem`).
+    #[serde(default)]
+    pub upload_problems: HashMap<String, String>,
 }
 
 /// A file conflict awaiting user resolution

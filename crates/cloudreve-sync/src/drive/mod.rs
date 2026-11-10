@@ -6,5 +6,6 @@ pub mod manager;
 pub mod mounts;
 pub mod remote_events;
 pub mod sync;
+pub mod upload_health;
 pub mod utils;
 pub mod vfs_mode;

@@ -783,6 +783,7 @@ impl DriveManager {
         let mut paused_drives = Vec::new();
         let mut pending_uploads = HashMap::new();
         let mut mount_errors = HashMap::new();
+        let mut upload_problems = HashMap::new();
         for mount in read_guard.values() {
             let config = mount.get_config().await;
             // D7: an on-demand drive never runs `FullSync`
@@ -811,6 +812,9 @@ impl DriveManager {
                 pending_uploads.insert(config.id.clone(), mount.unsynced_file_count().await.max(in_flight));
                 if let Some(message) = mount.mount_problem() {
                     mount_errors.insert(config.id.clone(), message);
+                }
+                if let Some(message) = mount.upload_problem() {
+                    upload_problems.insert(config.id.clone(), message);
                 }
             }
             if mount.is_paused() {
@@ -900,6 +904,7 @@ impl DriveManager {
             paused_drives,
             pending_uploads,
             mount_errors,
+            upload_problems,
         })
     }
 
@@ -1472,6 +1477,34 @@ mod tests {
         let drive = saved.drives.iter().find(|d| d.id == drive_id).expect("drive saved");
         assert_eq!(drive.credentials.access_token.as_deref(), Some("test-access-token"));
         assert_eq!(drive.credentials.refresh_token, "test-refresh-token");
+    }
+
+    /// The popup learns why a drive's uploads keep failing from the status
+    /// summary, next to the mount errors, and stops showing it as soon as
+    /// an upload gets through.
+    #[tokio::test]
+    async fn the_status_summary_explains_uploads_that_keep_failing() {
+        let (manager, drive_id, _hook, _tmp) = manager_with_one_on_demand_drive_at("http://127.0.0.1:9").await;
+        let mount = manager.get_drive(&drive_id).await.unwrap();
+        let failed = || cloudreve_vfs::vfs::VfsEvent::UploadFailed {
+            remote_path: "cloudreve://my/sync/report.pdf".into(),
+            error: "failed to create upload session: API error (code 40050): Insufficient capacity".into(),
+            will_retry: true,
+        };
+
+        mount.fold_vfs_event(failed()).await;
+        let summary = manager.get_status_summary(None).await.unwrap();
+        let reason = summary.upload_problems.get(&drive_id).expect("the problem is in the summary");
+        assert!(reason.contains("Test Drive") && reason.to_lowercase().contains("full"), "{reason}");
+
+        mount
+            .fold_vfs_event(cloudreve_vfs::vfs::VfsEvent::UploadSucceeded {
+                remote_path: "cloudreve://my/sync/other.txt".into(),
+                new_etag: "e2".into(),
+            })
+            .await;
+        let summary = manager.get_status_summary(None).await.unwrap();
+        assert!(summary.upload_problems.is_empty(), "{:?}", summary.upload_problems);
     }
 
     /// A save that could not be uploaded (server error, offline) must keep

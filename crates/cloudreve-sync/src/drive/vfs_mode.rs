@@ -83,22 +83,37 @@ pub fn effective_cache_cap(cache_dir: &Path) -> u64 {
     }
 }
 
-/// How many on-demand drives keep their cache on the same volume as
-/// `cache_dir`: every one has its own folder under the same parent
-/// (`cache_dir_for`), and this drive counts even before its folder exists.
-/// A deleted drive's folder goes with it (`Mount::delete`).
-pub(crate) fn drives_sharing_cache_volume(cache_dir: &Path) -> u64 {
-    let others = cache_dir
-        .parent()
-        .and_then(|parent| std::fs::read_dir(parent).ok())
-        .map(|entries| {
-            entries
-                .filter_map(Result::ok)
-                .filter(|e| e.path() != cache_dir && e.file_type().is_ok_and(|t| t.is_dir()))
-                .count() as u64
-        })
-        .unwrap_or(0);
-    others + 1
+/// The cache folders of the on-demand drives running in this process. All
+/// live under `~/.cloudreve/vfs-cache/` (`cache_dir_for`), so on one volume.
+/// Live drives only: counting the folders on disk would also count those
+/// a crash left behind, and shrink every cache for good.
+static RUNNING_CACHES: std::sync::LazyLock<RunningCaches> = std::sync::LazyLock::new(Default::default);
+
+#[derive(Default)]
+struct RunningCaches(std::sync::Mutex<std::collections::HashSet<PathBuf>>);
+
+impl RunningCaches {
+    /// Counts `cache_dir` as running (idempotent: a remount is not a new
+    /// drive) and returns how many running drives share the volume.
+    fn share_count(&self, cache_dir: &Path) -> u64 {
+        let mut running = self.0.lock().unwrap();
+        running.insert(cache_dir.to_path_buf());
+        running.len() as u64
+    }
+
+    fn forget(&self, cache_dir: &Path) {
+        self.0.lock().unwrap().remove(cache_dir);
+    }
+}
+
+fn drives_sharing_cache_volume(cache_dir: &Path) -> u64 {
+    RUNNING_CACHES.share_count(cache_dir)
+}
+
+/// `cache_dir`'s drive stopped (removed, or the app quits): it no longer
+/// takes a share of the volume.
+pub(crate) fn forget_running_cache(cache_dir: &Path) {
+    RUNNING_CACHES.forget(cache_dir);
 }
 
 /// Whether `cap` reflects D3's clamp having kicked in (below the
@@ -499,17 +514,17 @@ mod tests {
         assert_eq!(clamp_cache_cap(2 * GIB, 4), CACHE_FLOOR_BYTES);
     }
 
-    /// Every on-demand drive has its cache folder next to this one's; this
-    /// drive counts whether its own folder exists yet (first mount) or not.
+    /// Each running drive counts once, however often its cap is recomputed
+    /// (every remount), and a stopped one stops counting.
     #[test]
-    fn the_drives_sharing_the_cache_volume_are_counted_from_their_cache_folders() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir(root.path().join("drive-a")).unwrap();
-        std::fs::create_dir(root.path().join("drive-b")).unwrap();
-        std::fs::write(root.path().join(".DS_Store"), b"").unwrap();
-
-        assert_eq!(drives_sharing_cache_volume(&root.path().join("drive-new")), 3);
-        assert_eq!(drives_sharing_cache_volume(&root.path().join("drive-a")), 2);
+    fn only_running_drives_share_the_cache_volume() {
+        let running = RunningCaches::default();
+        let (a, b) = (Path::new("/home/ana/.cloudreve/vfs-cache/a"), Path::new("/home/ana/.cloudreve/vfs-cache/b"));
+        assert_eq!(running.share_count(a), 1);
+        assert_eq!(running.share_count(b), 2);
+        assert_eq!(running.share_count(b), 2, "a remount is not a new drive");
+        running.forget(a);
+        assert_eq!(running.share_count(b), 1);
     }
 
     /// Exactly at the reserve boundary: nothing left after the reserve, so

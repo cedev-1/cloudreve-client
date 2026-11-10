@@ -75,6 +75,7 @@
     "conflictKeepBothHint": "ローカルコピーの名前を変更します",
     "pendingUploads": "{{count}} 件のファイルがアップロード待ち",
     "mountFailed": "「{{name}}」は利用できません",
+    "uploadProblem": "「{{name}}」の変更がアップロードされていません",
     "retry": "再試行"
   },
   "settings": {

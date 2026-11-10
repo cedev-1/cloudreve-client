@@ -179,7 +179,7 @@ impl<'a> UploadTask<'a> {
                     send_conflict_toast(
                         self.drive_id,
                         &self.task.payload.local_path,
-                        self.inventory_meta.as_ref().map(|m| m.id).unwrap_or(0),
+                        None,
                     );
                 }
 
