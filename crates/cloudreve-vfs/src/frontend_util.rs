@@ -9,7 +9,7 @@
 
 use crate::tree::NodeAttr;
 use crate::vfs::{
-    CrossOverlayRenameError, DirNotEmptyError, JunkNameError, RenameBusyError, RenameOntoDirectoryError,
+    CrossOverlayRenameError, DirNotEmptyError, JunkNameError, JunkTooBigError, RenameBusyError, RenameOntoDirectoryError,
     StaleHandleError, UnlinkBusyError,
 };
 
@@ -98,6 +98,9 @@ pub fn classify_error(err: &anyhow::Error) -> FrontendErrno {
     }
     if err.downcast_ref::<CrossOverlayRenameError>().is_some() {
         return FrontendErrno::CrossDevice;
+    }
+    if err.downcast_ref::<JunkTooBigError>().is_some() {
+        return FrontendErrno::FileTooBig;
     }
     if err.to_string().starts_with("EEXIST") {
         return FrontendErrno::Exist;

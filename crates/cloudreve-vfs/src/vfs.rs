@@ -423,6 +423,115 @@ struct JunkFile {
     mtime_secs: i64,
 }
 
+/// The local-only junk files, keyed by would-be remote path, with their
+/// total size kept alongside so the caps ([`JUNK_FILE_MAX`],
+/// [`JUNK_TOTAL_MAX`]) cost nothing to check. Every size change goes
+/// through [`JunkOverlay::resize`]; there is deliberately no `get_mut`.
+#[derive(Default)]
+struct JunkOverlay {
+    files: HashMap<String, JunkFile>,
+    bytes: u64,
+    /// Last-write order, for eviction: oldest first.
+    touched: HashMap<String, u64>,
+    next_touch: u64,
+}
+
+impl JunkOverlay {
+    fn get(&self, path: &str) -> Option<&JunkFile> {
+        self.files.get(path)
+    }
+
+    fn contains_key(&self, path: &str) -> bool {
+        self.files.contains_key(path)
+    }
+
+    fn touch(&mut self, path: &str) {
+        self.next_touch += 1;
+        self.touched.insert(path.to_string(), self.next_touch);
+    }
+
+    fn insert(&mut self, path: String, file: JunkFile) {
+        self.bytes += file.data.len() as u64;
+        self.touch(&path);
+        if let Some(old) = self.files.insert(path, file) {
+            self.bytes -= old.data.len() as u64;
+        }
+    }
+
+    fn remove(&mut self, path: &str) -> Option<JunkFile> {
+        self.touched.remove(path);
+        let file = self.files.remove(path)?;
+        self.bytes -= file.data.len() as u64;
+        Some(file)
+    }
+
+    fn paths_under(&self, prefix: &str) -> Vec<String> {
+        self.files.keys().filter(|p| p.starts_with(prefix)).cloned().collect()
+    }
+
+    fn rename(&mut self, from: &str, to: String) {
+        if let Some(file) = self.remove(from) {
+            self.insert(to, file);
+        }
+    }
+
+    /// The drive folder's icon and the root's own sidecar (its Finder
+    /// info, `crate::appledouble`): never forgotten to make room.
+    fn is_pinned(path: &str) -> bool {
+        let leaf = path.rsplit('/').next().unwrap_or(path);
+        leaf == ".VolumeIcon.icns" || leaf == "Icon\r" || leaf == crate::appledouble::ROOT_SIDECAR_NAME
+    }
+
+    /// Resizes `path` to `new_len` (zero-filled), then hands its bytes to
+    /// `edit`. Refuses past [`JUNK_FILE_MAX`] ([`JunkTooBigError`]); past
+    /// [`JUNK_TOTAL_MAX`], forgets the least recently written files that
+    /// are neither pinned nor in `open`, and answers ENOSPC if that still
+    /// is not enough.
+    fn resize(
+        &mut self,
+        path: &str,
+        new_len: u64,
+        open: &HashSet<String>,
+        edit: impl FnOnce(&mut Vec<u8>),
+    ) -> Result<()> {
+        let old_len = self
+            .files
+            .get(path)
+            .map(|f| f.data.len() as u64)
+            .with_context(|| format!("{path} no longer exists"))?;
+        if new_len > JUNK_FILE_MAX {
+            return Err(anyhow::Error::new(JunkTooBigError { remote_path: path.to_string(), size: new_len }));
+        }
+        if new_len > old_len && self.bytes - old_len + new_len > JUNK_TOTAL_MAX {
+            let mut victims: Vec<(u64, String)> = self
+                .files
+                .keys()
+                .filter(|p| p.as_str() != path && !open.contains(*p) && !Self::is_pinned(p))
+                .map(|p| (self.touched.get(p).copied().unwrap_or(0), p.clone()))
+                .collect();
+            victims.sort_unstable();
+            for (_, victim) in victims {
+                if self.bytes - old_len + new_len <= JUNK_TOTAL_MAX {
+                    break;
+                }
+                tracing::debug!(path = %victim, "vfs: forgetting a local-only file to make room in the junk overlay");
+                self.remove(&victim);
+            }
+            if self.bytes - old_len + new_len > JUNK_TOTAL_MAX {
+                return Err(anyhow::Error::new(std::io::Error::from_raw_os_error(libc::ENOSPC)))
+                    .with_context(|| format!("no room left in the local-only overlay for {path}"));
+            }
+        }
+        let file = self.files.get_mut(path).expect("checked above");
+        file.data.resize(new_len as usize, 0);
+        edit(&mut file.data);
+        file.mtime_secs = unix_now();
+        self.bytes = self.bytes - old_len + new_len;
+        self.touch(path);
+        Ok(())
+    }
+}
+
 /// Test-only rendezvous for pausing `create()` mid-body — see
 /// `Vfs::pause_create_before_registration_for_tests`. Exists because the
 /// window this is meant to test (`create` making a name visible before it
@@ -645,7 +754,7 @@ pub struct Vfs {
     /// remote path. Never uploaded, never listed, forgotten on restart.
     /// A `std::sync::Mutex`: only ever held for the instant of one map
     /// operation, never across an await.
-    junk: std::sync::Mutex<HashMap<String, JunkFile>>,
+    junk: std::sync::Mutex<JunkOverlay>,
     /// Test-only: see `refuse_local_only_junk_for_tests`.
     refuse_local_only_junk: std::sync::atomic::AtomicBool,
     /// Refreshes folders open in a file manager after a remote change
@@ -761,7 +870,7 @@ impl Vfs {
                 create_pause_hook: std::sync::Mutex::new(None),
                 open_pause_hook: std::sync::Mutex::new(None),
                 events: events_tx,
-                junk: std::sync::Mutex::new(HashMap::new()),
+                junk: std::sync::Mutex::new(JunkOverlay::default()),
                 refuse_local_only_junk: std::sync::atomic::AtomicBool::new(false),
                 nudger: std::sync::Mutex::new(None),
             },
@@ -1618,7 +1727,10 @@ impl Vfs {
         if attr.is_dir {
             // The folder's local-only junk (see `crate::junk`) went with it.
             let nested = format!("{remote_path}/");
-            self.junk.lock().unwrap().retain(|path, _| !path.starts_with(&nested));
+            let mut junk = self.junk.lock().unwrap();
+            for path in junk.paths_under(&nested) {
+                junk.remove(&path);
+            }
         }
         self.tree.invalidate_path(&remote_path).await;
         Ok(())
@@ -1836,10 +1948,7 @@ impl Vfs {
 
         if source_is_junk {
             {
-                let mut junk = self.junk.lock().unwrap();
-                if let Some(file) = junk.remove(&old_path) {
-                    junk.insert(new_path.clone(), file);
-                }
+                self.junk.lock().unwrap().rename(&old_path, new_path.clone());
             }
             self.tree.rename_entry(parent, name, new_parent, new_name).await;
             return Ok(());
@@ -2042,11 +2151,9 @@ impl Vfs {
             // it — Finder's `.DS_Store`, the sidecars of the files inside.
             let nested = format!("{old_path}/");
             let mut junk = self.junk.lock().unwrap();
-            let moved: Vec<String> = junk.keys().filter(|p| p.starts_with(&nested)).cloned().collect();
-            for path in moved {
-                if let Some(file) = junk.remove(&path) {
-                    junk.insert(format!("{new_path}/{}", &path[nested.len()..]), file);
-                }
+            for path in junk.paths_under(&nested) {
+                let moved_to = format!("{new_path}/{}", &path[nested.len()..]);
+                junk.rename(&path, moved_to);
             }
         }
         Ok(())
@@ -2082,16 +2189,14 @@ impl Vfs {
     pub async fn write(&self, h: FileHandle, offset: u64, data: &[u8]) -> Result<u32> {
         let of = self.open_file(h).await?;
         if junk::is_local_only_path(&of.key.remote_path) {
+            let open = self.open_junk_paths().await;
             let mut junk = self.junk.lock().unwrap();
-            let file = junk
-                .get_mut(&of.key.remote_path)
-                .with_context(|| format!("write: {} no longer exists", of.key.remote_path))?;
-            let end = offset as usize + data.len();
-            if file.data.len() < end {
-                file.data.resize(end, 0);
-            }
-            file.data[offset as usize..end].copy_from_slice(data);
-            file.mtime_secs = unix_now();
+            let end = offset.saturating_add(data.len() as u64);
+            let len = junk.get(&of.key.remote_path).map(|f| f.data.len() as u64).unwrap_or(0).max(end);
+            junk.resize(&of.key.remote_path, len, &open, |bytes| {
+                bytes[offset as usize..end as usize].copy_from_slice(data);
+            })
+            .context("write")?;
             return Ok(data.len() as u32);
         }
         self.ensure_drafted(&of).await?;
@@ -2107,12 +2212,8 @@ impl Vfs {
     pub async fn truncate(&self, h: FileHandle, size: u64) -> Result<()> {
         let of = self.open_file(h).await?;
         if junk::is_local_only_path(&of.key.remote_path) {
-            let mut junk = self.junk.lock().unwrap();
-            let file = junk
-                .get_mut(&of.key.remote_path)
-                .with_context(|| format!("truncate: {} no longer exists", of.key.remote_path))?;
-            file.data.resize(size as usize, 0);
-            file.mtime_secs = unix_now();
+            let open = self.open_junk_paths().await;
+            self.junk.lock().unwrap().resize(&of.key.remote_path, size, &open, |_| {}).context("truncate")?;
             return Ok(());
         }
         if !self.has_draft(&of).await {
@@ -2289,6 +2390,18 @@ impl Vfs {
             return Ok(());
         }
         self.materialize(of).await
+    }
+
+    /// Local-only files with a handle open: never forgotten to make room
+    /// in the junk overlay (`JunkOverlay::resize`).
+    async fn open_junk_paths(&self) -> HashSet<String> {
+        self.open_files
+            .read()
+            .await
+            .values()
+            .filter(|of| junk::is_local_only_path(&of.key.remote_path))
+            .map(|of| of.key.remote_path.clone())
+            .collect()
     }
 
     async fn has_draft(&self, of: &Arc<OpenFile>) -> bool {
