@@ -455,6 +455,18 @@ driveLoadFailed:
   ru: "Не удалось загрузить диск"
   pl: "Nie udało się załadować dysku"
   it: "Impossibile caricare l'unità"
+syncPathOverlapsDrive:
+  en-US: "%{folder} cannot be used: it overlaps the folder of the drive \"%{drive}\" (%{other}). Two drives cannot share a folder or sit inside each other. Choose another folder."
+  zh-CN: "无法使用 %{folder}：它与驱动器“%{drive}”的文件夹（%{other}）重叠。两个驱动器不能共用文件夹，也不能互相嵌套。请选择其他文件夹。"
+  zh-TW: "無法使用 %{folder}：它與磁碟機「%{drive}」的資料夾（%{other}）重疊。兩個磁碟機不能共用資料夾，也不能互相巢狀。請選擇其他資料夾。"
+  ja: "%{folder} は使用できません：ドライブ「%{drive}」のフォルダー（%{other}）と重なっています。2 つのドライブでフォルダーを共有したり、入れ子にしたりすることはできません。別のフォルダーを選択してください。"
+  de: "%{folder} kann nicht verwendet werden: Der Ordner überschneidet sich mit dem Ordner des Laufwerks „%{drive}“ (%{other}). Zwei Laufwerke dürfen keinen Ordner teilen oder ineinander liegen. Wählen Sie einen anderen Ordner."
+  fr: "%{folder} ne peut pas être utilisé : il chevauche le dossier du lecteur « %{drive} » (%{other}). Deux lecteurs ne peuvent pas partager un dossier ni être l'un dans l'autre. Choisissez un autre dossier."
+  es: "No se puede usar %{folder}: se superpone con la carpeta de la unidad «%{drive}» (%{other}). Dos unidades no pueden compartir una carpeta ni estar una dentro de otra. Elija otra carpeta."
+  ko: "%{folder}을(를) 사용할 수 없습니다: 드라이브 \"%{drive}\"의 폴더(%{other})와 겹칩니다. 두 드라이브는 폴더를 공유하거나 서로 안에 있을 수 없습니다. 다른 폴더를 선택하세요."
+  ru: "Нельзя использовать %{folder}: папка пересекается с папкой диска «%{drive}» (%{other}). Два диска не могут использовать одну папку или находиться друг в друге. Выберите другую папку."
+  pl: "Nie można użyć %{folder}: nakłada się na folder dysku „%{drive}” (%{other}). Dwa dyski nie mogą współdzielić folderu ani być zagnieżdżone. Wybierz inny folder."
+  it: "Impossibile usare %{folder}: si sovrappone alla cartella dell'unità «%{drive}» (%{other}). Due unità non possono condividere una cartella né stare una dentro l'altra. Scegli un'altra cartella."
 localPathCannotBeRootDrive:
   en-US: "The local path cannot be a root drive (e.g., E:\\). Please select a subfolder."
   zh-CN: "本地路径不能是根驱动器（如 E:\\）。请选择一个子文件夹。"

@@ -225,7 +225,31 @@ impl DriveManager {
     /// folder cannot be mounted, nothing is added and the error is the
     /// plain-language explanation for the user.
     pub async fn add_drive(&self, config: DriveConfig) -> Result<String> {
+        self.refuse_overlapping_sync_path(&config).await?;
         self.add_drive_inner(config, false).await
+    }
+
+    /// Two drives on the same folder, or one nested in the other, would each
+    /// take the other's files for their own. Only checked for a NEW drive:
+    /// `load()` never drops a drive the user already has.
+    async fn refuse_overlapping_sync_path(&self, config: &DriveConfig) -> Result<()> {
+        let new = comparable_path(&config.sync_path);
+        for mount in self.drives.read().await.values() {
+            let existing = mount.get_config().await;
+            let other = comparable_path(&existing.sync_path);
+            if new.starts_with(&other) || other.starts_with(&new) {
+                anyhow::bail!(
+                    "{}",
+                    t!(
+                        "syncPathOverlapsDrive",
+                        folder = config.sync_path.display().to_string(),
+                        drive = existing.name.as_str(),
+                        other = existing.sync_path.display().to_string()
+                    )
+                );
+            }
+        }
+        Ok(())
     }
 
     /// `keep_on_mount_failure`: `load()` (an existing drive at launch) keeps
@@ -1036,6 +1060,31 @@ impl DriveManager {
     }
 }
 
+/// `path` resolved the way the filesystem sees it — symlinks, `.` and `..`
+/// gone — so two spellings of one folder compare equal. A folder that does
+/// not exist yet (the add-drive window can name one) is resolved through
+/// its nearest existing ancestor.
+fn comparable_path(path: &std::path::Path) -> PathBuf {
+    let mut existing = path.to_path_buf();
+    let mut rest = Vec::new();
+    loop {
+        if let Ok(canonical) = existing.canonicalize() {
+            let mut out = canonical;
+            for part in rest.iter().rev() {
+                out.push(part);
+            }
+            return out;
+        }
+        match (existing.file_name().map(|n| n.to_os_string()), existing.parent()) {
+            (Some(name), Some(parent)) => {
+                rest.push(name);
+                existing = parent.to_path_buf();
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
 /// Build a "conflicted copy" path next to the original file,
 /// e.g. `report.txt` → `report (conflicted copy 2026-07-03 14-32-05).txt`.
 fn conflicted_copy_path(path: &std::path::Path) -> PathBuf {
@@ -1645,6 +1694,43 @@ mod tests {
                 let _ = std::fs::remove_dir_all(dir);
             }
         }
+    }
+
+    /// Two drives syncing the same folder, or one inside the other, would
+    /// each see the other's files as their own: uploads into the wrong
+    /// account, deletions mirrored across both. A new drive whose folder
+    /// is, contains or sits inside an existing drive's is refused, naming
+    /// that drive.
+    #[tokio::test]
+    async fn a_new_drive_cannot_overlap_an_existing_drives_folder() {
+        let (manager, _sidebar, drives, tmp) = launch_with(|tmp| vec![on_demand_drive(tmp, "Work", false)]).await;
+        let work = tmp.path().join("Work");
+        std::fs::create_dir_all(work.join("Projects")).unwrap();
+        std::os::unix::fs::symlink(&work, tmp.path().join("Shortcut to Work")).unwrap();
+
+        for (folder, why) in [
+            (work.clone(), "the same folder"),
+            (tmp.path().join("Shortcut to Work"), "the same folder, through a symlink"),
+            (work.join("Projects"), "a folder inside it"),
+            (work.join("Projects/New"), "a folder inside it, not created yet"),
+            (tmp.path().to_path_buf(), "a folder containing it"),
+        ] {
+            let mut config = on_demand_drive(tmp.path(), "unused", false);
+            config.name = "Second".into();
+            config.sync_path = folder.clone();
+            let err = manager.add_drive(config).await.expect_err(why);
+            assert!(err.to_string().contains("drive \"Work\""), "{why}: {err}");
+        }
+
+        // A sibling whose name merely starts the same is fine.
+        let mut sibling = on_demand_drive(tmp.path(), "Work 2", false);
+        sibling.name = "Personal".into();
+        let id = manager.add_drive(sibling.clone()).await.expect("a sibling folder is not an overlap");
+        assert!(manager.get_drive(&id).await.is_some());
+
+        let mut all = drives.clone();
+        all.push(sibling);
+        cleanup(manager, &all).await;
     }
 
     /// Finder draws the Cloudreve glyph only on the rows of folders the
