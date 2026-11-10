@@ -582,6 +582,7 @@ impl Mount {
     /// now fails every access. Reported like a mount failure, with a Retry
     /// (`retry_mount` drops the dead mount first). Called by the watcher
     /// `attached` spawns.
+    #[cfg(test)]
     pub(crate) fn on_vfs_server_stopped(&self, reason: &str) {
         let mountpoint = self.config.try_read().map(|c| c.sync_path.clone()).unwrap_or_default();
         record_server_stopped(&self.id, reason, &server_stopped_message(&mountpoint), &self.mount_problem, &self.vfs_server_stopped);

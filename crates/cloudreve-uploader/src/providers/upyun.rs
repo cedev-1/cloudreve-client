@@ -52,7 +52,7 @@ where
     debug!(
         target: "uploader::upyun",
         size = chunk.size,
-        url = %cloudreve_api::redact::redact_url(url.as_ref()),
+        url = %cloudreve_api::redact::redact_url(url),
         "Uploading file to Upyun (streaming)"
     );
 

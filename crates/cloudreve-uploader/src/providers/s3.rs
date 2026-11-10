@@ -32,7 +32,7 @@ where
         target: "uploader::s3",
         chunk = chunk.index,
         size = chunk.size,
-        url = %cloudreve_api::redact::redact_url(url.as_ref()),
+        url = %cloudreve_api::redact::redact_url(url),
         "Uploading chunk to S3 (streaming)"
     );
 
@@ -117,7 +117,7 @@ pub async fn complete_upload_oss(http_client: &HttpClient, session: &UploadSessi
 
     debug!(
         target: "uploader::s3",
-        url = %cloudreve_api::redact::redact_url(url.as_ref()),
+        url = %cloudreve_api::redact::redact_url(url),
         "Completing OSS multipart upload"
     );
 
@@ -154,7 +154,7 @@ pub async fn complete_upload_s3like(
 
     debug!(
         target: "uploader::s3",
-        url = %cloudreve_api::redact::redact_url(url.as_ref()),
+        url = %cloudreve_api::redact::redact_url(url),
         "Completing S3-like multipart upload"
     );
 
@@ -193,7 +193,7 @@ pub async fn complete_upload_obs(http_client: &HttpClient, session: &UploadSessi
 
     debug!(
         target: "uploader::s3",
-        url = %cloudreve_api::redact::redact_url(url.as_ref()),
+        url = %cloudreve_api::redact::redact_url(url),
         "Completing OBS multipart upload"
     );
 

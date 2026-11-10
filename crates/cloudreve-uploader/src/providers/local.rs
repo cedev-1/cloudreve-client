@@ -84,7 +84,7 @@ where
         target: "uploader::remote",
         chunk = chunk.index,
         size = chunk.size,
-        url = %cloudreve_api::redact::redact_url(url.as_ref()),
+        url = %cloudreve_api::redact::redact_url(url),
         "Uploading chunk to slave node (streaming)"
     );
 

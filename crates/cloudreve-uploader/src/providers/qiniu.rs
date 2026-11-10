@@ -62,7 +62,7 @@ where
         target: "uploader::qiniu",
         chunk = chunk.index,
         size = chunk.size,
-        url = %cloudreve_api::redact::redact_url(url.as_ref()),
+        url = %cloudreve_api::redact::redact_url(url),
         "Uploading chunk to Qiniu (streaming)"
     );
 
@@ -132,7 +132,7 @@ pub async fn complete_upload(http_client: &HttpClient, session: &UploadSession) 
 
     debug!(
         target: "uploader::qiniu",
-        url = %cloudreve_api::redact::redact_url(url.as_ref()),
+        url = %cloudreve_api::redact::redact_url(url),
         parts = request.parts.len(),
         "Completing Qiniu multipart upload"
     );
