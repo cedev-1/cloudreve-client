@@ -652,3 +652,68 @@ async fn a_retransmitted_exclusive_create_succeeds_and_a_different_one_does_not(
     let other = fs.create_exclusive(&root, &fname("lock.pid"), createverf3([9; 8])).await;
     assert_eq!(other.map(|h| h.as_u64()), Err(nfsstat3::NFS3ERR_EXIST));
 }
+
+/// The first WRITE (or a resize) of a file not yet drafted downloads the
+/// whole file first. For a big remote file that outlived the client's soft
+/// timeout (~9 s) and the app got EIO; READ already answered JUKEBOX past
+/// a threshold, WRITE/SETATTR now do the same: the work keeps running, and
+/// the client's resend of the same call picks up its result.
+#[tokio::test]
+async fn a_slow_first_write_answers_jukebox_and_its_resend_completes_it() {
+    let env = VfsTestEnv::new().await;
+    let body: Vec<u8> = (0..=255u8).cycle().take(3 * 1024 * 1024).collect();
+    env.set_remote_files(vec![
+        remote_file("video.mov", body.len() as i64, "e1"),
+        remote_file("other.mov", body.len() as i64, "e2"),
+    ])
+    .await;
+    env.serve_file_content("video.mov", &body).await;
+    env.slow_down_downloads("video.mov", Duration::from_millis(1200));
+    let (vfs, _rx) =
+        Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(), DEFAULT_CACHE_MAX_BYTES)
+            .unwrap();
+    vfs.set_debounce_for_tests(Duration::from_secs(3600));
+    let fs = VfsNfs::with_read_jukebox_after(Arc::new(vfs), Duration::from_millis(200));
+    let file = fs.lookup(&fs.root_dir(), &fname("video.mov")).await.unwrap();
+
+    let started = std::time::Instant::now();
+    let first = fs.write(&file, 10, b"PATCH", stable_how::UNSTABLE).await;
+    assert_eq!(first.err(), Some(nfsstat3::NFS3ERR_JUKEBOX), "a slow write must not hold the RPC");
+    assert!(started.elapsed() < Duration::from_secs(1), "held {:?}", started.elapsed());
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        match fs.write(&file, 10, b"PATCH", stable_how::UNSTABLE).await {
+            Ok(_) => break,
+            Err(nfsstat3::NFS3ERR_JUKEBOX) => assert!(std::time::Instant::now() < deadline, "never completed"),
+            Err(other) => panic!("resend failed: {other:?}"),
+        }
+    }
+    let (data, _) = fs.read(&file, 0, 20).await.unwrap();
+    let mut expected = body[..20].to_vec();
+    expected[10..15].copy_from_slice(b"PATCH");
+    assert_eq!(data, expected);
+
+    // Same for a resize of an undrafted big file.
+    env.serve_file_content("other.mov", &body).await;
+    env.slow_down_downloads("other.mov", Duration::from_millis(1200));
+    let other = fs.lookup(&fs.root_dir(), &fname("other.mov")).await.unwrap();
+    let resize = sattr3 { size: Nfs3Option::Some(1000), ..Default::default() };
+    let started = std::time::Instant::now();
+    let first = fs.setattr(&other, resize.clone()).await;
+    assert_eq!(first.err(), Some(nfsstat3::NFS3ERR_JUKEBOX));
+    assert!(started.elapsed() < Duration::from_secs(1));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        match fs.setattr(&other, resize.clone()).await {
+            Ok(attr) => {
+                assert_eq!(attr.size, 1000);
+                break;
+            }
+            Err(nfsstat3::NFS3ERR_JUKEBOX) => assert!(std::time::Instant::now() < deadline, "never completed"),
+            Err(other) => panic!("resend failed: {other:?}"),
+        }
+    }
+}

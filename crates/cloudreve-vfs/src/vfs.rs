@@ -2601,9 +2601,14 @@ impl Vfs {
                 if data.is_empty() {
                     break; // server has fewer bytes than the tracked size promised
                 }
-                file.write_all(&data)
+                // Off the async workers: an 8 MiB synchronous write stalls
+                // every other task scheduled on this one.
+                let len = data.len() as u64;
+                file = tokio::task::spawn_blocking(move || file.write_all(&data).map(|()| file))
+                    .await
+                    .context("materialize: the write task panicked")?
                     .with_context(|| format!("failed to write {}", tmp_path.display()))?;
-                offset += data.len() as u64;
+                offset += len;
             }
         }
 

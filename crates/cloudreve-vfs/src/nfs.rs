@@ -143,6 +143,21 @@ const ABANDONED_READ_TTL: Duration = Duration::from_secs(120);
 type ReadKey = (u64, u64, u32);
 type ReadResult = Result<(Vec<u8>, bool), nfsstat3>;
 
+/// Which slow mutating call a parked task belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum SlowOp {
+    Write,
+    Resize,
+}
+
+/// A resent WRITE carries the same handle, offset and length; a resent
+/// resize the same handle and size.
+type SlowKey = (SlowOp, u64, u64, u64);
+/// A parked slow WRITE/resize: when it was parked, and its task.
+type ParkedOp = (Instant, JoinHandle<Result<(), nfsstat3>>);
+/// An exclusive CREATE's verifier and the fileid it created.
+type RecentCreate = ([u8; 8], u64);
+
 /// Spotlight opt-out: an empty, read-only file of this name at the volume
 /// root is how Apple DTS tells `mds` to leave a volume alone (Apple
 /// Developer Forums thread 820931, 2026). Served by this adapter alone —
@@ -170,9 +185,12 @@ pub struct VfsNfs {
     /// READs that outlived [`READ_JUKEBOX_AFTER`] and were answered with
     /// JUKEBOX, still running, waiting for the client's resend.
     slow_reads: Mutex<HashMap<ReadKey, (Instant, JoinHandle<ReadResult>)>>,
+    /// WRITEs and resizes that outlived the JUKEBOX threshold, still running,
+    /// waiting for the client's resend — see `run_or_jukebox`.
+    slow_ops: Mutex<HashMap<SlowKey, ParkedOp>>,
     /// Recent exclusive CREATEs: (parent fileid, name) -> (verifier, fileid),
     /// so a resent one is recognized — see `create_exclusive`.
-    exclusive_creates: Mutex<HashMap<(u64, String), ([u8; 8], u64)>>,
+    exclusive_creates: Mutex<HashMap<(u64, String), RecentCreate>>,
 }
 
 impl VfsNfs {
@@ -192,6 +210,7 @@ impl VfsNfs {
             rpc_counts: None,
             slow_reads: Mutex::new(HashMap::new()),
             exclusive_creates: Mutex::new(HashMap::new()),
+            slow_ops: Mutex::new(HashMap::new()),
         }
     }
 
@@ -221,6 +240,34 @@ impl VfsNfs {
     /// The facade this adapter serves.
     pub(crate) fn vfs(&self) -> Arc<Vfs> {
         self.vfs.clone()
+    }
+
+    /// Runs `op` (a WRITE or a resize) as a task; if it outlives
+    /// `read_jukebox_after`, answers JUKEBOX and parks it under `key` for
+    /// the client's resend — same scheme and reasons as READ's (see
+    /// [`READ_JUKEBOX_AFTER`]). The first write to a file not yet drafted
+    /// downloads the whole file (`Vfs::write`, D2): for a big remote file
+    /// that outlived the client's soft timeout, and the app got EIO.
+    async fn run_or_jukebox(
+        &self,
+        key: SlowKey,
+        op: impl std::future::Future<Output = Result<(), nfsstat3>> + Send + 'static,
+    ) -> Result<(), nfsstat3> {
+        let mut task = {
+            let mut slow = self.slow_ops.lock().unwrap();
+            slow.retain(|_, (since, _)| since.elapsed() < ABANDONED_READ_TTL);
+            match slow.remove(&key) {
+                Some((_, task)) => task,
+                None => tokio::spawn(op),
+            }
+        };
+        match tokio::time::timeout(self.read_jukebox_after, &mut task).await {
+            Ok(joined) => joined.unwrap_or(Err(nfsstat3::NFS3ERR_IO)),
+            Err(_) => {
+                self.slow_ops.lock().unwrap().insert(key, (Instant::now(), task));
+                Err(nfsstat3::NFS3ERR_JUKEBOX)
+            }
+        }
     }
 
     fn is_never_index(&self, dir: &FileHandleU64, name: &str) -> bool {
@@ -521,10 +568,14 @@ impl NfsFileSystem for VfsNfs {
         // call succeed (matching D7's fixed attrs) without silently
         // pretending to honor a value it can't keep.
         if let Nfs3Option::Some(size) = setattr.size {
-            let handle = self.vfs.open(node).await.map_err(|e| to_errno(&e))?;
-            let result = self.vfs.truncate(handle, size).await;
-            crate::frontend_util::close_logged(&self.vfs, handle).await;
-            result.map_err(|e| to_errno(&e))?;
+            let vfs = self.vfs.clone();
+            self.run_or_jukebox((SlowOp::Resize, node.0, size, 0), async move {
+                let handle = vfs.open(node).await.map_err(|e| to_errno(&e))?;
+                let result = vfs.truncate(handle, size).await;
+                crate::frontend_util::close_logged(&vfs, handle).await;
+                result.map(|_| ()).map_err(|e| to_errno(&e))
+            })
+            .await?;
         }
         let attr = self
             .vfs
@@ -547,10 +598,15 @@ impl NfsFileSystem for VfsNfs {
             return Err(nfsstat3::NFS3ERR_ACCES);
         }
         let node = NodeId(id.as_u64());
-        let handle = self.vfs.open(node).await.map_err(|e| to_errno(&e))?;
-        let result = self.vfs.write(handle, offset, data).await;
-        crate::frontend_util::close_logged(&self.vfs, handle).await;
-        result.map_err(|e| to_errno(&e))?;
+        let vfs = self.vfs.clone();
+        let bytes = data.to_vec();
+        self.run_or_jukebox((SlowOp::Write, node.0, offset, data.len() as u64), async move {
+            let handle = vfs.open(node).await.map_err(|e| to_errno(&e))?;
+            let result = vfs.write(handle, offset, &bytes).await;
+            crate::frontend_util::close_logged(&vfs, handle).await;
+            result.map(|_| ()).map_err(|e| to_errno(&e))
+        })
+        .await?;
         let attr = self
             .vfs
             .getattr(node)

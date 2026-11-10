@@ -44,8 +44,9 @@
 //! freezes the mount, and an `unlink`/`rename` waiting out
 //! [`crate::vfs::BUSY_GRACE`] for a late `release` (the kernel sends it
 //! asynchronously, possibly after the app's next request) leaves the
-//! dispatch thread free to deliver that `release`. `create`, `write`,
-//! `flush`, `release`, `mkdir` and `setattr` stay inline. A handle opened
+//! dispatch thread free to deliver that `release`. `write` and `setattr`
+//! too (the first write or resize of a file not yet drafted downloads it
+//! whole). `create`, `flush`, `release` and `mkdir` stay inline. A handle opened
 //! by one `open()` call persists in `Vfs::open_files` until its `release`,
 //! exactly like a real file descriptor, so `rename`/`unlink` of a file
 //! some app still holds open answers EBUSY once the grace runs out. See
@@ -308,10 +309,17 @@ impl Filesystem for VfsFuse {
     ) {
         let vfs = self.vfs.clone();
         let offset = offset.max(0) as u64;
-        match self.block_on(vfs.write(FileHandle(fh), offset, data)) {
-            Ok(written) => reply.written(written),
-            Err(err) => reply.error(errno_for(&err)),
-        }
+        let data = data.to_vec();
+        // On the runtime: the first write to a file not yet drafted
+        // downloads it whole (D2), and blocking the dispatch thread on that
+        // froze every other request on the mount meanwhile. The kernel only
+        // sends `release` once this reply is in.
+        self.spawn(async move {
+            match vfs.write(FileHandle(fh), offset, &data).await {
+                Ok(written) => reply.written(written),
+                Err(err) => reply.error(errno_for(&err)),
+            }
+        });
     }
 
     fn flush(&mut self, _req: &Request<'_>, _ino: u64, _fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
@@ -462,6 +470,15 @@ impl Filesystem for VfsFuse {
         reply: ReplyAttr,
     ) {
         let vfs = self.vfs.clone();
+        // On the runtime, like `write`: a resize of a file not yet drafted
+        // downloads it first.
+        self.spawn(setattr_reply(vfs, ino, size, fh, reply));
+    }
+}
+
+/// `setattr`'s body, run on the runtime (see `VfsFuse::spawn`).
+async fn setattr_reply(vfs: Arc<Vfs>, ino: u64, size: Option<u64>, fh: Option<u64>, reply: ReplyAttr) {
+    {
         if let Some(size) = size {
             let result = match fh {
                 // The kernel already gave us the open handle this file is
@@ -472,24 +489,25 @@ impl Filesystem for VfsFuse {
                 // handle per call — NFSv3 has no persistent handle to
                 // reuse), this is a genuine advantage of FUSE's handle
                 // model.
-                Some(fh) => self.block_on(vfs.truncate(FileHandle(fh), size)),
+                Some(fh) => vfs.truncate(FileHandle(fh), size).await,
                 // `truncate(2)` on a path with no currently-open fd is a
                 // real POSIX case the kernel can still send here with
                 // `fh: None` — fall back to `nfs.rs`'s open+truncate+close
                 // pattern.
-                None => self.block_on(async {
+                None => async {
                     let handle = vfs.open(NodeId(ino)).await?;
                     let result = vfs.truncate(handle, size).await;
                     crate::frontend_util::close_logged(&vfs, handle).await;
                     result
-                }),
+                }
+                .await,
             };
             if let Err(err) = result {
                 reply.error(errno_for(&err));
                 return;
             }
         }
-        match self.block_on(vfs.getattr(NodeId(ino))) {
+        match vfs.getattr(NodeId(ino)).await {
             Ok(Some(attr)) => reply.attr(&ATTR_TTL, &to_file_attr(&to_frontend_attr(ino, &attr))),
             Ok(None) => reply.error(libc::ENOENT),
             Err(err) => reply.error(errno_for(&err)),
