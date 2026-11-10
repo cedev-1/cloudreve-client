@@ -68,12 +68,12 @@ export default function DrivesSection() {
   const [editingDriveId, setEditingDriveId] = useState<string | null>(null);
   const [patternsText, setPatternsText] = useState("");
   const [maxFileSize, setMaxFileSize] = useState<number>(3072);
-  // Drive folder in the Finder / file manager sidebar. `initial` tells the
-  // save whether the toggle actually changed.
-  const [showInSidebar, setShowInSidebar] = useState(true);
-  const [initialShowInSidebar, setInitialShowInSidebar] = useState(true);
+  // Drive folder in the Finder / file manager sidebar, per drive: a switch
+  // on each drive card, for mirror and on-demand drives alike (the drive
+  // settings dialog only exists for mirror drives).
+  const [sidebarShown, setSidebarShown] = useState<Record<string, boolean>>({});
   // Already localized by the backend (`sidebarUpdateFailed`).
-  const [sidebarError, setSidebarError] = useState<string | null>(null);
+  const [sidebarErrors, setSidebarErrors] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
   const [patternsError, setPatternsError] = useState<string | null>(null);
   const [defaultPatterns, setDefaultPatterns] = useState<string[]>([]);
@@ -101,6 +101,34 @@ export default function DrivesSection() {
   useEffect(() => {
     fetchDrives();
   }, [fetchDrives]);
+
+  useEffect(() => {
+    const unknown = drives.filter((d) => !(d.id in sidebarShown));
+    if (unknown.length === 0) return;
+    Promise.all(
+      unknown.map((d) =>
+        invoke<boolean>("get_drive_sidebar", { driveId: d.id })
+          .catch(() => true)
+          .then((shown) => [d.id, shown] as const)
+      )
+    ).then((entries) =>
+      setSidebarShown((prev) => ({ ...prev, ...Object.fromEntries(entries) }))
+    );
+  }, [drives, sidebarShown]);
+
+  const handleToggleSidebar = async (driveId: string, enabled: boolean) => {
+    setSidebarShown((prev) => ({ ...prev, [driveId]: enabled }));
+    setSidebarErrors((prev) => {
+      const { [driveId]: _, ...rest } = prev;
+      return rest;
+    });
+    try {
+      await invoke("set_drive_sidebar", { driveId, enabled });
+    } catch (error) {
+      setSidebarShown((prev) => ({ ...prev, [driveId]: !enabled }));
+      setSidebarErrors((prev) => ({ ...prev, [driveId]: String(error) }));
+    }
+  };
 
   const handleDelete = async (drive: DriveInfo) => {
     const unsynced = drive.unsynced_files ?? 0;
@@ -180,11 +208,9 @@ export default function DrivesSection() {
 
   const handleEditIgnorePatterns = async (driveId: string) => {
     try {
-      const [patterns, maxMb, inSidebar] = await Promise.all([
+      const [patterns, maxMb] = await Promise.all([
         invoke<string[]>("get_ignore_patterns", { driveId }),
         invoke<number>("get_drive_max_file_size", { driveId }),
-        // Informational like the built-in list: never blocks the dialog.
-        invoke<boolean>("get_drive_sidebar", { driveId }).catch(() => true),
       ]);
       // The built-in list is informational: failing to fetch it must not
       // keep the dialog from opening.
@@ -193,8 +219,6 @@ export default function DrivesSection() {
         .catch(() => setDefaultPatterns([]));
       setPatternsText(patterns.join("\n"));
       setMaxFileSize(Number(maxMb) || 3072);
-      setShowInSidebar(inSidebar);
-      setInitialShowInSidebar(inSidebar);
       setPatternsError(null);
       setEditingDriveId(driveId);
     } catch (error) {
@@ -206,7 +230,6 @@ export default function DrivesSection() {
     if (!editingDriveId) return;
     setSaving(true);
     setPatternsError(null);
-    setSidebarError(null);
     try {
       const patterns = patternsText
         .split("\n")
@@ -220,17 +243,6 @@ export default function DrivesSection() {
         driveId: editingDriveId,
         maxMb: Math.max(0, Math.floor(maxFileSize)),
       });
-      if (showInSidebar !== initialShowInSidebar) {
-        try {
-          await invoke("set_drive_sidebar", {
-            driveId: editingDriveId,
-            enabled: showInSidebar,
-          });
-        } catch (error) {
-          setSidebarError(String(error));
-          return;
-        }
-      }
       setEditingDriveId(null);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -244,7 +256,6 @@ export default function DrivesSection() {
     setEditingDriveId(null);
     setPatternsText("");
     setPatternsError(null);
-    setSidebarError(null);
     setSaving(false);
   };
 
@@ -517,6 +528,34 @@ export default function DrivesSection() {
                   </Box>
                 </Box>
 
+                {/* Show in the Finder / file manager sidebar */}
+                <Box sx={{ mt: 1.5 }}>
+                  <FormControlLabel
+                    control={
+                      <Switch
+                        size="small"
+                        checked={sidebarShown[drive.id] ?? true}
+                        onChange={(e) => handleToggleSidebar(drive.id, e.target.checked)}
+                      />
+                    }
+                    label={
+                      <Typography variant="body2">
+                        {platform() === "macos"
+                          ? t("settings.showInFinderSidebar", "Show in Finder sidebar")
+                          : t("settings.showInFileManagerSidebar", "Show in file manager sidebar")}
+                      </Typography>
+                    }
+                  />
+                  <Typography variant="caption" color="text.secondary" component="div">
+                    {t("settings.showInSidebarDescription")}
+                  </Typography>
+                  {sidebarErrors[drive.id] && (
+                    <Alert severity="error" sx={{ mt: 1 }}>
+                      {sidebarErrors[drive.id]}
+                    </Alert>
+                  )}
+                </Box>
+
                 {/* Action Footer */}
                 <Divider sx={{ my: 2, mx: -2 }} />
                 <Box
@@ -642,28 +681,6 @@ export default function DrivesSection() {
               },
             }}
           />
-          <FormControlLabel
-            sx={{ mt: 2 }}
-            control={
-              <Switch
-                checked={showInSidebar}
-                onChange={(e) => setShowInSidebar(e.target.checked)}
-              />
-            }
-            label={
-              platform() === "macos"
-                ? t("settings.showInFinderSidebar", "Show in Finder sidebar")
-                : t("settings.showInFileManagerSidebar", "Show in file manager sidebar")
-            }
-          />
-          <Typography variant="body2" color="text.secondary">
-            {t("settings.showInSidebarDescription")}
-          </Typography>
-          {sidebarError && (
-            <Alert severity="error" sx={{ mt: 1 }}>
-              {sidebarError}
-            </Alert>
-          )}
         </DialogContent>
         <DialogActions>
           <Button onClick={handleCloseDialog}>
