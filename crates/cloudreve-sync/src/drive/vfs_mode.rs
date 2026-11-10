@@ -49,13 +49,16 @@ pub fn cache_dir_for(drive_id: &str) -> Result<PathBuf> {
     Ok(home.join(".cloudreve").join("vfs-cache").join(drive_id))
 }
 
-/// Pure D3 formula: `min(default, max(floor, available − reserve))`.
+/// Pure D3 formula: `min(default, max(floor, (available − reserve) / drives))`.
+/// `drives` is how many on-demand caches share the volume: each computes
+/// its cap from the same free space, so without the split three drives
+/// would each be allowed what only one of them fits in.
 /// Factored out from [`effective_cache_cap`] so it can be pinned by a unit
 /// test against concrete byte counts, independent of any real filesystem
 /// call — see this module's tests for why those numbers are never
 /// expressed in terms of the constants under test.
-fn clamp_cache_cap(available_bytes: u64) -> u64 {
-    let after_reserve = available_bytes.saturating_sub(RESERVED_BYTES);
+fn clamp_cache_cap(available_bytes: u64, drives: u64) -> u64 {
+    let after_reserve = available_bytes.saturating_sub(RESERVED_BYTES) / drives.max(1);
     after_reserve.clamp(CACHE_FLOOR_BYTES, DEFAULT_CACHE_MAX_BYTES)
 }
 
@@ -67,7 +70,7 @@ fn clamp_cache_cap(available_bytes: u64) -> u64 {
 /// unusable.
 pub fn effective_cache_cap(cache_dir: &Path) -> u64 {
     match available_space_for(cache_dir) {
-        Ok(available) => clamp_cache_cap(available),
+        Ok(available) => clamp_cache_cap(available, drives_sharing_cache_volume(cache_dir)),
         Err(err) => {
             tracing::warn!(
                 target: "drive::vfs_mode",
@@ -78,6 +81,24 @@ pub fn effective_cache_cap(cache_dir: &Path) -> u64 {
             DEFAULT_CACHE_MAX_BYTES
         }
     }
+}
+
+/// How many on-demand drives keep their cache on the same volume as
+/// `cache_dir`: every one has its own folder under the same parent
+/// (`cache_dir_for`), and this drive counts even before its folder exists.
+/// A deleted drive's folder goes with it (`Mount::delete`).
+pub(crate) fn drives_sharing_cache_volume(cache_dir: &Path) -> u64 {
+    let others = cache_dir
+        .parent()
+        .and_then(|parent| std::fs::read_dir(parent).ok())
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|e| e.path() != cache_dir && e.file_type().is_ok_and(|t| t.is_dir()))
+                .count() as u64
+        })
+        .unwrap_or(0);
+    others + 1
 }
 
 /// Whether `cap` reflects D3's clamp having kicked in (below the
@@ -440,14 +461,14 @@ mod tests {
     /// floor and the default, so neither clamp fires).
     #[test]
     fn three_gib_free_yields_a_two_gib_cap() {
-        assert_eq!(clamp_cache_cap(3 * GIB), 2 * GIB);
+        assert_eq!(clamp_cache_cap(3 * GIB, 1), 2 * GIB);
     }
 
     /// 100 TiB free -> capped at the 10 GiB default; a huge volume must
     /// never hand the on-demand cache an effectively unbounded budget.
     #[test]
     fn a_huge_volume_is_capped_at_the_default() {
-        assert_eq!(clamp_cache_cap(100 * TIB), DEFAULT_CACHE_MAX_BYTES);
+        assert_eq!(clamp_cache_cap(100 * TIB, 1), DEFAULT_CACHE_MAX_BYTES);
         assert_eq!(DEFAULT_CACHE_MAX_BYTES, 10 * GIB);
     }
 
@@ -457,15 +478,45 @@ mod tests {
     /// useless).
     #[test]
     fn a_nearly_full_volume_is_held_at_the_floor() {
-        assert_eq!(clamp_cache_cap(700 * MIB), CACHE_FLOOR_BYTES);
+        assert_eq!(clamp_cache_cap(700 * MIB, 1), CACHE_FLOOR_BYTES);
         assert_eq!(CACHE_FLOOR_BYTES, 512 * MIB);
+    }
+
+    /// Three on-demand drives, 31 GiB free: each cache may grow to 10 GiB,
+    /// and together they still leave the reserve. Without the split, each
+    /// was allowed the full 10 GiB of a volume holding barely more than
+    /// one of them.
+    #[test]
+    fn drives_on_one_volume_share_its_free_space() {
+        assert_eq!(clamp_cache_cap(31 * GIB, 3), 10 * GIB);
+        assert_eq!(clamp_cache_cap(13 * GIB, 3), 4 * GIB);
+        assert_eq!(clamp_cache_cap(13 * GIB, 2), 6 * GIB);
+    }
+
+    /// The share still never drops below the floor.
+    #[test]
+    fn a_small_share_is_held_at_the_floor() {
+        assert_eq!(clamp_cache_cap(2 * GIB, 4), CACHE_FLOOR_BYTES);
+    }
+
+    /// Every on-demand drive has its cache folder next to this one's; this
+    /// drive counts whether its own folder exists yet (first mount) or not.
+    #[test]
+    fn the_drives_sharing_the_cache_volume_are_counted_from_their_cache_folders() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("drive-a")).unwrap();
+        std::fs::create_dir(root.path().join("drive-b")).unwrap();
+        std::fs::write(root.path().join(".DS_Store"), b"").unwrap();
+
+        assert_eq!(drives_sharing_cache_volume(&root.path().join("drive-new")), 3);
+        assert_eq!(drives_sharing_cache_volume(&root.path().join("drive-a")), 2);
     }
 
     /// Exactly at the reserve boundary: nothing left after the reserve, so
     /// the floor applies.
     #[test]
     fn exactly_the_reserve_amount_free_is_held_at_the_floor() {
-        assert_eq!(clamp_cache_cap(RESERVED_BYTES), CACHE_FLOOR_BYTES);
+        assert_eq!(clamp_cache_cap(RESERVED_BYTES, 1), CACHE_FLOOR_BYTES);
     }
 
     /// A cap equal to the default is NOT considered clamped — only a cap
