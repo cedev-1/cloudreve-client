@@ -397,6 +397,23 @@ impl DraftStore {
         self.entries.values().any(|e| e.remote_path.starts_with(&nested))
     }
 
+    /// Names of the never-uploaded drafts (empty `base_etag`: created here,
+    /// no remote counterpart yet) sitting directly in the folder
+    /// `dir_path`. After a restart the tree is rebuilt from server
+    /// listings alone, which have never heard of these files: `Vfs`
+    /// overlays them from here so they stay visible (and `create` keeps
+    /// answering EEXIST instead of truncating their only copy).
+    pub fn local_only_children(&self, dir_path: &str) -> Vec<String> {
+        let prefix = format!("{dir_path}/");
+        self.entries
+            .values()
+            .filter(|e| e.base_etag.is_empty())
+            .filter_map(|e| e.remote_path.strip_prefix(&prefix))
+            .filter(|name| !name.is_empty() && !name.contains('/'))
+            .map(str::to_string)
+            .collect()
+    }
+
     /// The draft's content-mutation counter — see `Entry::write_seq`'s doc.
     pub fn write_seq(&self, remote_path: &str) -> Option<u64> {
         self.entries.get(&hash16(remote_path)).map(|e| e.write_seq)

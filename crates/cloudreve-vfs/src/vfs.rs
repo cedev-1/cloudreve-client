@@ -1368,6 +1368,11 @@ impl Vfs {
         if self.lookup(parent, name).await?.is_some() {
             anyhow::bail!("EEXIST: an entry named {name:?} already exists in this directory");
         }
+        // Belt and braces for the lookup above: `DraftStore::begin` below
+        // truncates, and a draft may be a file's only copy.
+        if self.drafts.lock().await.state(&remote_path).is_some() {
+            anyhow::bail!("EEXIST: {name:?} has local changes not uploaded yet");
+        }
         let node = self.tree.insert_local_entry(parent, name).await?;
         let attr = self
             .tree
@@ -2144,6 +2149,7 @@ impl Vfs {
                 listing.push((id, attr));
             }
         }
+        self.add_local_only_drafts(dir, &mut listing).await?;
         // Junk is never listed, local-only files included (see
         // `crate::junk`); the tree already drops the server's copies.
         listing.retain(|(_, attr)| junk::classify(&attr.name).is_none());
@@ -2173,7 +2179,38 @@ impl Vfs {
                 return Ok(Some((id, attr)));
             }
         }
+        let mut drafted = Vec::new();
+        self.add_local_only_drafts(parent, &mut drafted).await?;
+        for (id, attr) in drafted {
+            if crate::tree::same_name(&attr.name, name) {
+                return Ok(Some((id, attr)));
+            }
+        }
         Ok(None)
+    }
+
+    /// Puts back into the tree (and into `listing`) every never-uploaded
+    /// draft of `dir` that `listing` lacks — see
+    /// `DraftStore::local_only_children`. Before this, a file created but
+    /// not uploaded yet vanished at the next launch, and creating it again
+    /// truncated its draft.
+    async fn add_local_only_drafts(&self, dir: NodeId, listing: &mut Vec<(NodeId, NodeAttr)>) -> Result<()> {
+        let Some(dir_attr) = self.tree.getattr(dir).await? else { return Ok(()) };
+        if !dir_attr.is_dir {
+            return Ok(());
+        }
+        let names = self.drafts.lock().await.local_only_children(&dir_attr.remote_path);
+        for name in names {
+            if listing.iter().any(|(_, a)| crate::tree::same_name(&a.name, &name)) {
+                continue;
+            }
+            let id = self.tree.insert_local_entry(dir, &name).await?;
+            if let Some(mut attr) = self.tree.getattr(id).await? {
+                self.overlay_draft(&mut attr).await;
+                listing.push((id, attr));
+            }
+        }
+        Ok(())
     }
 
     /// `lookup` for a local-only junk name. The overlay is keyed by path,
