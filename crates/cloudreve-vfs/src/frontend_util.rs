@@ -62,6 +62,8 @@ pub enum FrontendErrno {
     /// The local disk holding drafts and cached blocks is full (ENOSPC
     /// anywhere in the error chain).
     NoSpace,
+    /// A local-only junk file past its size cap ([`JunkTooBigError`]).
+    FileTooBig,
     /// Everything else. The anyhow causal chain is logged at debug so a
     /// real bug stays diagnosable without ever leaking `anyhow::Error`
     /// details across the frontend boundary.
@@ -110,14 +112,16 @@ pub fn classify_error(err: &anyhow::Error) -> FrontendErrno {
     FrontendErrno::Io
 }
 
-/// D7: unix permission bits for a node — files are `0o644`, directories
-/// `0o755`. Fixed, not configurable: the facade has no per-file permission
-/// bit of its own to report instead.
+/// D7: unix permission bits for a node — files are `0o600`, directories
+/// `0o700`: owner-only, matching what the NFS server enforces (it refuses
+/// every uid but this user's and root's, see `nfs::start_server`). Fixed,
+/// not configurable: the facade has no per-file permission bit of its own
+/// to report instead.
 pub fn to_unix_mode(is_dir: bool) -> u32 {
     if is_dir {
-        0o755
+        0o700
     } else {
-        0o644
+        0o600
     }
 }
 
@@ -253,10 +257,13 @@ mod tests {
         assert_eq!(classify_error(&err), FrontendErrno::Io);
     }
 
+    /// Owner-only: the cloud files are this user's alone. The NFS server
+    /// already refuses other uids; the modes make Finder and `ls -l` say so,
+    /// and let the kernel refuse from its attribute cache too.
     #[test]
-    fn directories_and_files_get_distinct_modes() {
-        assert_eq!(to_unix_mode(true), 0o755);
-        assert_eq!(to_unix_mode(false), 0o644);
+    fn nodes_are_owner_only() {
+        assert_eq!(to_unix_mode(true), 0o700);
+        assert_eq!(to_unix_mode(false), 0o600);
     }
 
     #[test]
@@ -273,7 +280,7 @@ mod tests {
         let fa = to_frontend_attr(7, &attr);
         assert_eq!(fa.fileid, 7);
         assert_eq!(fa.size, 42);
-        assert_eq!(fa.mode, 0o644);
+        assert_eq!(fa.mode, 0o600);
         assert_eq!(fa.mtime_secs, 1_700_000_000);
         assert_eq!(fa.atime_secs, fa.mtime_secs);
         assert_eq!(fa.ctime_secs, fa.mtime_secs);

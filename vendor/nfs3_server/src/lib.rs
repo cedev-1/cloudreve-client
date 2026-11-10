@@ -1,6 +1,8 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![doc = include_str!("../README.md")]
 
+// Cloudreve fork: see CLOUDREVE-FORK.md.
+pub mod caller_policy;
 mod context;
 mod mount_handlers;
 pub(crate) mod nfs_ext;

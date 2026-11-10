@@ -257,12 +257,30 @@ pub async fn start_server(fs: VfsNfs, label: String) -> anyhow::Result<NfsServer
     use anyhow::Context;
     use nfs3_server::tcp::{NFSTcp, NFSTcpListener};
 
-    let listener = NFSTcpListener::bind("127.0.0.1:0", fs)
+    // Loopback keeps the network out, not the other local processes —
+    // another account, or a sandboxed app of this user allowed outgoing
+    // connections. Every handle starts with this generation, so a random
+    // one makes them unguessable (upstream uses the bind time in ms); the
+    // policy refuses callers that are neither this user nor root, and every
+    // MNT after the mount's own, so the root handle never leaves the kernel.
+    // See `vendor/nfs3_server/src/caller_policy.rs`.
+    let generation = random_u64().context("reading a random nfs handle generation")?;
+    let mut listener = NFSTcpListener::bind_with_generation("127.0.0.1:0", fs, generation)
         .await
         .context("binding the in-process nfs3 server to 127.0.0.1:0")?;
+    listener.set_caller_policy(
+        nfs3_server::caller_policy::CallerPolicy::new(vec![process_uid(), 0]).single_mount(),
+    );
     let port = listener.get_listen_port();
     let server = tokio::spawn(async move { listener.handle_forever().await });
     Ok(supervise(server, label, port))
+}
+
+fn random_u64() -> std::io::Result<u64> {
+    use std::io::Read;
+    let mut bytes = [0u8; 8];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(u64::from_ne_bytes(bytes))
 }
 
 /// Watches the server task: its end is reported unless it was aborted.
@@ -309,7 +327,7 @@ fn never_index_attr() -> fattr3 {
         fileid: NEVER_INDEX_FILEID,
         is_dir: false,
         size: 0,
-        mode: 0o444,
+        mode: 0o400,
         uid: process_uid(),
         gid: process_gid(),
         nlink: 1,
@@ -729,6 +747,7 @@ fn to_nfsstat3(errno: FrontendErrno) -> nfsstat3 {
         FrontendErrno::Access => nfsstat3::NFS3ERR_ACCES,
         FrontendErrno::CrossDevice => nfsstat3::NFS3ERR_XDEV,
         FrontendErrno::NoSpace => nfsstat3::NFS3ERR_NOSPC,
+        FrontendErrno::FileTooBig => nfsstat3::NFS3ERR_FBIG,
         FrontendErrno::Io => nfsstat3::NFS3ERR_IO,
     }
 }

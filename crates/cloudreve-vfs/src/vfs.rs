@@ -68,6 +68,16 @@ const USER_AGENT: &str = concat!("cloudreve-desktop/", env!("CARGO_PKG_VERSION")
 /// `Vfs::settle_closed`. Under NFS's 3 s soft timeout.
 pub const BUSY_GRACE: Duration = Duration::from_millis(1500);
 
+/// Largest one local-only junk file may grow (see `crate::junk`). A
+/// `.DS_Store` reaches a few hundred KiB in a big folder; an AppleDouble
+/// sidecar carrying a resource fork or a Finder thumbnail a few MB.
+pub const JUNK_FILE_MAX: u64 = 16 * 1024 * 1024;
+
+/// Most memory the whole junk overlay may hold. Past it, the oldest closed
+/// sidecars are forgotten to make room (their xattrs are lost, as they
+/// already are at every restart); see `Vfs::junk_make_room`.
+pub const JUNK_TOTAL_MAX: u64 = 64 * 1024 * 1024;
+
 /// Opaque handle returned by [`Vfs::open`], threaded through [`Vfs::read`]
 /// and [`Vfs::close`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -387,6 +397,24 @@ impl std::fmt::Display for CrossOverlayRenameError {
 }
 
 impl std::error::Error for CrossOverlayRenameError {}
+
+/// A local-only junk file (see `crate::junk`) asked to grow past
+/// [`JUNK_FILE_MAX`]: frontends answer EFBIG. The overlay is memory, and
+/// an unchecked `truncate -s 50G ._x` aborted the process on the
+/// allocation. Detectable via `downcast_ref::<JunkTooBigError>()`.
+#[derive(Debug, Clone)]
+pub struct JunkTooBigError {
+    pub remote_path: String,
+    pub size: u64,
+}
+
+impl std::fmt::Display for JunkTooBigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "local-only {} cannot grow to {} bytes", self.remote_path, self.size)
+    }
+}
+
+impl std::error::Error for JunkTooBigError {}
 
 /// One local-only junk file (see `crate::junk`): its whole content, kept in
 /// memory. AppleDouble sidecars and `.DS_Store` are a few KiB.

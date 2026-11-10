@@ -16,6 +16,8 @@ pub struct RPCContext<T: crate::vfs::NfsFileSystem> {
     pub export_name: Arc<String>,
     pub transaction_tracker: Arc<TransactionTracker>,
     pub(crate) file_handle_converter: FileHandleConverter,
+    // Cloudreve fork: see `caller_policy`.
+    pub(crate) caller_policy: Option<Arc<crate::caller_policy::CallerPolicy>>,
 }
 
 #[allow(clippy::missing_fields_in_debug)]
@@ -49,6 +51,7 @@ where
             export_name: Arc::clone(&self.export_name),
             transaction_tracker: Arc::clone(&self.transaction_tracker),
             file_handle_converter: self.file_handle_converter,
+            caller_policy: self.caller_policy.clone(),
         }
     }
 }
@@ -73,6 +76,7 @@ where
                 1024,
             )),
             file_handle_converter: FileHandleConverter::new(),
+            caller_policy: None,
         }
     }
     #[must_use]

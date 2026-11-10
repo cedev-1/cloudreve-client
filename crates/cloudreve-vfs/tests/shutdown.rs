@@ -11,8 +11,8 @@ use cloudreve_vfs::vfs::{Vfs, DEFAULT_CACHE_MAX_BYTES};
 use cloudreve_vfs::writeback::{DraftState, UPLOAD_RETRIES};
 use common::{remote_file, VfsTestEnv};
 
-fn request_count(env: &VfsTestEnv) -> impl std::future::Future<Output = usize> + '_ {
-    async move { env.server.received_requests().await.map(|r| r.len()).unwrap_or(0) }
+async fn request_count(env: &VfsTestEnv) -> usize {
+    env.server.received_requests().await.map(|r| r.len()).unwrap_or(0)
 }
 
 /// A save closed just before the drive is deleted: its debounce timer is

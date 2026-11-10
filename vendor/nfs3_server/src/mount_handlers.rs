@@ -26,7 +26,9 @@ where
 
     debug!("handle_nfs({xid}, {call:?}");
     if call.vers != VERSION {
-        warn!("Invalid Mount Version number {} != {VERSION}", call.vers);
+        // Cloudreve fork: debug, not warn — macOS mount_nfs probes MOUNT v1
+        // on every mount; refusing it is the expected answer.
+        debug!("Invalid Mount Version number {} != {VERSION}", call.vers);
         return message.into_error_reply(accept_stat_data::PROG_MISMATCH {
             low: VERSION,
             high: VERSION,
@@ -87,10 +89,22 @@ where
 
     match context.vfs.lookup_by_path(path).await {
         Ok(fileid) => {
+            // Cloudreve fork: see `caller_policy`. Only the first MNT gets
+            // the root handle, and only AUTH_UNIX is offered — offered
+            // AUTH_NULL first, a client could pick it and be refused on
+            // every call.
+            let auth_flavors = match &context.caller_policy {
+                Some(policy) if !policy.claim_mount() => {
+                    warn!("{xid} --> refusing a second MNT");
+                    return mountres3::Err(mountstat3::MNT3ERR_ACCES);
+                }
+                Some(_) => vec![auth_flavor::AUTH_UNIX as u32],
+                None => vec![auth_flavor::AUTH_NULL as u32, auth_flavor::AUTH_UNIX as u32],
+            };
             let root = context.file_handle_converter.fh_to_nfs(&fileid);
             let response = mountres3_ok {
                 fhandle: fhandle3(root.data),
-                auth_flavors: vec![auth_flavor::AUTH_NULL as u32, auth_flavor::AUTH_UNIX as u32],
+                auth_flavors,
             };
             debug!("{xid} --> {response:?}");
             if let Some(ref chan) = context.mount_signal {

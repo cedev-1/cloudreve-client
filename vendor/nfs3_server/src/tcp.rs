@@ -9,6 +9,11 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
+// Cloudreve fork: see `handle_forever`.
+// Same values on macOS and Linux.
+const EMFILE: i32 = 24;
+const ENFILE: i32 = 23;
+
 use crate::context::RPCContext;
 use crate::rpcwire::{SocketMessageHandler, write_fragment};
 use crate::transaction_tracker::{Cleaner, TransactionTracker};
@@ -26,11 +31,18 @@ pub struct NFSTcpListener<T: NfsFileSystem + 'static> {
     transaction_tracker: Arc<TransactionTracker>,
     file_handle_converter: crate::vfs::handle::FileHandleConverter,
     stop_notify: Arc<tokio::sync::Notify>,
+    // Cloudreve fork: see `caller_policy`.
+    caller_policy: Option<Arc<crate::caller_policy::CallerPolicy>>,
+    // Cloudreve fork: flipped when the listener is dropped (its serving
+    // task aborted), so every connection it accepted stops too instead of
+    // answering the kernel forever from a detached task.
+    closed: tokio::sync::watch::Sender<bool>,
 }
 
 impl<T: NfsFileSystem + 'static> Drop for NFSTcpListener<T> {
     fn drop(&mut self) {
         self.stop_notify.notify_waiters();
+        self.closed.send_replace(true);
     }
 }
 
@@ -226,6 +238,8 @@ impl<T: NfsFileSystem + 'static> NFSTcpListener<T> {
             transaction_tracker: Self::new_transaction_tracker(),
             stop_notify: Arc::new(tokio::sync::Notify::new()),
             file_handle_converter,
+            caller_policy: None,
+            closed: tokio::sync::watch::channel(false).0,
         })
     }
 
@@ -239,6 +253,12 @@ impl<T: NfsFileSystem + 'static> NFSTcpListener<T> {
             MAX_ACTIVE_TRANSACTIONS,
             TRANSACTION_TRIM_THRESHOLD,
         ))
+    }
+
+    /// Cloudreve fork: restricts who this server answers — see
+    /// [`crate::caller_policy::CallerPolicy`].
+    pub fn set_caller_policy(&mut self, policy: crate::caller_policy::CallerPolicy) {
+        self.caller_policy = Some(Arc::new(policy));
     }
 
     /// Sets an optional NFS export name.
@@ -293,25 +313,50 @@ impl<T: NfsFileSystem + 'static> NFSTcp for NFSTcpListener<T> {
         tokio::spawn(cleaner_future);
 
         loop {
-            let (socket, _) = self.listener.accept().await?;
+            // Cloudreve fork: upstream returned on the first accept error,
+            // silently killing the server — EMFILE (a GUI app starts with
+            // 256 descriptors) or a connection reset before accept returned
+            // were enough. Every accept error is per-attempt: log, back off
+            // (so EMFILE does not spin), keep serving.
+            let socket = match self.listener.accept().await {
+                Ok((socket, _)) => socket,
+                Err(err) => {
+                    let backoff = if matches!(err.raw_os_error(), Some(code) if code == EMFILE || code == ENFILE) {
+                        Duration::from_millis(500)
+                    } else {
+                        Duration::from_millis(50)
+                    };
+                    error!("accept failed, retrying in {backoff:?}: {err}");
+                    tokio::time::sleep(backoff).await;
+                    continue;
+                }
+            };
+            // Cloudreve fork: upstream `expect`ed here; a peer already gone
+            // (reset right after connecting) panicked the whole server.
+            let Ok(peer) = socket.peer_addr() else {
+                debug!("dropping a connection whose peer is already gone");
+                continue;
+            };
             let context = RPCContext {
                 local_port: self.port,
-                client_addr: socket
-                    .peer_addr()
-                    .expect("failed to get peer address")
-                    .to_string(),
+                client_addr: peer.to_string(),
                 auth: nfs3_types::rpc::auth_unix::default(),
                 vfs: self.arcfs.clone(),
                 mount_signal: self.mount_signal.clone(),
                 export_name: self.export_name.clone(),
                 transaction_tracker: self.transaction_tracker.clone(),
                 file_handle_converter: self.file_handle_converter,
+                caller_policy: self.caller_policy.clone(),
             };
-            info!("Accepting connection from {}", context.client_addr);
+            debug!("Accepting connection from {}", context.client_addr);
             debug!("Accepting socket {:?} {:?}", socket, context);
+            let mut closed = self.closed.subscribe();
             tokio::spawn(async move {
                 let _ = socket.set_nodelay(true);
-                let _ = process_socket(socket, context).await;
+                tokio::select! {
+                    _ = process_socket(socket, context) => {}
+                    _ = closed.wait_for(|c| *c) => {}
+                }
             });
         }
     }

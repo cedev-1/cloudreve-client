@@ -555,6 +555,12 @@ mod macos_impl {
     /// capped at `OPEN_MAX` (10240 — macOS refuses anything higher, even
     /// under an unlimited hard limit). Best-effort and idempotent: a
     /// failure only leaves the old limit in place.
+    /// Test-only: [`raise_open_file_limit`], which `mount` runs first.
+    #[doc(hidden)]
+    pub fn raise_open_file_limit_for_tests() {
+        raise_open_file_limit();
+    }
+
     pub(crate) fn raise_open_file_limit() {
         const OPEN_MAX: libc::rlim_t = 10240;
         // SAFETY: plain syscalls on a stack struct we own.
@@ -838,7 +844,8 @@ mod macos_impl {
 #[cfg(target_os = "macos")]
 pub use macos_impl::{
     cleanup_stale_mount, mount, mount_with_nfs_tuning_for_tests, mount_with_read_log_for_tests,
-    mount_with_rpc_counts_for_tests, production_mount_opts_for_tests, MountedVfs,
+    mount_with_rpc_counts_for_tests, production_mount_opts_for_tests, raise_open_file_limit_for_tests,
+    MountedVfs,
 };
 
 #[cfg(target_os = "linux")]

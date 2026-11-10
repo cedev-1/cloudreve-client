@@ -10,8 +10,9 @@ use nfs3_types::xdr_codec::{Pack, Unpack};
 use nfs3_types::{nfs3 as nfs, portmap};
 use tokio::io::{AsyncWriteExt, DuplexStream};
 use tokio::sync::mpsc;
-use tracing::{error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
+use crate::caller_policy::NfsAccessDenied;
 use crate::context::RPCContext;
 use crate::transaction_tracker::{self, TransactionError, TransactionLock};
 use crate::units::KIBIBYTE;
@@ -44,9 +45,28 @@ where
         return message.into_rpc_mismatch();
     }
 
+    let mut unix_uid = None;
     if call.cred.flavor == auth_flavor::AUTH_UNIX {
         let auth = auth_unix::unpack(&mut Cursor::new(&call.cred.body.0))?.0;
+        unix_uid = Some(auth.uid);
         context.auth = auth;
+    }
+
+    // Cloudreve fork: see `caller_policy`. The NULL ping (proc 0) carries
+    // no data and stays open; a wrong version falls through to the
+    // handlers' own PROG_MISMATCH.
+    if let Some(policy) = &context.caller_policy {
+        let proc_ = call.proc;
+        if proc_ != 0 && call.vers == 3 && !policy.allows(unix_uid) {
+            if prog == nfs::PROGRAM {
+                debug!("refusing NFS call {proc_} from uid {unix_uid:?}");
+                return message.into_success_reply(&NfsAccessDenied::for_proc(proc_));
+            }
+            if prog == nfs3_types::mount::PROGRAM && proc_ == 1 {
+                warn!("refusing MNT from uid {unix_uid:?}");
+                return message.into_success_reply(&nfs3_types::mount::mountstat3::MNT3ERR_ACCES);
+            }
+        }
     }
 
     let transaction = lock_transaction(

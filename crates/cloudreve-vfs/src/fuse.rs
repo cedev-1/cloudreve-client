@@ -569,6 +569,7 @@ fn to_errno(errno: FrontendErrno) -> i32 {
         FrontendErrno::Access => libc::EACCES,
         FrontendErrno::CrossDevice => libc::EXDEV,
         FrontendErrno::NoSpace => libc::ENOSPC,
+        FrontendErrno::FileTooBig => libc::EFBIG,
         FrontendErrno::Io => libc::EIO,
     }
 }

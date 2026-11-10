@@ -608,7 +608,7 @@ pub struct WriteBackQueue {
     /// its own entry the instant it fires (before doing any real work), so
     /// a `cancel` racing in after that point correctly finds nothing and
     /// reports it did not stop anything — see `cancel`'s doc.
-    timers: Arc<StdMutex<HashMap<String, (u64, tokio::task::JoinHandle<()>)>>>,
+    timers: Arc<StdMutex<ArmedTimers>>,
     /// Identifies each armed timer in `timers`, so a timer only ever takes
     /// out its own entry — see `arm`.
     next_timer: Arc<std::sync::atomic::AtomicU64>,
@@ -694,6 +694,9 @@ pub struct WriteBackQueue {
     /// Names the drive in this queue's log lines — see `Vfs::set_drive_label`.
     drive: Arc<StdMutex<Arc<str>>>,
 }
+
+/// Armed debounce timers by remote path: (timer id, task) — see `arm`.
+type ArmedTimers = HashMap<String, (u64, tokio::task::JoinHandle<()>)>;
 
 /// Scope guard for `WriteBackQueue::run` (phase 4, this task): removes
 /// `remote_path` from `in_flight` on drop — unconditionally, whether `run`
