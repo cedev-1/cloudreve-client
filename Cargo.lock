@@ -805,7 +805,6 @@ dependencies = [
  "tauri-plugin-updater",
  "tokio",
  "tracing",
- "tracing-log",
  "urlencoding",
  "uuid",
 ]
@@ -847,6 +846,7 @@ dependencies = [
  "image",
  "libc",
  "libsqlite3-sys",
+ "log",
  "notify-debouncer-full",
  "objc2 0.6.4",
  "objc2-app-kit",

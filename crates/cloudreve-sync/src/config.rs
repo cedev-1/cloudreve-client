@@ -70,6 +70,11 @@ pub struct AppConfig {
     pub check_updates_on_startup: bool,
     /// Whether to automatically download and install updates
     pub auto_install_updates: bool,
+    /// Which one-time migrations of saved defaults this file has been
+    /// through (see `migrate_defaults`). Field-level default: a file written
+    /// before it existed reads as 0, not as `AppConfig::default()`'s value.
+    #[serde(default)]
+    pub defaults_version: u32,
 }
 
 impl Default for AppConfig {
@@ -81,14 +86,38 @@ impl Default for AppConfig {
             notify_connection_status: true,
             fast_popup_launch: true,
             log_to_file: true,
-            log_level: LogLevel::Debug,
+            log_level: LogLevel::Info,
             log_max_files: 5,
             language: None,
             heartbeat_interval_secs: 15,
             check_updates_on_startup: true,
             auto_install_updates: false,
+            defaults_version: CURRENT_DEFAULTS_VERSION,
         }
     }
+}
+
+/// See `AppConfig::defaults_version`.
+const CURRENT_DEFAULTS_VERSION: u32 = 1;
+
+/// Brings a config written by an older version up to date. Returns whether
+/// anything changed (the caller then saves it).
+///
+/// 1: versions up to 0.3.x defaulted `log_level` to debug, and every save
+/// of any setting wrote that default into the file — so a stored "debug"
+/// cannot be told apart from one the user picked. It is moved to info once:
+/// debug logs every path touched (hundreds of MB a day on a busy drive),
+/// and the few who chose it on purpose can pick it again in settings,
+/// where it then sticks.
+fn migrate_defaults(config: &mut AppConfig) -> bool {
+    if config.defaults_version >= CURRENT_DEFAULTS_VERSION {
+        return false;
+    }
+    if config.defaults_version < 1 && config.log_level == LogLevel::Debug {
+        config.log_level = LogLevel::Info;
+    }
+    config.defaults_version = CURRENT_DEFAULTS_VERSION;
+    true
 }
 
 /// Thread-safe configuration manager that persists settings to JSON
@@ -142,8 +171,11 @@ impl ConfigManager {
         let content = fs::read_to_string(path).context("Failed to read config file")?;
 
         // serde's #[serde(default)] handles missing fields automatically
-        let config: AppConfig =
+        let mut config: AppConfig =
             serde_json::from_str(&content).context("Failed to parse config file")?;
+        if migrate_defaults(&mut config) {
+            tracing::info!(target: "config", log_level = config.log_level.as_str(), "Migrated saved defaults");
+        }
 
         tracing::info!(target: "config", path = %path.display(), "Loaded configuration from file");
 
@@ -414,6 +446,46 @@ mod tests {
 
         let config = ConfigManager::load_from_path(&temp_file.path().to_path_buf()).unwrap();
         assert!(!config.auto_start);
+    }
+
+    fn load(json: &str) -> AppConfig {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        writeln!(temp_file, "{json}").unwrap();
+        ConfigManager::load_from_path(&temp_file.path().to_path_buf()).unwrap()
+    }
+
+    /// Debug logging writes every path the user touches, several hundred
+    /// MB a day on a busy drive: it is not a default.
+    #[test]
+    fn a_fresh_install_logs_at_info() {
+        assert_eq!(AppConfig::default().log_level, LogLevel::Info);
+        assert_eq!(load("{}").log_level, LogLevel::Info);
+    }
+
+    /// Versions up to 0.3.x defaulted to debug, and saving any setting wrote
+    /// that default into config.json as if the user had picked it. Such a
+    /// file is moved to info once.
+    #[test]
+    fn a_config_saved_with_the_old_debug_default_moves_to_info_once() {
+        let migrated = load(r#"{"auto_start": false, "log_level": "debug", "log_max_files": 5}"#);
+        assert_eq!(migrated.log_level, LogLevel::Info);
+        assert!(!migrated.auto_start, "the rest of the file is untouched");
+    }
+
+    /// After that one migration, debug is a choice the user made in
+    /// settings, and it sticks.
+    #[test]
+    fn debug_chosen_after_the_migration_is_kept() {
+        let mut config = load(r#"{"log_level": "debug"}"#);
+        config.log_level = LogLevel::Debug;
+        let saved = serde_json::to_string(&config).unwrap();
+        assert_eq!(load(&saved).log_level, LogLevel::Debug);
+    }
+
+    #[test]
+    fn a_level_other_than_the_old_default_is_never_touched() {
+        assert_eq!(load(r#"{"log_level": "trace"}"#).log_level, LogLevel::Trace);
+        assert_eq!(load(r#"{"log_level": "warn"}"#).log_level, LogLevel::Warn);
     }
 
     #[test]
