@@ -20,6 +20,7 @@ pub mod fuse;
 pub mod mount;
 pub mod nfs;
 pub mod nudge;
+mod ratelimit;
 pub mod tree;
 pub mod vfs;
 pub mod writeback;

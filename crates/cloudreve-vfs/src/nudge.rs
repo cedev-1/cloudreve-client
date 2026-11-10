@@ -143,8 +143,8 @@ async fn drain(queue: Arc<Queue>, stop: Arc<AtomicBool>, perform: Perform, debou
                 Ok(Ok(Ok(()))) => {}
                 // The folder is gone (deleted or renamed remotely, mount
                 // being torn down): nothing to refresh.
-                Ok(Ok(Err(err))) => tracing::debug!(%rel, %err, "vfs nudge: folder refresh failed"),
-                Ok(Err(err)) => tracing::warn!(%rel, %err, "vfs nudge: refresh task panicked"),
+                Ok(Ok(Err(err))) => tracing::debug!(%rel, err = %format!("{err:#}"), "vfs nudge: folder refresh failed"),
+                Ok(Err(err)) => tracing::warn!(%rel, err = %format!("{err:#}"), "vfs nudge: refresh task panicked"),
                 Err(_) => {
                     tracing::warn!(%rel, "vfs nudge: folder refresh timed out, skipping the rest of the batch");
                     break;

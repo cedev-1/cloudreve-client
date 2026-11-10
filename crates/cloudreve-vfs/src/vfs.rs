@@ -810,7 +810,7 @@ impl Vfs {
                 if let Err(err) = result {
                     tracing::warn!(
                         path = %path.display(),
-                        %err,
+                        err = %format!("{err:#}"),
                         "vfs: failed to sweep a leftover materialization temp"
                     );
                 }
@@ -1060,7 +1060,7 @@ impl Vfs {
             match fetch_download_url(&self.client, &key).await {
                 Ok(url) => Some(url),
                 Err(err) => {
-                    tracing::warn!(remote_path = %key.remote_path, %err, "vfs: no download url at open, deferring to the first read");
+                    tracing::warn!(remote_path = %key.remote_path, err = %format!("{err:#}"), "vfs: no download url at open, deferring to the first read");
                     None
                 }
             }
@@ -1271,15 +1271,27 @@ impl Vfs {
             .await
             .remove(&h.0)
             .context("close: file handle is not open")?;
-        {
-            let mut drafts = self.drafts.lock().await;
-            if let Some(DraftState::Editing) = drafts.state(&of.key.remote_path) {
-                drafts.set_state(&of.key.remote_path, DraftState::Pending)?;
-                drop(drafts);
-                self.write_queue.arm(of.key.remote_path.clone());
-            }
-        }
+        // First, so no early return below can leave the entry pinned.
         self.cache.lock().await.release(&of.key);
+        // Another handle still open on the file (FUSE: one per open(2))
+        // may still write: arming now would upload and remove the draft
+        // under it, and its next write would start a fresh draft from the
+        // server's copy. The last handle to close arms.
+        let other_open =
+            self.open_files.read().await.values().any(|o| o.key.remote_path == of.key.remote_path);
+        if other_open {
+            return Ok(());
+        }
+        let mut drafts = self.drafts.lock().await;
+        if let Some(DraftState::Editing) = drafts.state(&of.key.remote_path) {
+            // `set_state` flips the state in memory even when persisting it
+            // fails (disk full): arm regardless, or the draft would sit
+            // `Editing` with no handle left to ever queue it.
+            let persisted = drafts.set_state(&of.key.remote_path, DraftState::Pending);
+            drop(drafts);
+            self.write_queue.arm(of.key.remote_path.clone());
+            persisted.with_context(|| format!("close: failed to persist the queued state of {}", of.key.remote_path))?;
+        }
         Ok(())
     }
 
@@ -2231,6 +2243,7 @@ impl Vfs {
             let path_lock = self.draft_begin_lock_for(&of.key.remote_path);
             let _guard = path_lock.lock().await;
             if !self.has_draft(&of).await {
+                self.refuse_if_draft_outlived(&of)?;
                 if size == 0 {
                     self.drafts.lock().await.begin(&of.key.remote_path, &of.key.etag, DraftInit::Empty)?;
                     return Ok(()); // an `Empty` draft already IS size 0.
@@ -2394,7 +2407,19 @@ impl Vfs {
         if self.has_draft(of).await {
             return Ok(());
         }
+        self.refuse_if_draft_outlived(of)?;
         self.materialize(of).await
+    }
+
+    /// A handle opened on a draft (or by `create`) whose draft is gone —
+    /// uploaded and removed meanwhile — has no honest base left to write
+    /// on: a new draft would start from the server copy (or empty, for a
+    /// file `create` made) and overwrite it. Same answer as `read`'s.
+    fn refuse_if_draft_outlived(&self, of: &OpenFile) -> Result<()> {
+        if of.opened_on_draft {
+            return Err(anyhow::Error::new(StaleHandleError { remote_path: of.key.remote_path.clone() }));
+        }
+        Ok(())
     }
 
     /// Local-only files with a handle open: never forgotten to make room
@@ -2610,7 +2635,7 @@ impl Vfs {
         let remote_path = of.key.remote_path.clone();
         tokio::spawn(async move {
             if let Err(err) = readahead_fill(&client, &http, &cache, &of, start, end).await {
-                tracing::warn!(remote_path = %remote_path, %err, "vfs: readahead fetch failed");
+                tracing::warn!(remote_path = %remote_path, err = %format!("{err:#}"), "vfs: readahead fetch failed");
             }
             readahead_inflight.lock().unwrap().remove(&remote_path);
         });
@@ -2747,7 +2772,7 @@ async fn fetch_range_with_backoff(
                     return Err(err);
                 }
                 let backoff = FETCH_RETRY_BACKOFF[(attempt - 1) as usize];
-                tracing::warn!(%err, attempt, ?backoff, "vfs: ranged GET failed, retrying");
+                tracing::warn!(err = %format!("{err:#}"), attempt, ?backoff, "vfs: ranged GET failed, retrying");
                 tokio::time::sleep(backoff).await;
             }
         }
@@ -2755,32 +2780,65 @@ async fn fetch_range_with_backoff(
 }
 
 async fn fetch_range(http: &reqwest::Client, url: &str, start: u64, end: u64) -> Result<FetchOutcome> {
+    // The url's query is a signature granting access to the file: errors
+    // (logged at WARN) carry only its host and path, and reqwest's own
+    // errors are stripped of it.
+    let shown = redact_url(url);
     let resp = http
         .get(url)
         .header("Range", format!("bytes={start}-{end}"))
         .send()
         .await
-        .with_context(|| format!("range GET failed for {url}"))?;
+        .map_err(reqwest::Error::without_url)
+        .with_context(|| format!("range GET failed for {shown}"))?;
     match resp.status().as_u16() {
         206 => {
-            let bytes = resp.bytes().await.context("failed to read range response body")?;
+            let bytes = resp
+                .bytes()
+                .await
+                .map_err(reqwest::Error::without_url)
+                .context("failed to read range response body")?;
             Ok(FetchOutcome::Data(bytes))
         }
         // The server (or a proxy/CDN in front of it) ignored `Range` and
         // sent the whole file, which starts at offset 0, not at `start`:
         // cut the asked-for slice out, or the cache would store the
-        // file's head under the blocks of `start`.
+        // file's head under the blocks of `start`. Streamed, and dropped
+        // once past `end`: buffering the whole body held a multi-GB file
+        // in memory for one 1 MiB block.
         200 => {
-            let bytes = resp.bytes().await.context("failed to read range response body")?;
-            let len = bytes.len() as u64;
-            let from = start.min(len) as usize;
-            let to = end.saturating_add(1).min(len) as usize;
-            Ok(FetchOutcome::Data(bytes.slice(from..to)))
+            let mut resp = resp;
+            let mut out = BytesMut::new();
+            let mut pos = 0u64;
+            while pos <= end {
+                let Some(chunk) = resp
+                    .chunk()
+                    .await
+                    .map_err(reqwest::Error::without_url)
+                    .context("failed to read range response body")?
+                else {
+                    break;
+                };
+                let chunk_end = pos + chunk.len() as u64;
+                if chunk_end > start {
+                    let from = start.saturating_sub(pos) as usize;
+                    let to = (end + 1).min(chunk_end).saturating_sub(pos) as usize;
+                    out.extend_from_slice(&chunk[from..to]);
+                }
+                pos = chunk_end;
+            }
+            Ok(FetchOutcome::Data(out.freeze()))
         }
         416 => Ok(FetchOutcome::RangeNotSatisfiable),
         403 => Ok(FetchOutcome::Forbidden),
-        status => bail!("unexpected status {status} fetching bytes {start}-{end} from {url}"),
+        status => bail!("unexpected status {status} fetching bytes {start}-{end} from {shown}"),
     }
+}
+
+/// `url` without its query and fragment (the signature of a signed
+/// download url) — what logs and errors may show.
+fn redact_url(url: &str) -> &str {
+    url.split(['?', '#']).next().unwrap_or(url)
 }
 
 /// Resolves a fresh signed download URL exactly the way

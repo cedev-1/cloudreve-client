@@ -215,3 +215,26 @@ async fn a_server_that_ignores_range_still_serves_the_right_bytes() {
     assert_eq!(head.as_ref(), &body[..1000]);
     vfs.close(h).await.unwrap();
 }
+
+/// A download URL is a signed credential (its query string grants access to
+/// the file). A failed read logs its error at WARN — the log must name the
+/// host and path, never the signature.
+#[tokio::test]
+async fn a_download_error_does_not_carry_the_signed_url_query() {
+    let env = VfsTestEnv::new().await;
+    let body = vec![3u8; 4096];
+    env.set_remote_files(vec![remote_file("dead.bin", body.len() as i64, "e1")]).await;
+    env.serve_file_content("dead.bin", &body).await;
+    env.fail_downloads_n_times("dead.bin", 1000, 500).await;
+
+    let (vfs, _rx) = Vfs::new(env.client(), common::REMOTE_BASE.into(), env.cache_dir(),
+                       DEFAULT_CACHE_MAX_BYTES).unwrap();
+    let node = vfs.tree().lookup(vfs.tree().root(), "dead.bin").await.unwrap().unwrap().0;
+    let h = vfs.open(node).await.unwrap();
+
+    let err = vfs.read(h, 0, 4096).await.expect_err("the download keeps failing");
+    let text = format!("{err:#} {err:?}");
+    assert!(text.contains("/vfs-download/dead.bin"), "the error should still name the file: {text}");
+    // The mock signs its urls `?v=<n>` (see `common`).
+    assert!(!text.contains("?v="), "the signed query leaked into the error: {text}");
+}

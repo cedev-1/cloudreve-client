@@ -480,7 +480,7 @@ impl Filesystem for VfsFuse {
                 None => self.block_on(async {
                     let handle = vfs.open(NodeId(ino)).await?;
                     let result = vfs.truncate(handle, size).await;
-                    let _ = vfs.close(handle).await;
+                    crate::frontend_util::close_logged(&vfs, handle).await;
                     result
                 }),
             };

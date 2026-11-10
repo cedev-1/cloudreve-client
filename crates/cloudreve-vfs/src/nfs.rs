@@ -354,7 +354,7 @@ async fn read_once(vfs: Arc<Vfs>, node: NodeId, offset: u64, count: u32) -> Read
     // this open() took. `close`'s own error (handle already gone) would
     // only ever fire if something else raced this exact handle id, which
     // nothing can — it is local to this call.
-    let _ = vfs.close(handle).await;
+    crate::frontend_util::close_logged(&vfs, handle).await;
     let data = result.map_err(|e| to_errno(&e))?;
     let eof = offset.saturating_add(data.len() as u64) >= attr.size;
     Ok((data.to_vec(), eof))
@@ -519,7 +519,7 @@ impl NfsFileSystem for VfsNfs {
         if let Nfs3Option::Some(size) = setattr.size {
             let handle = self.vfs.open(node).await.map_err(|e| to_errno(&e))?;
             let result = self.vfs.truncate(handle, size).await;
-            let _ = self.vfs.close(handle).await;
+            crate::frontend_util::close_logged(&self.vfs, handle).await;
             result.map_err(|e| to_errno(&e))?;
         }
         let attr = self
@@ -545,7 +545,7 @@ impl NfsFileSystem for VfsNfs {
         let node = NodeId(id.as_u64());
         let handle = self.vfs.open(node).await.map_err(|e| to_errno(&e))?;
         let result = self.vfs.write(handle, offset, data).await;
-        let _ = self.vfs.close(handle).await;
+        crate::frontend_util::close_logged(&self.vfs, handle).await;
         result.map_err(|e| to_errno(&e))?;
         let attr = self
             .vfs
@@ -574,7 +574,7 @@ impl NfsFileSystem for VfsNfs {
         // `setattr`'s doc: the facade has nowhere to persist it, and D7
         // fixes every entry's reported mode regardless.
         let (node, handle) = self.vfs.create(parent, &name).await.map_err(|e| to_errno(&e))?;
-        let _ = self.vfs.close(handle).await;
+        crate::frontend_util::close_logged(&self.vfs, handle).await;
         let attr = self
             .vfs
             .getattr(node)
@@ -601,7 +601,7 @@ impl NfsFileSystem for VfsNfs {
             return Err(nfsstat3::NFS3ERR_EXIST);
         }
         let (node, handle) = self.vfs.create(parent, &name).await.map_err(|e| to_errno(&e))?;
-        let _ = self.vfs.close(handle).await;
+        crate::frontend_util::close_logged(&self.vfs, handle).await;
         Ok(FileHandleU64::new(node.0))
     }
 

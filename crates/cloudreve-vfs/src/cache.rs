@@ -179,7 +179,7 @@ impl BlockCache {
             let meta: MetaFile = match serde_json::from_slice(&raw) {
                 Ok(meta) => meta,
                 Err(err) => {
-                    tracing::warn!(hash = %hash, %err, "cache: dropping unreadable meta.json");
+                    tracing::warn!(hash = %hash, err = %format!("{err:#}"), "cache: dropping unreadable meta.json");
                     // Same reasoning as the missing-meta.json case above: a
                     // meta.json that fails to parse (torn by a crash, or
                     // otherwise corrupt) leaves its data unusable, so the
@@ -550,7 +550,7 @@ fn hash_key(remote_path: &str, etag: &str) -> String {
 /// being treated as not part of the cache either way.
 fn delete_orphaned_entry_dir(hash: &str, dir: &Path) {
     if let Err(err) = fs::remove_dir_all(dir) {
-        tracing::warn!(hash = %hash, %err, "cache: failed to delete an orphaned entry directory");
+        tracing::warn!(hash = %hash, err = %format!("{err:#}"), "cache: failed to delete an orphaned entry directory");
     }
 }
 

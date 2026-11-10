@@ -252,7 +252,7 @@ impl VfsTree {
                 // on every lookup.
                 let mut inner = self.inner.write().await;
                 if inner.children.contains_key(&dir) {
-                    tracing::warn!(remote_path, %err, "vfs: listing failed, serving the last known content");
+                    tracing::warn!(remote_path, err = %format!("{err:#}"), "vfs: listing failed, serving the last known content");
                     inner.listed_at.insert(dir, Instant::now());
                     return Ok(());
                 }

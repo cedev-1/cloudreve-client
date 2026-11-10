@@ -1209,7 +1209,12 @@ async fn a_handle_kept_open_across_its_upload_fails_loudly() {
     let during = vfs.read(h2, 100, 10).await.unwrap();
     assert_eq!(during.as_ref(), b"PATCHED!!!", "a drafted handle reads the draft");
 
-    vfs.close(h1).await.unwrap(); // arms; the upload runs and removes the draft.
+    // h2 still open: this close does not arm (`two_handles.rs`). The draft
+    // is uploaded and removed under h2 anyway by a retry sweep (reconnect,
+    // parked retry), which queues `Pending` drafts whatever is open.
+    vfs.close(h1).await.unwrap();
+    vfs.set_draft_state_for_tests(&uri_of("held.bin"), DraftState::Pending).await.unwrap();
+    vfs.retry_pending_uploads().await;
     vfs.wait_for_writeback_idle().await;
 
     // The draft is gone and h2's frozen view cannot be served honestly any

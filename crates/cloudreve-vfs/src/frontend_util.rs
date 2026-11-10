@@ -111,8 +111,27 @@ pub fn classify_error(err: &anyhow::Error) -> FrontendErrno {
     if disk_full {
         return FrontendErrno::NoSpace;
     }
-    tracing::debug!(chain = ?err, "vfs frontend: unmapped error, reporting a generic i/o failure");
+    // An app gets a bare EIO: the cause must be in the log. Once a minute
+    // per distinct message (it carries the path), not per RPC.
+    let message = format!("{err:#}");
+    if unmapped_log_limiter().allow(&message, std::time::Duration::from_secs(60)) {
+        tracing::warn!(error = %message, "vfs frontend: an operation failed, the app gets an i/o error");
+    }
     FrontendErrno::Io
+}
+
+fn unmapped_log_limiter() -> &'static crate::ratelimit::RateLimiter {
+    static LIMITER: std::sync::OnceLock<crate::ratelimit::RateLimiter> = std::sync::OnceLock::new();
+    LIMITER.get_or_init(Default::default)
+}
+
+/// Closes a handle a frontend opened for one call. A failure (persisting
+/// the queued state on a full disk — the upload is armed anyway) is
+/// logged, never surfaced: the call it served already has its answer.
+pub async fn close_logged(vfs: &crate::vfs::Vfs, handle: crate::vfs::FileHandle) {
+    if let Err(err) = vfs.close(handle).await {
+        tracing::warn!(drive = %vfs.drive_label(), error = %format!("{err:#}"), "vfs: closing a handle failed");
+    }
 }
 
 /// D7: unix permission bits for a node — files are `0o600`, directories

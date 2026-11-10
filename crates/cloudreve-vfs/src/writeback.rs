@@ -147,7 +147,7 @@ impl DraftStore {
             let mut meta: DraftMeta = match serde_json::from_slice(&raw) {
                 Ok(meta) => meta,
                 Err(err) => {
-                    tracing::warn!(hash = %hash, %err, "drafts: dropping unreadable draft.json");
+                    tracing::warn!(hash = %hash, err = %format!("{err:#}"), "drafts: dropping unreadable draft.json");
                     delete_orphaned_dir(&hash, &dir_entry.path());
                     continue;
                 }
@@ -969,7 +969,7 @@ impl WriteBackQueue {
         {
             // Nothing landed (the upload failed before finishing): there
             // was nothing to delete.
-            tracing::debug!(remote_path, %err, "writeback: nothing to undo for a file deleted mid-upload");
+            tracing::debug!(remote_path, err = %format!("{err:#}"), "writeback: nothing to undo for a file deleted mid-upload");
         }
         self.tree.invalidate_path(uploaded_uri).await;
         self.tree.invalidate_path(remote_path).await;
@@ -1115,7 +1115,7 @@ impl WriteBackQueue {
                             }
                             Err(err) => tracing::warn!(
                                 remote_path = %path,
-                                %err,
+                                err = %format!("{err:#}"),
                                 "writeback: failed to demote a stranded Uploading draft"
                             ),
                         }
@@ -1218,7 +1218,7 @@ impl WriteBackQueue {
                 Err(err) => {
                     tracing::warn!(
                         remote_path,
-                        %err,
+                        err = %format!("{err:#}"),
                         "writeback: conflict check failed, uploading in place anyway"
                     );
                 }
@@ -1233,7 +1233,7 @@ impl WriteBackQueue {
         if let Err(err) =
             self.drafts.lock().await.set_state(remote_path, DraftState::Uploading)
         {
-            tracing::warn!(remote_path, %err, "writeback: failed to mark draft Uploading");
+            tracing::warn!(remote_path, err = %format!("{err:#}"), "writeback: failed to mark draft Uploading");
         }
 
         // `snapshot_seq` is captured in the same lock hold as the size the
@@ -1385,7 +1385,7 @@ impl WriteBackQueue {
                     if let Err(err) = self.cache.lock().await.purge(remote_path) {
                         tracing::warn!(
                             remote_path,
-                            %err,
+                            err = %format!("{err:#}"),
                             "writeback: failed to purge stale blocks after upload"
                         );
                     }
@@ -1416,7 +1416,7 @@ impl WriteBackQueue {
                 if let Err(e) =
                     self.drafts.lock().await.set_state(remote_path, DraftState::Pending)
                 {
-                    tracing::warn!(remote_path, %e, "writeback: failed to park draft back to Pending");
+                    tracing::warn!(remote_path, err = %format!("{e:#}"), "writeback: failed to park draft back to Pending");
                 }
                 // `terminal` (phase 4 task 3, R3): `true` only for the ONE
                 // fallback case `upload_plain_with_adoption` itself
@@ -1492,7 +1492,7 @@ impl WriteBackQueue {
                         if let Err(err) = drafts.set_base_etag(remote_path, etag) {
                             tracing::warn!(
                                 remote_path,
-                                %err,
+                                err = %format!("{err:#}"),
                                 "writeback: failed to rebase a mid-flight-written draft"
                             );
                         }
@@ -1501,7 +1501,7 @@ impl WriteBackQueue {
                 if let Err(err) = drafts.set_state(remote_path, DraftState::Pending) {
                     tracing::warn!(
                         remote_path,
-                        %err,
+                        err = %format!("{err:#}"),
                         "writeback: failed to park a mid-flight-written draft"
                     );
                 }
@@ -1653,7 +1653,7 @@ async fn upload_plain_with_adoption(
         }
         Ok(Some(dest_attr)) => {
             if let Err(e) = queue.drafts.lock().await.set_base_etag(remote_path, &dest_attr.etag) {
-                tracing::warn!(remote_path, %e, "writeback: failed to persist the adopted etag");
+                tracing::warn!(remote_path, err = %format!("{e:#}"), "writeback: failed to persist the adopted etag");
             }
             params.overwrite = true;
             params.previous_version = dest_attr.etag;
@@ -1666,7 +1666,7 @@ async fn upload_plain_with_adoption(
         Err(resolve_err) => {
             tracing::warn!(
                 remote_path,
-                %resolve_err,
+                err = %format!("{resolve_err:#}"),
                 "writeback: failed to resolve the 40004 destination for adoption"
             );
             (Some(err), false)
@@ -1815,7 +1815,7 @@ fn move_into(from: &Path, to: &Path) -> Result<()> {
 /// `cache.rs`'s `delete_orphaned_entry_dir`.
 fn delete_orphaned_dir(hash: &str, dir: &Path) {
     if let Err(err) = fs::remove_dir_all(dir) {
-        tracing::warn!(hash = %hash, %err, "drafts: failed to delete an orphaned draft directory");
+        tracing::warn!(hash = %hash, err = %format!("{err:#}"), "drafts: failed to delete an orphaned draft directory");
     }
 }
 

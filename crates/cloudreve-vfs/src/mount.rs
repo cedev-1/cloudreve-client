@@ -204,7 +204,7 @@ fn remove_mount_marker(cache_dir: &Path) {
     let path = mount_marker_path(cache_dir);
     if let Err(err) = std::fs::remove_file(&path) {
         if err.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!(path = %path.display(), %err, "vfs mount: failed to remove the mount marker");
+            tracing::warn!(path = %path.display(), err = %format!("{err:#}"), "vfs mount: failed to remove the mount marker");
         }
     }
 }
