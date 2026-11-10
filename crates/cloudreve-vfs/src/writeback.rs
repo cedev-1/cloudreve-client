@@ -1374,7 +1374,7 @@ impl WriteBackQueue {
                 // intervention (e.g. the directory being renamed away).
                 let _ = self.events.send(crate::vfs::VfsEvent::UploadFailed {
                     remote_path: remote_path.to_string(),
-                    error: err.to_string(),
+                    error: format!("{err:#}"),
                     will_retry: !terminal,
                 });
                 if !terminal {
