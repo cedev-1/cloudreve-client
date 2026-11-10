@@ -2,7 +2,7 @@ use crate::AppStateHandle;
 use chrono::{Duration, Utc};
 use cloudreve_api::api::UserApi;
 use cloudreve_sync::{
-    config::LogLevel, ConfigManager, ConflictResolution, Credentials, DriveConfig, DriveInfo, DriveMode,
+    config::LogLevel, ConfigManager, ConflictResolution, Credentials, DriveConfig, DriveInfo, DriveMode, DriveSummary,
     StatusSummary,
 };
 #[cfg(target_os = "macos")]
@@ -78,12 +78,6 @@ pub async fn is_dir_empty(path: String) -> CommandResult<bool> {
         Ok(mut entries) => Ok(entries.next().is_none()),
         Err(_) => Ok(true),
     }
-}
-
-#[tauri::command]
-pub async fn list_drives(state: State<'_, AppStateHandle>) -> CommandResult<Vec<DriveConfig>> {
-    let app_state = state.get().ok_or_else(|| "App not yet initialized".to_string())?;
-    Ok(app_state.drive_manager.list_drives().await)
 }
 
 #[derive(serde::Deserialize)]
@@ -182,9 +176,10 @@ pub async fn add_drive(
 pub async fn remove_drive(
     state: State<'_, AppStateHandle>,
     drive_id: String,
-) -> CommandResult<Option<DriveConfig>> {
+) -> CommandResult<Option<DriveSummary>> {
     let app_state = state.get().ok_or_else(|| "App not yet initialized".to_string())?;
-    let result = app_state.drive_manager.remove_drive(&drive_id).await.map_err(|e| e.to_string())?;
+    // The removed drive as the UI knows it: never its tokens.
+    let result = app_state.drive_manager.remove_drive(&drive_id).await.map_err(|e| e.to_string())?.as_ref().map(DriveSummary::from);
     app_state.drive_manager.persist().await.map_err(|e| e.to_string())?;
     Ok(result)
 }

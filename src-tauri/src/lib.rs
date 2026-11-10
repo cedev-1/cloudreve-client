@@ -347,7 +347,6 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::is_dir_empty,
-            commands::list_drives,
             commands::add_drive,
             commands::remove_drive,
             commands::get_ignore_patterns,

@@ -436,16 +436,6 @@ impl DriveManager {
         read_guard.get(id).cloned()
     }
 
-    /// List all drives
-    pub async fn list_drives(&self) -> Vec<DriveConfig> {
-        // let read_guard = self.drives.read().await;
-        // read_guard
-        //     .values()
-        //     .map(|mount| mount.get_config())
-        //     .collect()
-        Vec::new()
-    }
-
     /// Update drive configuration
     pub async fn update_drive(&self, _id: &str, _config: DriveConfig) -> Result<()> {
         // let mut write_guard = self.drives.write().await;
@@ -802,7 +792,7 @@ impl DriveManager {
             if mount.is_paused() {
                 paused_drives.push(mount.id.clone());
             }
-            drives.push(config);
+            drives.push(DriveSummary::from(&config));
         }
 
         // Query recent tasks from inventory (filtered by drive_id if provided)
@@ -1403,6 +1393,38 @@ mod tests {
         assert!(!manager.get_drive_sidebar(&drive_id).await.unwrap());
     }
 
+    /// The popup and settings windows are web pages: whatever reaches them
+    /// is one injected script away from leaving the machine. The OAuth
+    /// tokens never need to: the summary they poll carries none.
+    #[tokio::test]
+    async fn the_status_summary_sent_to_the_ui_carries_no_tokens() {
+        let (manager, drive_id, _hook, _tmp) = manager_with_one_on_demand_drive_at("http://127.0.0.1:9").await;
+
+        let json = serde_json::to_string(&manager.get_status_summary(None).await.unwrap()).unwrap();
+
+        assert!(json.contains(&drive_id), "the drive is still listed: {json}");
+        assert!(json.contains("\"sync_path\""), "with what the popup shows: {json}");
+        for secret in ["test-access-token", "test-refresh-token", "credentials"] {
+            assert!(!json.contains(secret), "{secret} reached the UI: {json}");
+        }
+    }
+
+    /// drives.json is where the tokens DO belong: hiding them from the UI
+    /// must not stop them being saved, or every relaunch would log out.
+    #[tokio::test]
+    async fn drives_json_still_saves_the_tokens() {
+        let (manager, drive_id, _hook, _tmp) = manager_with_one_on_demand_drive_at("http://127.0.0.1:9").await;
+        std::fs::create_dir_all(&manager.config_dir).unwrap();
+
+        manager.persist().await.unwrap();
+
+        let saved: super::DriveState =
+            serde_json::from_str(&std::fs::read_to_string(manager.get_config_file()).unwrap()).unwrap();
+        let drive = saved.drives.iter().find(|d| d.id == drive_id).expect("drive saved");
+        assert_eq!(drive.credentials.access_token.as_deref(), Some("test-access-token"));
+        assert_eq!(drive.credentials.refresh_token, "test-refresh-token");
+    }
+
     /// A save that could not be uploaded (server error, offline) must keep
     /// showing as waiting to upload — in the popup and before removing the
     /// drive — for as long as the change is not on the server. Before, the
@@ -1578,7 +1600,7 @@ mod tests {
         let err = manager.add_drive(config).await.expect_err("a non-empty folder cannot be mounted on");
         let message = err.to_string();
         assert!(message.contains("Documents") && message.to_lowercase().contains("empty"), "{message}");
-        assert!(manager.list_drives().await.is_empty(), "a failed add must not leave a drive behind");
+        assert!(manager.get_drive(&drive_id).await.is_none(), "a failed add must not leave a drive behind");
         if let Ok(dir) = crate::drive::vfs_mode::cache_dir_for(&drive_id) {
             let _ = std::fs::remove_dir_all(dir);
         }

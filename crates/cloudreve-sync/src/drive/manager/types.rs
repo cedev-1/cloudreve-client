@@ -9,11 +9,45 @@ pub struct DriveState {
     pub drives: Vec<DriveConfig>,
 }
 
+/// What the UI is told about a drive: a `DriveConfig` without its OAuth
+/// tokens (and the other fields no window shows). The webviews never need
+/// the tokens, and whatever reaches a web page is one injected script away
+/// from leaving the machine. `DriveConfig` itself keeps serializing them:
+/// drives.json must.
+#[derive(Debug, Clone, Serialize)]
+pub struct DriveSummary {
+    pub id: String,
+    pub name: String,
+    pub instance_url: String,
+    pub remote_path: String,
+    pub sync_path: std::path::PathBuf,
+    pub icon_path: Option<String>,
+    pub raw_icon_path: Option<String>,
+    pub user_id: String,
+    pub mode: DriveMode,
+}
+
+impl From<&DriveConfig> for DriveSummary {
+    fn from(c: &DriveConfig) -> Self {
+        Self {
+            id: c.id.clone(),
+            name: c.name.clone(),
+            instance_url: c.instance_url.clone(),
+            remote_path: c.remote_path.clone(),
+            sync_path: c.sync_path.clone(),
+            icon_path: c.icon_path.clone(),
+            raw_icon_path: c.raw_icon_path.clone(),
+            user_id: c.user_id.clone(),
+            mode: c.mode,
+        }
+    }
+}
+
 /// Summary of the current status including drives and recent tasks
 #[derive(Debug, Clone, Serialize)]
 pub struct StatusSummary {
     /// All configured drives (unfiltered)
-    pub drives: Vec<DriveConfig>,
+    pub drives: Vec<DriveSummary>,
     /// Active tasks (pending/running) with optional live progress info
     pub active_tasks: Vec<TaskWithProgress>,
     /// Recently finished tasks (completed/failed/cancelled)
