@@ -1348,6 +1348,30 @@ mod tests {
         assert_eq!(hook.mount_count(), before + 1, "the volume was attached more than once");
     }
 
+    /// The in-process server behind an on-demand mount can die on its own
+    /// (a panic, the OS killing its socket). The folder then answers every
+    /// app with errors: the drive must say so like any mount failure, with
+    /// a Retry that really mounts it again (dropping the dead mount first).
+    #[tokio::test]
+    async fn a_mount_whose_server_died_reports_it_and_retry_mounts_again() {
+        let (manager, drive_id, hook, _tmp) =
+            manager_with_one_on_demand_drive_at("http://127.0.0.1:1").await;
+        let mount = manager.get_drive(&drive_id).await.unwrap();
+        let (mounts, unmounts) = (hook.mount_count(), hook.unmount_count());
+
+        mount.on_vfs_server_stopped("nfs server task panicked");
+
+        let summary = manager.get_status_summary(None).await.unwrap();
+        let reason = summary.mount_errors.get(&drive_id).expect("the drive reports the dead mount");
+        assert!(reason.contains("Retry"), "tells the user what to do: {reason}");
+
+        manager.resume_drive(&drive_id).await.expect("retry");
+        assert_eq!(hook.unmount_count(), unmounts + 1, "the dead mount is dropped first");
+        assert_eq!(hook.mount_count(), mounts + 1, "then the drive is mounted again");
+        let summary = manager.get_status_summary(None).await.unwrap();
+        assert!(summary.mount_errors.is_empty(), "{:?}", summary.mount_errors);
+    }
+
     /// Resuming a drive that is already running changes nothing.
     #[tokio::test]
     async fn resuming_a_drive_that_is_not_paused_does_not_mount_it_again() {

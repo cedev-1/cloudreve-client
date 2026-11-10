@@ -671,6 +671,18 @@ mountErrorPermission:
   ru: "Система не позволила открыть диск в %{folder}. Убедитесь, что эта папка принадлежит вам (или выберите папку внутри домашней папки), и нажмите «Повторить»."
   pl: "System odmówił otwarcia dysku w %{folder}. Upewnij się, że ten folder należy do ciebie (lub wybierz folder w swoim folderze domowym), a następnie kliknij „Ponów”."
   it: "Il sistema ha rifiutato di aprire l'unità in %{folder}. Assicurati che la cartella ti appartenga (o scegli una cartella nella tua cartella personale), poi fai clic su \"Riprova\"."
+mountErrorServerStopped:
+  en-US: "The folder %{folder} stopped responding: the part of Cloudreve that serves it quit unexpectedly. Your unsaved changes are kept. Click Retry to mount it again."
+  zh-CN: "文件夹 %{folder} 已停止响应：为其提供服务的 Cloudreve 组件意外退出。未上传的更改已保留。点击“重试”重新挂载。"
+  zh-TW: "資料夾 %{folder} 已停止回應：為其提供服務的 Cloudreve 元件意外結束。尚未上傳的變更已保留。點選「重試」重新掛載。"
+  ja: "フォルダー %{folder} が応答しなくなりました：これを提供する Cloudreve の部分が予期せず終了しました。未アップロードの変更は保持されています。「再試行」をクリックして再マウントしてください。"
+  de: "Der Ordner %{folder} reagiert nicht mehr: Der Teil von Cloudreve, der ihn bereitstellt, wurde unerwartet beendet. Ihre noch nicht hochgeladenen Änderungen bleiben erhalten. Klicken Sie auf „Erneut versuchen“, um ihn wieder einzubinden."
+  fr: "Le dossier %{folder} ne répond plus : la partie de Cloudreve qui le sert s'est arrêtée de façon inattendue. Vos modifications non envoyées sont conservées. Cliquez sur Réessayer pour le remonter."
+  es: "La carpeta %{folder} dejó de responder: la parte de Cloudreve que la sirve se cerró inesperadamente. Sus cambios no subidos se conservan. Haga clic en Reintentar para montarla de nuevo."
+  ko: "%{folder} 폴더가 응답하지 않습니다: 이를 제공하는 Cloudreve 구성 요소가 예기치 않게 종료되었습니다. 업로드되지 않은 변경 사항은 보존됩니다. 다시 시도를 클릭하여 다시 마운트하세요."
+  ru: "Папка %{folder} перестала отвечать: часть Cloudreve, которая её обслуживает, неожиданно завершилась. Неотправленные изменения сохранены. Нажмите «Повторить», чтобы подключить её снова."
+  pl: "Folder %{folder} przestał odpowiadać: część Cloudreve, która go obsługuje, nieoczekiwanie się zamknęła. Niewysłane zmiany zostały zachowane. Kliknij Ponów, aby zamontować go ponownie."
+  it: "La cartella %{folder} non risponde più: la parte di Cloudreve che la serve si è chiusa in modo imprevisto. Le modifiche non caricate sono conservate. Fai clic su Riprova per montarla di nuovo."
 mountErrorStale:
   en-US: "The folder %{folder} is still held by an earlier Cloudreve session that did not close properly. Close any window or terminal open in that folder, then click Retry. If it keeps happening, restart your computer."
   zh-CN: "文件夹 %{folder} 仍被之前未正常关闭的 Cloudreve 会话占用。请关闭在该文件夹中打开的所有窗口或终端，然后点击“重试”。如果问题仍然存在，请重启电脑。"

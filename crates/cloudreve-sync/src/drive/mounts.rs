@@ -228,7 +228,11 @@ pub struct Mount {
     /// or `None` when it is mounted (or paused on purpose). Set when
     /// mounting fails at launch or on "Retry"; the drive stays listed and
     /// saved instead of vanishing — see `DriveManager::add_drive_inner`.
-    mount_problem: std::sync::Mutex<Option<String>>,
+    mount_problem: Arc<std::sync::Mutex<Option<String>>>,
+    /// On-demand only: the server behind the current mount died on its own
+    /// (`MountedVfs::server_stopped`). "Retry" must then drop that dead
+    /// mount before attaching again.
+    vfs_server_stopped: Arc<std::sync::atomic::AtomicBool>,
     /// On-demand only: held across an attach or a detach, so two of them
     /// never interleave (two resumes racing used to stack two mounts on
     /// one folder).
@@ -349,7 +353,8 @@ impl Mount {
             upload_health: std::sync::Mutex::new(UploadHealth::default()),
             upload_problem: std::sync::Mutex::new(None),
             vfs_mount_test_hook: Mutex::new(None),
-            mount_problem: std::sync::Mutex::new(None),
+            mount_problem: Arc::new(std::sync::Mutex::new(None)),
+            vfs_server_stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             attach_lock: Mutex::new(()),
             vfs_attached: std::sync::atomic::AtomicBool::new(false),
             sidebar_backend: std::sync::RwLock::new(Arc::new(NoSidebar)),
@@ -508,10 +513,7 @@ impl Mount {
 
         let hook = self.vfs_mount_test_hook.lock().await.clone();
         let mounted = vfs_mode::attach(vfs, mountpoint, &name, &cache_dir, cap, hook.as_ref()).await?;
-        *self.mounted_vfs.lock().await = mounted;
-        self.vfs_attached.store(true, std::sync::atomic::Ordering::SeqCst);
-        // A new node behind the folder: its sidebar glyph must be re-attached.
-        self.sidebar_backend().glyph_folder_remounted();
+        self.attached(mounted, mountpoint).await;
 
         Ok(())
     }
@@ -547,11 +549,42 @@ impl Mount {
         let hook = self.vfs_mount_test_hook.lock().await.clone();
         let mounted =
             vfs_mode::attach(vfs, &sync_path, &name, &cache_dir, cap, hook.as_ref()).await?;
-
-        *self.mounted_vfs.lock().await = mounted;
-        self.vfs_attached.store(true, std::sync::atomic::Ordering::SeqCst);
-        self.sidebar_backend().glyph_folder_remounted();
+        self.attached(mounted, &sync_path).await;
         Ok(())
+    }
+
+    /// Records a successful attach: keeps the OS handle, and watches its
+    /// server for a death of its own (`on_vfs_server_stopped`).
+    async fn attached(&self, mounted: Option<MountedVfs>, mountpoint: &Path) {
+        if let Some(m) = &mounted {
+            let mut stopped = m.server_stopped();
+            let (problem, flag) = (self.mount_problem.clone(), self.vfs_server_stopped.clone());
+            let (id, message) = (self.id.clone(), server_stopped_message(mountpoint));
+            tokio::spawn(async move {
+                // `Err`: the mount was torn down on purpose — nothing to say.
+                while stopped.changed().await.is_ok() {
+                    if let Some(reason) = stopped.borrow().clone() {
+                        record_server_stopped(&id, &reason, &message, &problem, &flag);
+                        break;
+                    }
+                }
+            });
+        }
+        *self.mounted_vfs.lock().await = mounted;
+        self.vfs_server_stopped.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.vfs_attached.store(true, std::sync::atomic::Ordering::SeqCst);
+        tracing::info!(target: "drive::mounts", id = %self.id, mountpoint = %mountpoint.display(), "On-demand drive mounted");
+        // A new node behind the folder: its sidebar glyph must be re-attached.
+        self.sidebar_backend().glyph_folder_remounted();
+    }
+
+    /// The server behind this drive's mount died on its own: the folder
+    /// now fails every access. Reported like a mount failure, with a Retry
+    /// (`retry_mount` drops the dead mount first). Called by the watcher
+    /// `attached` spawns.
+    pub(crate) fn on_vfs_server_stopped(&self, reason: &str) {
+        let mountpoint = self.config.try_read().map(|c| c.sync_path.clone()).unwrap_or_default();
+        record_server_stopped(&self.id, reason, &server_stopped_message(&mountpoint), &self.mount_problem, &self.vfs_server_stopped);
     }
 
     /// D5: unmounts the on-demand vfs (pause/shutdown/delete). The `Vfs`
@@ -566,6 +599,8 @@ impl Mount {
         let mounted = self.mounted_vfs.lock().await.take();
         if let Err(err) = vfs_mode::detach(mounted, &mountpoint, hook.as_ref()).await {
             tracing::warn!(target: "drive::mounts", id = %self.id, ?err, "failed to unmount the on-demand vfs");
+        } else {
+            tracing::info!(target: "drive::mounts", id = %self.id, mountpoint = %mountpoint.display(), "On-demand drive unmounted");
         }
         // The bare mountpoint again: another node for the sidebar glyph.
         self.sidebar_backend().glyph_folder_remounted();
@@ -574,6 +609,10 @@ impl Mount {
     /// "Retry" on an on-demand drive that failed to mount: attach it, then
     /// do what `start()` does once a drive is up (the sidebar entry).
     pub async fn retry_mount(&self) -> Result<()> {
+        // A mount whose server died is still attached, but dead: drop it.
+        if self.vfs_server_stopped.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.unmount_on_demand().await;
+        }
         self.remount_on_demand().await?;
         self.apply_sidebar_at_start().await;
         Ok(())
@@ -601,7 +640,12 @@ impl Mount {
     }
 
     pub fn set_mount_problem(&self, message: Option<String>) {
-        *self.mount_problem.lock().unwrap() = message;
+        let previous = std::mem::replace(&mut *self.mount_problem.lock().unwrap(), message.clone());
+        match (previous.is_some(), message.is_some()) {
+            (_, true) => tracing::warn!(target: "drive::mounts", id = %self.id, "Mount problem recorded"),
+            (true, false) => tracing::info!(target: "drive::mounts", id = %self.id, "Mount problem cleared"),
+            (false, false) => {}
+        }
     }
 
     /// Test-only: install a substitute for the real OS mount/unmount calls
@@ -1314,3 +1358,22 @@ impl Mount {
     }
 }
 
+
+/// What the user is told when the server behind an on-demand mount died.
+fn server_stopped_message(mountpoint: &Path) -> String {
+    t!("mountErrorServerStopped", folder = mountpoint.display().to_string()).into_owned()
+}
+
+/// Shared by the server watcher (which has no `Mount` to call into) and
+/// `Mount::on_vfs_server_stopped`.
+fn record_server_stopped(
+    id: &str,
+    reason: &str,
+    message: &str,
+    problem: &std::sync::Mutex<Option<String>>,
+    flag: &std::sync::atomic::AtomicBool,
+) {
+    tracing::error!(target: "drive::mounts", id, reason, "The server behind the on-demand mount stopped; the folder is unusable until Retry");
+    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    *problem.lock().unwrap() = Some(message.to_string());
+}
