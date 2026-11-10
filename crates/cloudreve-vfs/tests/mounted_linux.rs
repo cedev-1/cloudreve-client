@@ -752,3 +752,37 @@ async fn a_remote_change_wakes_an_inotify_watch_on_the_open_folder_within_3s() {
     assert_eq!(listed, vec!["a.txt".to_string(), "b.txt".to_string()], "what the file manager re-reads");
     assert_eq!(env.upload_session_count(), 0, "a refresh must never upload anything");
 }
+
+fn is_fuse_mounted(path: &std::path::Path) -> bool {
+    let canonical = std::fs::canonicalize(path.parent().unwrap()).unwrap().join(path.file_name().unwrap());
+    let wanted = canonical.to_string_lossy().replace(' ', "\\040");
+    std::fs::read_to_string("/proc/mounts")
+        .unwrap()
+        .lines()
+        .any(|l| l.split_whitespace().nth(1) == Some(wanted.as_str()) && l.contains("fuse"))
+}
+
+/// V6: a terminal (or any process) sitting inside the mount makes the
+/// plain unmount fail with EBUSY. `unmount` used to report the failure and
+/// leave the mount attached with its session still serving; it must
+/// detach it lazily instead, so the folder is free again.
+#[tokio::test(flavor = "multi_thread")]
+async fn unmounting_while_a_process_sits_inside_the_mount_detaches_it() {
+    let env = VfsTestEnv::new().await;
+    env.set_remote_files(vec![]).await;
+    let vfs = new_test_vfs(&env).await;
+    let mp = tempfile::tempdir().unwrap();
+    let mountpoint = mp.path().join("drive");
+    std::fs::create_dir(&mountpoint).unwrap();
+    let _guard = MountpointGuard(mountpoint.clone());
+
+    let mounted = mount::mount(vfs.clone(), &mountpoint, "CloudreveTest", env.cache_dir()).await.unwrap();
+    let mut squatter = std::process::Command::new("sleep").arg("30").current_dir(&mountpoint).spawn().unwrap();
+
+    let result = tokio::time::timeout(Duration::from_secs(60), mounted.unmount()).await.expect("unmount hung");
+    let still_mounted = is_fuse_mounted(&mountpoint);
+    let _ = squatter.kill();
+    let _ = squatter.wait();
+    result.expect("a busy mount must be detached lazily, not reported as a failure");
+    assert!(!still_mounted, "the mount is still attached after unmount() returned Ok");
+}
