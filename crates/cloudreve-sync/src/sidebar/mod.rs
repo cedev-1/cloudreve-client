@@ -242,6 +242,8 @@ pub(crate) mod tests {
         /// Every `set_glyph_folders` list, in order.
         pub glyphs: Mutex<Vec<Vec<PathBuf>>>,
         pub remounts: std::sync::atomic::AtomicUsize,
+        /// `set_glyph_folders` takes this long (a PlugInKit call that hangs).
+        pub glyph_delay: Mutex<std::time::Duration>,
     }
 
     impl FakeSidebar {
@@ -295,6 +297,7 @@ pub(crate) mod tests {
             Ok(())
         }
         fn set_glyph_folders(&self, folders: &[PathBuf]) -> Result<()> {
+            std::thread::sleep(*self.glyph_delay.lock().unwrap());
             self.glyphs.lock().unwrap().push(folders.to_vec());
             Ok(())
         }

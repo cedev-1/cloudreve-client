@@ -54,14 +54,25 @@ pub(super) struct FinderSyncGlyph {
     folders_file: Option<PathBuf>,
     /// The file content last published by this process. A fresh process
     /// always publishes once (the app may have moved or been updated).
-    published: Mutex<Option<String>>,
+    published: Mutex<Published>,
+    /// Registers and enables the extension (`enable`; replaced in tests).
+    register: fn(&Path) -> Result<()>,
+}
+
+#[derive(Default)]
+struct Published {
+    content: Option<String>,
+    /// PlugInKit refused the extension once in this process: not retried
+    /// (five attempts a second apart) on every save. The next launch tries
+    /// again.
+    registration_failed: bool,
 }
 
 impl FinderSyncGlyph {
     pub(super) fn for_this_app() -> Self {
         let extension = std::env::current_exe().ok().and_then(|exe| extension_of(&exe));
         let folders_file = dirs::home_dir().map(|home| cloudreve_finder_sync::folders_file(&home));
-        Self { extension, folders_file, published: Mutex::new(None) }
+        Self { extension, folders_file, published: Mutex::new(Published::default()), register: enable }
     }
 
     pub(super) fn publish(&self, folders: &[PathBuf]) -> Result<()> {
@@ -72,17 +83,24 @@ impl FinderSyncGlyph {
         // Held throughout: two saves in a row must not interleave their
         // pluginkit calls.
         let mut published = self.published.lock().unwrap();
-        if published.as_deref() == Some(content.as_str()) {
+        if published.content.as_deref() == Some(content.as_str()) {
             return Ok(());
         }
         write_atomically(file, &content)?;
+        let mut result = Ok(());
         match registration(extension, folders) {
-            Registration::Enable(extension) => enable(&extension)?,
+            Registration::Enable(_) if published.registration_failed => {}
+            Registration::Enable(extension) => {
+                if let Err(err) = (self.register)(&extension) {
+                    published.registration_failed = true;
+                    result = Err(err);
+                }
+            }
             Registration::Disable => disable(),
         }
         reload();
-        *published = Some(content);
-        Ok(())
+        published.content = Some(content);
+        result
     }
 
     pub(super) fn remounted(&self) {
@@ -205,8 +223,42 @@ mod tests {
     fn outside_an_app_bundle_nothing_is_written_or_registered() {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join(".cloudreve/finder-sync/folders.json");
-        let glyph = FinderSyncGlyph { extension: None, folders_file: Some(file.clone()), published: Mutex::new(None) };
+        let glyph = FinderSyncGlyph { extension: None, folders_file: Some(file.clone()), ..FinderSyncGlyph::for_this_app() };
         glyph.publish(&[PathBuf::from("/Users/ana/Cloudreve")]).unwrap();
         assert!(!file.exists());
+    }
+
+    static REGISTER_ATTEMPTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn register_fails(_: &Path) -> Result<()> {
+        REGISTER_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        bail!("PlugInKit did not register the extension")
+    }
+
+    /// PlugInKit refusing the extension (an unsigned copy, a sandbox) is not
+    /// going to change within one run: retrying it — five attempts a second
+    /// apart — on every save of drives.json only stalled each save. The
+    /// folder list is still kept current for when it does work.
+    #[test]
+    fn a_registration_that_failed_is_not_retried_on_every_save() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join(".cloudreve/finder-sync/folders.json");
+        let glyph = FinderSyncGlyph {
+            extension: Some(tmp.path().join("CloudreveFinderSync.appex")),
+            folders_file: Some(file.clone()),
+            register: register_fails,
+            ..FinderSyncGlyph::for_this_app()
+        };
+
+        assert!(glyph.publish(&[PathBuf::from("/Users/ana/Cloudreve")]).is_err(), "the first failure is reported");
+        glyph.publish(&[PathBuf::from("/Users/ana/Cloudreve"), PathBuf::from("/Users/ana/Work")]).unwrap();
+        glyph.publish(&[PathBuf::from("/Users/ana/Work")]).unwrap();
+
+        assert_eq!(REGISTER_ATTEMPTS.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            encode_folders(&[PathBuf::from("/Users/ana/Work")]),
+            "the list itself stays current"
+        );
     }
 }
