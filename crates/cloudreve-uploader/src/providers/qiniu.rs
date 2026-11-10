@@ -62,7 +62,7 @@ where
         target: "uploader::qiniu",
         chunk = chunk.index,
         size = chunk.size,
-        url = %cloudreve_api::redact::redact_url(url),
+        url = %cloudreve_api::redact::redact_url(&url),
         "Uploading chunk to Qiniu (streaming)"
     );
 
