@@ -816,12 +816,7 @@
   resolved "https://registry.yarnpkg.com/@rollup/rollup-win32-x64-msvc/-/rollup-win32-x64-msvc-4.55.1.tgz#f79437939020b83057faf07e98365b1fa51c458b"
   integrity sha512-SPEpaL6DX4rmcXtnhdrQYgzQ5W2uW3SCJch88lB2zImhJRhIIK44fkUrgIV/Q8yUNfw5oyZ5vkeQsZLhCb06lw==
 
-"@tauri-apps/api@2.12.0":
-  version "2.12.0"
-  resolved "https://registry.yarnpkg.com/@tauri-apps/api/-/api-2.12.0.tgz#9048cede2961ac8e255d2c023692a54b31bffd6a"
-  integrity sha512-fUSxFX8VABYe9W9K5ROdEaKVkNUFRcMSRofjruvaxztXA+I0XnQHcYHF8m/a6iExRUxsUf0HsFWhPBuH9IgzJw==
-
-"@tauri-apps/api@^2.12.0":
+"@tauri-apps/api@2.12.4", "@tauri-apps/api@^2.12.0":
   version "2.12.4"
   resolved "https://registry.yarnpkg.com/@tauri-apps/api/-/api-2.12.4.tgz#2bab72b87696ae8dcfb4f4db2119e46a87aeabe0"
   integrity sha512-pVmfis+4zT8H0Qhp3xPZx9Ju7kpzvA6rr/PSJPyuwfvucTQ8sVt61NYU9KMkK703UFlYadFmjKA4HhybOtN0gg==
