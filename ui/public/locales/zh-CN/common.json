@@ -13,6 +13,19 @@
     "finalSetupDescription": "选择一个本地文件夹作为网盘的挂载位置。",
     "localPath": "本地路径",
     "localDriveName": "挂载名称",
+    "modeChoice": {
+      "title": "文件要如何保存在这台电脑上？",
+      "mirror": "全部下载",
+      "mirrorHint": "所有文件都会复制到这台电脑并保持同步。",
+      "mirrorDetails": "无需联网即可打开，但占用的磁盘空间与云盘相同。",
+      "onDemand": "按需文件",
+      "onDemandHint": "文件会立即显示在文件夹中，但在打开之前不占用磁盘空间。",
+      "onDemandDetails": "首次打开文件需要联网；最近打开过的文件仍可使用。",
+      "fixedNote": "此选择之后无法更改。如需切换，请移除该云盘后重新添加。",
+      "macNote": "首次使用时，macOS 可能会询问是否允许 Cloudreve 访问网络宗卷上的文件：请点击“允许”。",
+      "linuxNote": "需要 FUSE（“fuse3”软件包，大多数 Linux 系统已预装）。",
+      "learnMore": "了解更多"
+    },
     "localPathPlaceholder": "/Users/username/CloudDrive",
     "browse": "浏览",
     "selectFolder": "选择文件夹",
@@ -59,7 +72,14 @@
     "conflictKeepRemote": "保留服务器版本",
     "conflictKeepRemoteHint": "将覆盖本地文件",
     "conflictKeepBoth": "两者都保留",
-    "conflictKeepBothHint": "将重命名本地副本"
+    "conflictKeepBothHint": "将重命名本地副本",
+    "pendingUploads": "{{count}} 个文件等待上传",
+    "mountFailed": "“{{name}}”不可用",
+    "uploadProblem": "“{{name}}”上的更改未能上传",
+    "retry": "重试",
+    "pause": "暂停同步",
+    "resume": "恢复同步",
+    "pausedStatus": "同步已暂停"
   },
   "settings": {
     "title": "设置",
@@ -118,7 +138,14 @@
       "active": "活跃",
       "eventPushLost": "实时事件推送丢失",
       "offline": "离线",
-      "credentialExpired": "凭证已过期"
+      "credentialExpired": "凭证已过期",
+      "mountFailed": "不可用"
+    },
+    "driveMode": {
+      "mirror": "全部下载",
+      "onDemand": "按需文件",
+      "mirrorHint": "所有文件都保存在这台电脑上",
+      "onDemandHint": "打开时才下载文件"
     },
     "networkSettings": "网络",
     "heartbeatInterval": "心跳间隔",
@@ -126,11 +153,17 @@
     "driveSettingsTitle": "驱动器设置",
     "maxFileSize": "最大文件大小 (MB)",
     "maxFileSizeDescription": "0 = 无限制。大于此大小的文件将不会被同步。",
+    "showInFinderSidebar": "在 Finder 边栏中显示",
+    "showInFileManagerSidebar": "在文件管理器侧边栏中显示",
+    "showInSidebarDescription": "将此驱动器的文件夹以 Cloudreve 图标添加到侧边栏，一键即可打开。",
     "updateSettings": "更新",
     "checkUpdatesOnStartup": "启动时检查更新",
     "checkUpdatesOnStartupDescription": "应用启动时自动检查新版本",
     "autoInstallUpdates": "自动安装更新",
-    "autoInstallUpdatesDescription": "自动下载并安装更新，无需提示"
+    "autoInstallUpdatesDescription": "自动下载并安装更新，无需提示",
+    "retryMount": "重试",
+    "deleteOnDemandDriveConfirm": "要从这台电脑移除“{{name}}”吗？你的文件仍保留在云端；这台电脑上的文件夹将变为空。",
+    "deleteOnDemandDriveUnsynced": "“{{name}}”中有 {{count}} 个文件的更改尚未上传。如果现在移除该云盘，这些更改将会丢失。仍要移除吗？"
   },
   "about": {
     "homepage": "主页",

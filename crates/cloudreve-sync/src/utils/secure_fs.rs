@@ -58,6 +58,22 @@ pub fn restrict_file<P: AsRef<Path>>(path: P) -> Result<()> {
     Ok(())
 }
 
+/// Creates `path` and any missing parent as owner-only (`0700` on Unix)
+/// directories. Only what this call creates gets that mode: a folder that
+/// already exists — one the user picked — keeps its own permissions.
+pub fn create_private_dir_all<P: AsRef<Path>>(path: P) -> std::io::Result<()> {
+    let path = path.as_ref();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(path)
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;

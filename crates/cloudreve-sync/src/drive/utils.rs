@@ -19,11 +19,65 @@ pub fn is_partial_download(path: &Path) -> bool {
         .is_some_and(|n| n.starts_with(PARTIAL_DOWNLOAD_PREFIX))
 }
 
+/// Turns a path the server sent, relative to the synced folder ("/a/b.txt"
+/// in an SSE event, the tail of a listed entry's uri), into a relative local
+/// path — or `None` if joining it to the sync folder could land anywhere but
+/// under it.
+///
+/// Every server-supplied path goes through here: a `..` segment (sent as is,
+/// or hidden in a name behind an encoded `/` that decoding turns back into a
+/// separator) would otherwise resolve next to the sync folder, and the
+/// download task would happily write or delete a file there — anywhere in
+/// the user's home directory. `Path::starts_with` is no protection: it
+/// compares components lexically, and `sync/../x` starts with `sync`.
+///
+/// Empty segments (leading, trailing or doubled slashes) are dropped as
+/// harmless. Rejected: `.` and `..`, NUL, and a backslash (a separator on
+/// Windows, where the same server data must mean the same thing). An empty
+/// result (the root itself) is also `None`: it names no file.
+pub fn safe_relative_path(remote_rel: &str) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for segment in remote_rel.split('/').filter(|s| !s.is_empty()) {
+        if segment == "." || segment == ".." || segment.contains('\0') || segment.contains('\\') {
+            return None;
+        }
+        // Belt and braces: whatever the platform, one segment must be
+        // exactly one plain name.
+        let mut components = Path::new(segment).components();
+        if !matches!(
+            (components.next(), components.next()),
+            (Some(std::path::Component::Normal(_)), None)
+        ) {
+            return None;
+        }
+        out.push(segment);
+    }
+    if out.as_os_str().is_empty() { None } else { Some(out) }
+}
+
+/// Whether `path` names something strictly under `root`, with no `..` or
+/// other non-name component after it — the check `safe_relative_path`
+/// guarantees for paths built from server data, re-asserted where a local
+/// file is about to be written or removed.
+pub fn is_inside(root: &Path, path: &Path) -> bool {
+    match path.strip_prefix(root) {
+        Ok(rest) => {
+            !rest.as_os_str().is_empty()
+                && rest.components().all(|c| matches!(c, std::path::Component::Normal(_)))
+        }
+        Err(_) => false,
+    }
+}
+
 pub fn local_path_to_cr_uri(path: PathBuf, root: PathBuf, remote_base: String) -> Result<CrUri> {
     let mut base = CrUri::new(&remote_base)?;
 
     // Strip the root from path to get the relative path
     let relative = path.strip_prefix(&root).context("Path is not under root")?;
+    // `strip_prefix` is lexical: `root/../x` strips to `../x`.
+    if !relative.components().all(|c| matches!(c, std::path::Component::Normal(_))) {
+        anyhow::bail!("Path escapes the sync folder: {}", path.display());
+    }
 
     // Convert to string with forward slashes (for URI compatibility)
     let relative_str = relative
@@ -58,10 +112,10 @@ pub fn remote_path_to_local_relative_path(
         .strip_prefix(&remote_base_str)
         .context("Path is not under remote base")?;
 
-    // 3. make sure OS slash is used
-    let relative_path = relative_path.replace("/", std::path::MAIN_SEPARATOR_STR);
-
-    Ok(PathBuf::from(relative_path))
+    // 3. `path()` is percent-decoded: a single listed name like `..%2Fx`
+    // comes back as `../x`. See `safe_relative_path`.
+    safe_relative_path(relative_path)
+        .with_context(|| format!("Remote path escapes the synced folder: {remote_path_str}"))
 }
 
 /// Generate a URL to view a folder or file online.
@@ -151,6 +205,61 @@ mod tests {
         let base = CrUri::new("cloudreve://my/data").unwrap();
         let remote = CrUri::new("cloudreve://my/other/file").unwrap();
         assert!(remote_path_to_local_relative_path(&remote, &base).is_err());
+    }
+
+    #[test]
+    fn ordinary_server_paths_map_to_nested_local_paths() {
+        assert_eq!(safe_relative_path("/docs/2026/report.txt"), Some(PathBuf::from("docs/2026/report.txt")));
+        assert_eq!(safe_relative_path("photo..jpg"), Some(PathBuf::from("photo..jpg")));
+        assert_eq!(safe_relative_path("/a//b/"), Some(PathBuf::from("a/b")));
+        assert_eq!(safe_relative_path("/.config/app.ini"), Some(PathBuf::from(".config/app.ini")));
+    }
+
+    #[test]
+    fn server_paths_that_climb_out_are_rejected() {
+        for evil in [
+            "/../planted.txt",
+            "../../Library/LaunchAgents/x.plist",
+            "/a/../../b",
+            "/a/..",
+            "/./a",
+            "..",
+            "/a\\..\\..\\b",
+            "/a/b\0c",
+        ] {
+            assert_eq!(safe_relative_path(evil), None, "{evil:?} was accepted");
+        }
+    }
+
+    #[test]
+    fn the_root_itself_names_no_file() {
+        assert_eq!(safe_relative_path("/"), None);
+        assert_eq!(safe_relative_path(""), None);
+    }
+
+    #[test]
+    fn a_listed_name_hiding_a_climb_behind_encoded_slashes_is_rejected() {
+        let base = CrUri::new("cloudreve://my/data").unwrap();
+        let remote = CrUri::new("cloudreve://my/data/..%2F..%2Fplanted.txt").unwrap();
+        assert!(remote_path_to_local_relative_path(&remote, &base).is_err());
+    }
+
+    #[test]
+    fn only_paths_strictly_under_the_root_are_inside() {
+        let root = Path::new("/home/me/sync");
+        assert!(is_inside(root, Path::new("/home/me/sync/a/b.txt")));
+        assert!(!is_inside(root, Path::new("/home/me/sync/../x")));
+        assert!(!is_inside(root, Path::new("/home/me/sync/a/../../x")));
+        assert!(!is_inside(root, Path::new("/home/me/sync")));
+        assert!(!is_inside(root, Path::new("/home/me/syncx/a")));
+        assert!(!is_inside(root, Path::new("/etc/passwd")));
+    }
+
+    #[test]
+    fn a_local_path_climbing_out_has_no_remote_uri() {
+        let root = PathBuf::from("/home/me/sync");
+        let path = PathBuf::from("/home/me/sync/../.ssh/id_rsa");
+        assert!(local_path_to_cr_uri(path, root, "cloudreve://my".to_string()).is_err());
     }
 
     #[test]

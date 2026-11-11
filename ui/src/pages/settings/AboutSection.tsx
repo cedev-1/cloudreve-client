@@ -143,7 +143,7 @@ export default function AboutSection() {
         );
       case "ready":
         return (
-          <Stack direction="row" spacing={1} alignItems="center">
+          <Stack direction="row" spacing={1} sx={{ alignItems: "center" }}>
             <Button size="small" variant="contained" onClick={() => relaunch()}>
               {t("about.restartNow")}
             </Button>
@@ -171,7 +171,7 @@ export default function AboutSection() {
 
   return (
     <Box>
-      <Stack direction="row" alignItems="center" spacing={2} sx={{ mb: 3 }}>
+      <Stack direction="row" spacing={2} sx={{ mb: 3, alignItems: "center" }}>
         <Box
           component="img"
           src={logo}
@@ -179,10 +179,10 @@ export default function AboutSection() {
           sx={{ width: 48, height: 48 }}
         />
         <Box>
-          <Typography variant="h6" fontWeight={500}>
+          <Typography variant="h6" sx={{ fontWeight: 500 }}>
             Cloudreve Desktop
           </Typography>
-          <Stack direction="row" alignItems="center" spacing={1}>
+          <Stack direction="row" spacing={1} sx={{ alignItems: "center" }}>
             <Typography variant="body2" color="text.secondary">
               {version ? `v${version}` : "..."}
             </Typography>
@@ -197,7 +197,7 @@ export default function AboutSection() {
         </Box>
       </Stack>
 
-      <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 2 }}>
+      <Stack direction="row" spacing={1} sx={{ mb: 2, alignItems: "center" }}>
         <Button
           variant="outlined"
           size="small"

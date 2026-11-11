@@ -1,7 +1,9 @@
-import { Alert, Box, Button, CircularProgress, Container, IconButton, InputAdornment, Snackbar, Typography } from "@mui/material";
+import { Alert, Box, Button, CircularProgress, Collapse, Container, IconButton, InputAdornment, Snackbar, ToggleButton, ToggleButtonGroup, Tooltip, Typography } from "@mui/material";
 import CloseIcon from "@mui/icons-material/Close";
+import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { platform } from "@tauri-apps/plugin-os";
 import { invoke } from '@tauri-apps/api/core';
 import confetti from "canvas-confetti";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -21,6 +23,10 @@ import { listen } from '@tauri-apps/api/event';
 import { CALLBACK_PATH, CLIENT_ID, SCOPES } from "../utils/constants";
 
 type PageState = "url_input" | "waiting" | "final_setup" | "setting_up" | "success";
+
+// Must match `DriveMode`'s serde snake_case wire format exactly
+// (crates/cloudreve-sync/src/drive/mounts.rs).
+type DriveModeChoice = "full_mirror" | "on_demand";
 
 interface OAuthCallbackData {
   code: string;
@@ -93,9 +99,16 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
   const [snackbarOpen, setSnackbarOpen] = useState(false);
   const [logo, setLogo] = useState(defaultLogo);
   const [authorizeUrl, setAuthorizeUrl] = useState<string | null>(null);
+  const [modeDetailsOpen, setModeDetailsOpen] = useState(false);
+  const os = platform();
+  const tokensRef = useRef<TokenResponse | null>(null);
+  // The backend's plain-language reason a drive could not be added (shown
+  // on the final step, which the user can retry from).
+  const [finishError, setFinishError] = useState("");
   const [pageState, setPageState] = useState<PageState>(isReauthorize ? "url_input" : "url_input");
   const [localPath, setLocalPath] = useState("");
   const [folderNotEmpty, setFolderNotEmpty] = useState(false);
+  const [driveMode, setDriveMode] = useState<DriveModeChoice>("full_mirror");
   const [driveName, setDriveName] = useState(driveNameQuery ? decodeURIComponent(driveNameQuery) : "");
   const lastFetchedUrl = useRef<string>("");
   const currentIconUrl = useRef<string | undefined>(undefined);
@@ -126,7 +139,7 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
       pkceSessionRef.current.callbackData = callbackData;
 
       // Transition to final setup page
-      callbackData.name && setDriveName(callbackData.name);
+      if (callbackData.name) setDriveName(callbackData.name);
       setPageState("final_setup");
     }).then((fn) => {
       unlisten = fn;
@@ -171,13 +184,14 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
   };
 
   // Reset logo when URL is cleared or becomes invalid
-  useEffect(() => {
-    if (!siteUrl.trim() || !isValidUrl(siteUrl.trim())) {
+  const handleSiteUrlChange = (value: string) => {
+    setSiteUrl(value);
+    if (!value.trim() || !isValidUrl(value.trim())) {
       setLogo(defaultLogo);
       lastFetchedUrl.current = "";
       currentIconUrl.current = undefined;
     }
-  }, [siteUrl]);
+  };
 
   // Shared authorization logic
   const startAuthorization = useCallback(async (urlToAuthorize: string) => {
@@ -276,6 +290,9 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
     setPageState("url_input");
     setLocalPath("");
     setFolderNotEmpty(false);
+    setDriveMode("full_mirror");
+    tokensRef.current = null;
+    setFinishError("");
     pkceSessionRef.current = null;
   };
 
@@ -306,15 +323,20 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
 
   const handleFinish = async (e: React.FormEvent) => {
     e.preventDefault();
+    setFinishError("");
     setPageState("setting_up");
 
+    // The authorization code is single-use: keep the tokens, so a failed
+    // add (e.g. on-demand mode needing FUSE) can be retried from this same
+    // step after fixing the cause, without signing in again.
     let tokens: TokenResponse;
     try {
-      tokens = await exchangeTokens(
+      tokens = tokensRef.current ?? await exchangeTokens(
         pkceSessionRef.current!.siteUrl,
         pkceSessionRef.current!.callbackData!.code,
         pkceSessionRef.current!.codeVerifier
       );
+      tokensRef.current = tokens;
     } catch (error) {
       if (isValidationError(error)) {
         setError(t(`addDrive.errors.${error.type}`, error.params));
@@ -343,15 +365,15 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
           remote_path: pkceSessionRef.current!.callbackData!.path,
           user_id: pkceSessionRef.current!.callbackData!.user_id || "",
           drive_id: isReauthorize ? driveId : undefined,
+          mode: driveMode,
         }
       });
       // Success - switch to success state
       setPageState("success");
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      setError(t("addDrive.errors.addDriveFailed", { message }));
-      setPageState("url_input");
-      setSnackbarOpen(true);
+      setFinishError(message);
+      setPageState("final_setup");
     }
   }
 
@@ -417,11 +439,9 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
                 🎉
               </Typography>
               <Typography
-                sx={{ mt: 2 }}
+                sx={{ mt: 2, fontWeight: 500, textAlign: "center" }}
                 variant="h5"
                 component="h1"
-                fontWeight={500}
-                textAlign="center"
               >
                 {isReauthorize ? t("addDrive.reauthorizeSuccessTitle") : t("addDrive.successTitle")}
               </Typography>
@@ -461,11 +481,9 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
             <>
               <CircularProgress size={48} sx={{ mt: 2 }} />
               <Typography
-                sx={{ mt: 2 }}
+                sx={{ mt: 2, fontWeight: 500, textAlign: "center" }}
                 variant="h6"
                 component="h1"
-                fontWeight={500}
-                textAlign="center"
               >
                 {t("addDrive.settingUp")}
               </Typography>
@@ -474,10 +492,9 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
             // Final setup state - local path input (hidden in reauthorize mode)
             <>
               <Typography
-                sx={{ mt: 2 }}
+                sx={{ mt: 2, fontWeight: 500 }}
                 variant="h5"
                 component="h1"
-                fontWeight={500}
               >
                 {isReauthorize ? t("addDrive.reauthorizeTitle") : t("addDrive.finalSetupTitle")}
               </Typography>
@@ -485,7 +502,7 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
               <Typography
                 variant="body2"
                 color="text.secondary"
-                textAlign="center"
+                sx={{ textAlign: "center" }}
               >
                 {isReauthorize ? t("addDrive.reauthorizeDescription") : t("addDrive.finalSetupDescription")}
               </Typography>
@@ -514,6 +531,76 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
 
                 {!isReauthorize && (
                   <>
+                    <Box sx={{ width: "100%" }}>
+                      <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+                        {t("addDrive.modeChoice.title")}
+                      </Typography>
+                      <ToggleButtonGroup
+                        value={driveMode}
+                        exclusive
+                        fullWidth
+                        size="small"
+                        onChange={(_, value: DriveModeChoice | null) => value && setDriveMode(value)}
+                      >
+                        <ToggleButton value="full_mirror">
+                          {t("addDrive.modeChoice.mirror")}
+                        </ToggleButton>
+                        <ToggleButton value="on_demand">
+                          {t("addDrive.modeChoice.onDemand")}
+                        </ToggleButton>
+                      </ToggleButtonGroup>
+                      <Box sx={{ mt: 0.75, display: "flex", alignItems: "flex-start", gap: 0.5 }}>
+                        <Typography variant="caption" color="text.secondary" sx={{ flex: 1 }}>
+                          {driveMode === "on_demand"
+                            ? t("addDrive.modeChoice.onDemandHint")
+                            : t("addDrive.modeChoice.mirrorHint")}
+                        </Typography>
+                        <Tooltip title={t("addDrive.modeChoice.learnMore")}>
+                          <IconButton
+                            size="small"
+                            aria-label={t("addDrive.modeChoice.learnMore")}
+                            aria-expanded={modeDetailsOpen}
+                            onClick={() => setModeDetailsOpen((open) => !open)}
+                            sx={{ p: 0.25, mt: -0.25 }}
+                          >
+                            <InfoOutlinedIcon
+                              fontSize="small"
+                              color={modeDetailsOpen ? "primary" : "action"}
+                            />
+                          </IconButton>
+                        </Tooltip>
+                      </Box>
+                      <Collapse in={modeDetailsOpen}>
+                        <Typography
+                          variant="caption"
+                          color="text.secondary"
+                          sx={{ mt: 0.5, display: "block" }}
+                        >
+                          {driveMode === "on_demand"
+                            ? t("addDrive.modeChoice.onDemandDetails")
+                            : t("addDrive.modeChoice.mirrorDetails")}
+                        </Typography>
+                        {driveMode === "on_demand" && (os === "macos" || os === "linux") && (
+                          <Typography
+                            variant="caption"
+                            color="text.secondary"
+                            sx={{ mt: 0.5, display: "block" }}
+                          >
+                            {os === "macos"
+                              ? t("addDrive.modeChoice.macNote")
+                              : t("addDrive.modeChoice.linuxNote")}
+                          </Typography>
+                        )}
+                        <Typography
+                          variant="caption"
+                          color="text.secondary"
+                          sx={{ mt: 0.5, display: "block", fontStyle: "italic" }}
+                        >
+                          {t("addDrive.modeChoice.fixedNote")}
+                        </Typography>
+                      </Collapse>
+                    </Box>
+
                     <FilledTextField
                       fullWidth
                       autoComplete="off"
@@ -550,6 +637,12 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
                   </>
                 )}
 
+                {finishError && (
+                  <Alert severity="error" sx={{ width: "100%" }}>
+                    {finishError}
+                  </Alert>
+                )}
+
                 <Button
                   type="submit"
                   variant="contained"
@@ -574,10 +667,9 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
             // Waiting for sign-in state
             <>
               <Typography
-                sx={{ mt: 2 }}
+                sx={{ mt: 2, fontWeight: 500 }}
                 variant="h5"
                 component="h1"
-                fontWeight={500}
               >
                 {t("addDrive.waitingTitle")}
               </Typography>
@@ -585,7 +677,7 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
               <Typography
                 variant="body2"
                 color="text.secondary"
-                textAlign="center"
+                sx={{ textAlign: "center" }}
               >
                 {t("addDrive.waitingDescription")}
               </Typography>
@@ -622,10 +714,9 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
             // Initial URL input state
             <>
               <Typography
-                sx={{ mt: 2 }}
+                sx={{ mt: 2, fontWeight: 500 }}
                 variant="h5"
                 component="h1"
-                fontWeight={500}
               >
                 {t("addDrive.title")}
               </Typography>
@@ -633,7 +724,7 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
               <Typography
                 variant="body2"
                 color="text.secondary"
-                textAlign="center"
+                sx={{ textAlign: "center" }}
               >
                 {t("addDrive.description")}
               </Typography>
@@ -660,7 +751,7 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
                   label={t("addDrive.siteUrl")}
                   placeholder={t("addDrive.siteUrlPlaceholder")}
                   value={siteUrl}
-                  onChange={(e) => setSiteUrl(e.target.value)}
+                  onChange={(e) => handleSiteUrlChange(e.target.value)}
                   onBlur={handleUrlBlur}
                   variant="filled"
                   type="url"

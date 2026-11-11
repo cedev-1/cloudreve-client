@@ -19,7 +19,9 @@ mod event_handler;
 #[macro_use]
 extern crate rust_i18n;
 
-i18n!("../locales");
+// English for any locale without a translation (en-GB, pt-BR, ...),
+// instead of showing raw message keys.
+i18n!("../locales", fallback = "en-US");
 
 fn init_i18n() {
     use rust_i18n::set_locale;
@@ -50,6 +52,11 @@ static APP_STATE: OnceCell<AppState> = OnceCell::const_new();
 async fn init_sync_service(app: AppHandle) -> anyhow::Result<()> {
     let log_guard = cloudreve_sync::logging::init_logging(LogConfig::from_config_manager())
         .context("Failed to initialize logging system")?;
+
+    // No explicit `log` -> `tracing` bridge here: `init_logging` installs
+    // one (tracing-subscriber's default `tracing-log` feature), which is
+    // how `fuser`, logging through the `log` facade, reaches the log file.
+    // A second `LogTracer::init()` only ever failed.
 
     tracing::info!(target: "main", "Starting Cloudreve Sync Service...");
 
@@ -203,7 +210,7 @@ async fn shutdown() {
         state.event_broadcaster.connection_status_changed(false);
         state.drive_manager.shutdown().await;
         if let Err(e) = state.drive_manager.persist().await {
-            tracing::error!(target: "main", error = %e, "Failed to persist drive configurations");
+            tracing::error!(target: "main", error = %format_args!("{e:#}"), "Failed to persist drive configurations");
         }
     }
     tracing::info!(target: "main", "Shutdown complete");
@@ -274,13 +281,13 @@ pub fn run() {
             let _ = app.handle().plugin(tauri_plugin_positioner::init());
 
             if let Err(e) = setup_tray(app) {
-                tracing::error!(target: "main", error = %e, "Failed to setup tray (continuing)");
+                tracing::error!(target: "main", error = %format_args!("{e:#}"), "Failed to setup tray (continuing)");
             }
 
             #[cfg(desktop)]
             {
                 if let Err(e) = app.deep_link().register("cloudreve") {
-                    tracing::warn!(target: "main", error = %e, "Failed to register deep link scheme via plugin, trying lsregister");
+                    tracing::warn!(target: "main", error = %format_args!("{e:#}"), "Failed to register deep link scheme via plugin, trying lsregister");
                     // On macOS in dev mode, try registering via lsregister directly
                     #[cfg(target_os = "macos")]
                     if let Ok(exe) = std::env::current_exe() {
@@ -296,7 +303,8 @@ pub fn run() {
                 let handle = app.handle().clone();
                 app.deep_link().on_open_url(move |event| {
                     for url in event.urls() {
-                        tracing::info!(target: "main", url = %url, "Deep link received");
+                        // The query carries the OAuth code, state and user id: never log it.
+                        tracing::info!(target: "main", url = %cloudreve_api::redact::redact_url(url.as_str()), "Deep link received");
                         let _ = handle.emit("deeplink", url.to_string());
                         show_add_drive_window_impl(&handle);
                     }
@@ -319,7 +327,7 @@ pub fn run() {
                         .body(&body)
                         .show()
                     {
-                        tracing::warn!(target: "toast", error = %e, "Failed to send OS notification");
+                        tracing::warn!(target: "toast", error = %format_args!("{e:#}"), "Failed to send OS notification");
                     }
                 }
             });
@@ -327,7 +335,7 @@ pub fn run() {
             let app_handle = app.handle().clone();
             spawn(async move {
                 if let Err(e) = init_sync_service(app_handle).await {
-                    tracing::error!(target: "main", error = %e, "Failed to initialize sync service");
+                    tracing::error!(target: "main", error = %format_args!("{e:#}"), "Failed to initialize sync service");
                 }
             });
 
@@ -339,7 +347,6 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::is_dir_empty,
-            commands::list_drives,
             commands::add_drive,
             commands::remove_drive,
             commands::get_ignore_patterns,
@@ -347,6 +354,8 @@ pub fn run() {
             commands::set_ignore_patterns,
             commands::get_drive_max_file_size,
             commands::set_drive_max_file_size,
+            commands::get_drive_sidebar,
+            commands::set_drive_sidebar,
             commands::get_sync_status,
             commands::get_status_summary,
             commands::resolve_conflict,

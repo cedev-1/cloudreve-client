@@ -13,6 +13,19 @@
     "finalSetupDescription": "클라우드 드라이브가 마운트될 로컬 폴더를 선택하세요.",
     "localPath": "로컬 경로",
     "localDriveName": "마운트 이름",
+    "modeChoice": {
+      "title": "이 컴퓨터에 파일을 어떻게 보관할까요?",
+      "mirror": "모두 다운로드",
+      "mirrorHint": "모든 파일을 이 컴퓨터에 복사하고 동기화합니다.",
+      "mirrorDetails": "인터넷 없이 열 수 있지만 클라우드만큼 디스크 공간을 사용합니다.",
+      "onDemand": "온디맨드 파일",
+      "onDemandHint": "파일이 폴더에 바로 표시되지만 열기 전까지 디스크 공간을 사용하지 않습니다.",
+      "onDemandDetails": "파일을 처음 열 때는 인터넷 연결이 필요하며, 최근에 연 파일은 계속 사용할 수 있습니다.",
+      "fixedNote": "이 선택은 나중에 바꿀 수 없습니다. 바꾸려면 드라이브를 제거한 뒤 다시 추가하세요.",
+      "macNote": "처음에 macOS가 Cloudreve의 네트워크 볼륨 파일 접근을 허용할지 물을 수 있습니다. \"허용\"을 클릭하세요.",
+      "linuxNote": "FUSE(대부분의 Linux에 이미 설치된 \"fuse3\" 패키지)가 필요합니다.",
+      "learnMore": "자세히"
+    },
     "localPathPlaceholder": "/Users/username/CloudDrive",
     "browse": "찾아보기",
     "selectFolder": "폴더 선택",
@@ -59,7 +72,14 @@
     "conflictKeepRemote": "서버 버전 유지",
     "conflictKeepRemoteHint": "로컬 파일을 덮어씁니다",
     "conflictKeepBoth": "둘 다 유지",
-    "conflictKeepBothHint": "로컬 사본의 이름을 변경합니다"
+    "conflictKeepBothHint": "로컬 사본의 이름을 변경합니다",
+    "pendingUploads": "파일 {{count}}개 업로드 대기 중",
+    "mountFailed": "\"{{name}}\"을(를) 사용할 수 없습니다",
+    "uploadProblem": "\"{{name}}\"의 변경 사항이 업로드되지 않습니다",
+    "retry": "다시 시도",
+    "pause": "동기화 일시 중지",
+    "resume": "동기화 재개",
+    "pausedStatus": "동기화가 일시 중지됨"
   },
   "settings": {
     "title": "설정",
@@ -118,7 +138,14 @@
       "active": "활성",
       "eventPushLost": "실시간 이벤트 푸시 연결 끊김",
       "offline": "오프라인",
-      "credentialExpired": "자격 증명 만료됨"
+      "credentialExpired": "자격 증명 만료됨",
+      "mountFailed": "사용할 수 없음"
+    },
+    "driveMode": {
+      "mirror": "모두 다운로드",
+      "onDemand": "온디맨드 파일",
+      "mirrorHint": "모든 파일이 이 컴퓨터에 저장됨",
+      "onDemandHint": "파일을 열 때 다운로드"
     },
     "networkSettings": "네트워크",
     "heartbeatInterval": "하트비트 간격",
@@ -126,11 +153,17 @@
     "driveSettingsTitle": "드라이브 설정",
     "maxFileSize": "최대 파일 크기 (MB)",
     "maxFileSizeDescription": "0 = 무제한. 이 크기보다 큰 파일은 동기화되지 않습니다.",
+    "showInFinderSidebar": "Finder 사이드바에 표시",
+    "showInFileManagerSidebar": "파일 관리자 사이드바에 표시",
+    "showInSidebarDescription": "이 드라이브의 폴더를 Cloudreve 아이콘과 함께 사이드바에 추가하여 한 번의 클릭으로 열 수 있게 합니다.",
     "updateSettings": "업데이트",
     "checkUpdatesOnStartup": "시작 시 업데이트 확인",
     "checkUpdatesOnStartupDescription": "앱이 시작될 때 새 버전을 자동으로 확인합니다",
     "autoInstallUpdates": "업데이트 자동 설치",
-    "autoInstallUpdatesDescription": "자동으로 업데이트를 다운로드하고 설치합니다"
+    "autoInstallUpdatesDescription": "자동으로 업데이트를 다운로드하고 설치합니다",
+    "retryMount": "다시 시도",
+    "deleteOnDemandDriveConfirm": "이 컴퓨터에서 \"{{name}}\"을(를) 제거할까요? 파일은 클라우드에 남고, 이 컴퓨터의 폴더는 비게 됩니다.",
+    "deleteOnDemandDriveUnsynced": "\"{{name}}\"에 아직 업로드되지 않은 변경 사항이 있는 파일이 {{count}}개 있습니다. 지금 드라이브를 제거하면 이 변경 사항은 사라집니다. 그래도 제거할까요?"
   },
   "about": {
     "homepage": "홈페이지",

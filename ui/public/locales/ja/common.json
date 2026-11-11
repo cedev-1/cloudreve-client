@@ -13,6 +13,19 @@
     "finalSetupDescription": "クラウドドライブをマウントするローカルフォルダを選択してください。",
     "localPath": "ローカルパス",
     "localDriveName": "マウント名",
+    "modeChoice": {
+      "title": "このコンピューターでファイルをどのように保持しますか？",
+      "mirror": "すべてダウンロード",
+      "mirrorHint": "すべてのファイルをこのコンピューターにコピーして同期します。",
+      "mirrorDetails": "インターネットなしで開けますが、クラウドと同じだけのディスク容量を使います。",
+      "onDemand": "オンデマンドファイル",
+      "onDemandHint": "ファイルはすぐにフォルダーに表示されますが、開くまでディスク容量を使いません。",
+      "onDemandDetails": "初めて開くときはインターネット接続が必要です。最近開いたファイルは引き続き利用できます。",
+      "fixedNote": "この選択は後から変更できません。切り替えるには、ドライブを削除してからもう一度追加してください。",
+      "macNote": "初回に、Cloudreve がネットワークボリューム上のファイルにアクセスしてよいか macOS が確認することがあります。「許可」をクリックしてください。",
+      "linuxNote": "FUSE（ほとんどの Linux に既にインストールされている「fuse3」パッケージ）が必要です。",
+      "learnMore": "詳細"
+    },
     "localPathPlaceholder": "/Users/username/CloudDrive",
     "browse": "参照",
     "selectFolder": "フォルダを選択",
@@ -59,7 +72,14 @@
     "conflictKeepRemote": "サーバー版を保持",
     "conflictKeepRemoteHint": "ローカルファイルを上書きします",
     "conflictKeepBoth": "両方を保持",
-    "conflictKeepBothHint": "ローカルコピーの名前を変更します"
+    "conflictKeepBothHint": "ローカルコピーの名前を変更します",
+    "pendingUploads": "{{count}} 件のファイルがアップロード待ち",
+    "mountFailed": "「{{name}}」は利用できません",
+    "uploadProblem": "「{{name}}」の変更がアップロードされていません",
+    "retry": "再試行",
+    "pause": "同期を一時停止",
+    "resume": "同期を再開",
+    "pausedStatus": "同期は一時停止中です"
   },
   "settings": {
     "title": "設定",
@@ -118,7 +138,14 @@
       "active": "アクティブ",
       "eventPushLost": "リアルタイムイベントプッシュが切断",
       "offline": "オフライン",
-      "credentialExpired": "認証期限切れ"
+      "credentialExpired": "認証期限切れ",
+      "mountFailed": "利用できません"
+    },
+    "driveMode": {
+      "mirror": "すべてダウンロード",
+      "onDemand": "オンデマンドファイル",
+      "mirrorHint": "すべてのファイルをこのコンピューターに保存",
+      "onDemandHint": "開いたときにダウンロード"
     },
     "networkSettings": "ネットワーク",
     "heartbeatInterval": "ハートビート間隔",
@@ -126,11 +153,17 @@
     "driveSettingsTitle": "ドライブ設定",
     "maxFileSize": "最大ファイルサイズ (MB)",
     "maxFileSizeDescription": "0 = 無制限。これより大きいファイルは同期されません。",
+    "showInFinderSidebar": "Finder のサイドバーに表示",
+    "showInFileManagerSidebar": "ファイルマネージャーのサイドバーに表示",
+    "showInSidebarDescription": "このドライブのフォルダを Cloudreve アイコン付きでサイドバーに追加し、ワンクリックで開けるようにします。",
     "updateSettings": "アップデート",
     "checkUpdatesOnStartup": "起動時にアップデートを確認",
     "checkUpdatesOnStartupDescription": "アプリ起動時に新しいバージョンを自動的に確認します",
     "autoInstallUpdates": "アップデートを自動インストール",
-    "autoInstallUpdatesDescription": "確認なしでアップデートを自動的にダウンロードしてインストールします"
+    "autoInstallUpdatesDescription": "確認なしでアップデートを自動的にダウンロードしてインストールします",
+    "retryMount": "再試行",
+    "deleteOnDemandDriveConfirm": "このコンピューターから「{{name}}」を削除しますか？ファイルはクラウドに残り、このコンピューター上のフォルダーは空になります。",
+    "deleteOnDemandDriveUnsynced": "「{{name}}」には、まだアップロードされていない変更があるファイルが {{count}} 件あります。今ドライブを削除すると、これらの変更は失われます。それでも削除しますか？"
   },
   "about": {
     "homepage": "ホームページ",

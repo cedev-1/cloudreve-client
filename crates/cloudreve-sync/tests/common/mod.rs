@@ -13,8 +13,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use cloudreve_sync::drive::commands::ManagerCommand;
-use cloudreve_sync::drive::mounts::{Credentials, DriveConfig, Mount};
+use cloudreve_sync::drive::mounts::{Credentials, DriveConfig, DriveMode, Mount};
+use cloudreve_sync::drive::vfs_mode::MountTestHook;
 use cloudreve_sync::inventory::{InventoryDb, MetadataEntry, TaskRecord};
+use cloudreve_sync::sidebar::SidebarBackend;
 use cloudreve_sync::{EventBroadcaster, SummaryNotifier};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -24,6 +26,16 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 pub const REMOTE_BASE: &str = "cloudreve://my/sync";
+
+/// Points the app's data root (drive caches, icons, logs, see
+/// `cloudreve_sync::utils::app_dir`) at a directory of this test process
+/// under the system temp dir, never the developer's real `~/.cloudreve`.
+/// Called by every `TestEnv`; a test that reaches the data root without
+/// one calls it itself.
+pub fn redirect_app_data() -> PathBuf {
+    let root = std::env::temp_dir().join("cloudreve-test-home");
+    cloudreve_sync::utils::app_dir::redirect_for_tests(&root)
+}
 
 /// A real, temporary HFS+ volume backed by RAM, detached on drop.
 ///
@@ -86,6 +98,19 @@ pub struct TestEnv {
     pub inventory: Arc<InventoryDb>,
     pub sync_dir: PathBuf,
     pub drive_id: String,
+    /// `Some` only for a `DriveMode::OnDemand` env (see `with_mode`): the
+    /// seam every OS mount/unmount request this env's `Mount` makes is
+    /// recorded on, instead of ever touching the OS. `None` for a
+    /// `FullMirror` env, which has no on-demand lifecycle to intercept.
+    pub vfs_mount_hook: Option<Arc<MountTestHook>>,
+    /// `Some` only for an env built `with_sidebar`: installed on every
+    /// `Mount` this env builds (including `restart_mount`), whose `start()`
+    /// is then run for a `FullMirror` drive too. Every other env keeps the
+    /// `Mount` default, which never touches the real sidebar.
+    pub sidebar: Option<Arc<dyn SidebarBackend>>,
+    /// An on-demand env that mounts for real (no `MountTestHook`): see
+    /// `with_real_mount_and_sidebar`.
+    pub real_mount: bool,
     _tmp: TempDir,
     _manager_rx: mpsc::UnboundedReceiver<ManagerCommand>,
 }
@@ -96,29 +121,80 @@ impl TestEnv {
     }
 
     pub async fn with_max_file_size(max_file_size_mb: u64) -> Self {
-        Self::build(max_file_size_mb, Vec::new(), None).await
+        Self::build(max_file_size_mb, Vec::new(), None, DriveMode::FullMirror, None, false).await
     }
 
     pub async fn with_ignore_patterns(patterns: Vec<String>) -> Self {
-        Self::build(1024, patterns, None).await
+        Self::build(1024, patterns, None, DriveMode::FullMirror, None, false).await
     }
 
     /// Put the sync folder on a caller-chosen volume, so tests can exercise the
     /// disk space guard against real free-space numbers.
     pub async fn with_sync_dir(sync_dir: PathBuf, max_file_size_mb: u64) -> Self {
-        Self::build(max_file_size_mb, Vec::new(), Some(sync_dir)).await
+        Self::build(max_file_size_mb, Vec::new(), Some(sync_dir), DriveMode::FullMirror, None, false).await
+    }
+
+    /// A `Mount` built in the given mode, real `Mount::start()` already
+    /// run. For `OnDemand`, a [`MountTestHook`] is installed BEFORE
+    /// `start()` runs (see `vfs_mount_hook`) so the on-demand lifecycle
+    /// never touches the OS — every real mount/unmount attempt this crate's
+    /// own suite makes is proven end-to-end by `cloudreve-vfs`'s own
+    /// `tests/mounted_{macos,linux}.rs` instead.
+    pub async fn with_mode(mode: DriveMode) -> Self {
+        Self::build(1024, Vec::new(), None, mode, None, false).await
+    }
+
+    /// A `Mount` in `mode` with `sidebar` as its sidebar backend, real
+    /// `Mount::start()` already run (for both modes: that is where a
+    /// drive puts itself in the sidebar).
+    pub async fn with_sidebar(mode: DriveMode, sidebar: Arc<dyn SidebarBackend>) -> Self {
+        Self::build(1024, Vec::new(), None, mode, Some(sidebar), false).await
+    }
+
+    /// An on-demand drive REALLY mounted by `Mount::start()` (NFS on macOS,
+    /// FUSE on Linux) over an empty remote folder, with `sidebar` as its
+    /// sidebar backend. The caller must `mount.delete()` (or `shutdown()`)
+    /// before the end, or the mount outlives the test.
+    pub async fn with_real_mount_and_sidebar(sidebar: Arc<dyn SidebarBackend>) -> Self {
+        Self::build(1024, Vec::new(), None, DriveMode::OnDemand, Some(sidebar), true).await
+    }
+
+    /// A drive whose sync folder is `sync_dir` exactly as the caller left it
+    /// (missing, or already there with its own permissions), real
+    /// `Mount::start()` already run in `mode` — what adding a drive on a
+    /// chosen folder does.
+    pub async fn started_on(sync_dir: PathBuf, mode: DriveMode) -> Self {
+        Self::build_with(1024, Vec::new(), Some(sync_dir), mode, None, false, false).await
     }
 
     async fn build(
         max_file_size_mb: u64,
         ignore_patterns: Vec<String>,
         sync_dir_override: Option<PathBuf>,
+        mode: DriveMode,
+        sidebar: Option<Arc<dyn SidebarBackend>>,
+        real_mount: bool,
     ) -> Self {
+        Self::build_with(max_file_size_mb, ignore_patterns, sync_dir_override, mode, sidebar, real_mount, true).await
+    }
+
+    async fn build_with(
+        max_file_size_mb: u64,
+        ignore_patterns: Vec<String>,
+        sync_dir_override: Option<PathBuf>,
+        mode: DriveMode,
+        sidebar: Option<Arc<dyn SidebarBackend>>,
+        real_mount: bool,
+        precreate_sync_dir: bool,
+    ) -> Self {
+        redirect_app_data();
         let tmp = TempDir::new().expect("create temp dir");
         // The inventory DB deliberately stays in the temp dir: on an overridden
         // sync volume it would eat into the very free space under test.
         let sync_dir = sync_dir_override.unwrap_or_else(|| tmp.path().join("sync"));
-        std::fs::create_dir_all(&sync_dir).expect("create sync dir");
+        if precreate_sync_dir {
+            std::fs::create_dir_all(&sync_dir).expect("create sync dir");
+        }
 
         let inventory = Arc::new(
             InventoryDb::with_path(tmp.path().join("meta.db")).expect("create inventory db"),
@@ -144,12 +220,34 @@ impl TestEnv {
             ignore_patterns,
             max_file_size_mb,
             sse_client_id: Uuid::new_v4().to_string(),
+            mode,
             ..Default::default()
         };
 
         let (manager_tx, manager_rx) = mpsc::unbounded_channel();
         let notifier = Arc::new(SummaryNotifier::new(Arc::new(EventBroadcaster::new(16))));
-        let mount = Arc::new(Mount::new(config, inventory.clone(), manager_tx, notifier).await);
+        let mut mount = Mount::new(config, inventory.clone(), manager_tx, notifier).await;
+
+        let vfs_mount_hook = if mode == DriveMode::OnDemand && !real_mount {
+            let hook = MountTestHook::new();
+            mount.install_vfs_mount_hook_for_tests(hook.clone()).await;
+            Some(hook)
+        } else {
+            None
+        };
+        if real_mount {
+            // The mounted root is listed as soon as anything looks inside it.
+            mock_listing(&server, Vec::new()).await;
+        }
+
+        if let Some(sidebar) = &sidebar {
+            mount.set_sidebar_backend(sidebar.clone());
+        }
+        if mode == DriveMode::OnDemand || sidebar.is_some() || !precreate_sync_dir {
+            mount.start().await.expect("start the mount");
+        }
+
+        let mount = Arc::new(mount);
 
         Self {
             server,
@@ -157,6 +255,9 @@ impl TestEnv {
             inventory,
             sync_dir,
             drive_id,
+            vfs_mount_hook,
+            sidebar,
+            real_mount,
             _tmp: tmp,
             _manager_rx: manager_rx,
         }
@@ -166,24 +267,7 @@ impl TestEnv {
     /// Replaces any previously registered listing.
     pub async fn set_remote_files(&self, files: Vec<Value>) {
         self.server.reset().await;
-        let body = json!({
-            "code": 0,
-            "msg": "",
-            "data": {
-                "files": files,
-                "pagination": { "page": 1, "page_size": 500, "total_items": 0 },
-                "props": {
-                    "max_page_size": 10000,
-                    "order_by_options": ["name"],
-                    "order_direction_options": ["asc"],
-                },
-            },
-        });
-        Mock::given(method("GET"))
-            .and(path("/api/v4/file"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(body))
-            .mount(&self.server)
-            .await;
+        mock_listing(&self.server, files).await;
     }
 
     /// Run a full 3-way sync against the mock remote.
@@ -194,12 +278,35 @@ impl TestEnv {
     /// Simulate the app being relaunched: rebuild the Mount over the same
     /// inventory database and config, exactly like the next boot would.
     /// Whatever startup does with the tasks left in the database has happened
-    /// by the time this returns.
+    /// by the time this returns. For an on-demand env, a fresh
+    /// `MountTestHook` is installed and `start()` is run again, exactly
+    /// mirroring `with_mode`'s own on-demand setup — `vfs_mount_hook` is
+    /// replaced with the new hook, so any counts a test read off the OLD
+    /// one before restarting stay a frozen snapshot of the pre-restart
+    /// mount's activity.
     pub async fn restart_mount(&mut self) {
         let config = self.mount.get_config().await;
+        let mode = config.mode;
         let (manager_tx, manager_rx) = mpsc::unbounded_channel();
         let notifier = Arc::new(SummaryNotifier::new(Arc::new(EventBroadcaster::new(16))));
-        self.mount = Arc::new(Mount::new(config, self.inventory.clone(), manager_tx, notifier).await);
+        let mut mount = Mount::new(config, self.inventory.clone(), manager_tx, notifier).await;
+
+        self.vfs_mount_hook = if mode == DriveMode::OnDemand && !self.real_mount {
+            let hook = MountTestHook::new();
+            mount.install_vfs_mount_hook_for_tests(hook.clone()).await;
+            Some(hook)
+        } else {
+            None
+        };
+
+        if let Some(sidebar) = &self.sidebar {
+            mount.set_sidebar_backend(sidebar.clone());
+        }
+        if mode == DriveMode::OnDemand || self.sidebar.is_some() {
+            mount.start().await.expect("start the mount");
+        }
+
+        self.mount = Arc::new(mount);
         self._manager_rx = manager_rx;
     }
 
@@ -268,6 +375,23 @@ impl TestEnv {
     }
 }
 
+/// An on-demand env's cache dir lives under the REAL `~/.cloudreve/
+/// vfs-cache/<drive_id>/` (D3 — this crate's own production layout, not a
+/// test fixture path), keyed by a fresh random `drive_id` per test. A test
+/// that doesn't itself call `Mount::delete()` (only `deleting_removes_the_
+/// cache_dir` does) would otherwise leak that directory on the machine
+/// actually running the suite; this cleans it up unconditionally so the
+/// rest of this file's tests don't accumulate garbage there run after run.
+impl Drop for TestEnv {
+    fn drop(&mut self) {
+        if self.vfs_mount_hook.is_some()
+            && let Ok(cache_dir) = cloudreve_sync::drive::vfs_mode::cache_dir_for(&self.drive_id)
+        {
+            let _ = std::fs::remove_dir_all(&cache_dir);
+        }
+    }
+}
+
 /// Build the JSON for a remote file as the Cloudreve list API would return it.
 pub fn remote_file(name: &str, size: i64, etag: &str) -> Value {
     json!({
@@ -280,4 +404,26 @@ pub fn remote_file(name: &str, size: i64, etag: &str) -> Value {
         "path": format!("{REMOTE_BASE}/{name}"),
         "primary_entity": etag,
     })
+}
+
+/// Serves `files` as the remote listing of every folder.
+async fn mock_listing(server: &MockServer, files: Vec<Value>) {
+    let body = json!({
+        "code": 0,
+        "msg": "",
+        "data": {
+            "files": files,
+            "pagination": { "page": 1, "page_size": 500, "total_items": 0 },
+            "props": {
+                "max_page_size": 10000,
+                "order_by_options": ["name"],
+                "order_direction_options": ["asc"],
+            },
+        },
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v4/file"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(server)
+        .await;
 }

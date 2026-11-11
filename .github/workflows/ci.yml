@@ -8,6 +8,8 @@ on:
       - 'src-tauri/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'ui/**'
+      - 'locales/**'
       - '.github/workflows/ci.yml'
   pull_request:
     paths:
@@ -15,9 +17,62 @@ on:
       - 'src-tauri/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'ui/**'
+      - 'locales/**'
       - '.github/workflows/ci.yml'
 
 jobs:
+  frontend:
+    name: Frontend type-check
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ui
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Install Node.js
+        uses: actions/setup-node@v6.4.0
+        with:
+          # vitest 5 needs Node 22.12+.
+          node-version: '24'
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+
+      - name: Type-check
+        # Not a bare "tsc --noEmit": tsconfig.json only holds project
+        # references ("files": []), so that checks nothing at all.
+        run: |
+          yarn tsc -p tsconfig.app.json --noEmit
+          yarn tsc -p tsconfig.node.json --noEmit
+          yarn tsc -p tsconfig.test.json --noEmit
+
+      - name: Lint
+        run: yarn lint
+
+      - name: Smoke tests (every window, en-US and fr)
+        run: yarn test
+
+      - name: Tauri JS packages match the Rust crates
+        # A plugin's JS half and Rust half speak a private IPC protocol: a
+        # `cargo update` that moved tauri-plugin-http to 2.9 under a 2.5 JS
+        # package broke every login ("missing client-config header").
+        run: |
+          status=0
+          for pkg in $(grep -o '"@tauri-apps/\(api\|plugin-[a-z-]*\)"' package.json | tr -d '"' | sort -u); do
+            crate=$(echo "$pkg" | sed 's|@tauri-apps/api|tauri|; s|@tauri-apps/plugin-|tauri-plugin-|')
+            # By path: plugin-deep-link's "exports" does not list ./package.json.
+            js=$(node -p "require('./node_modules/$pkg/package.json').version")
+            rust=$(grep -A1 "^name = \"$crate\"$" ../Cargo.lock | sed -n 's/^version = "\(.*\)"/\1/p' | head -n 1)
+            if [ "${js%.*}" != "${rust%.*}" ]; then
+              echo "::error::$pkg is $js but the $crate crate is $rust (major.minor must match)"
+              status=1
+            fi
+          done
+          exit $status
+
   test:
     name: Rust tests
     runs-on: ubuntu-latest
@@ -41,15 +96,200 @@ jobs:
             libappindicator3-dev \
             librsvg2-dev \
             libssl-dev \
-            pkg-config
+            pkg-config \
+            fuse3
+
+      - name: Check FUSE is available
+        run: |
+          test -e /dev/fuse
+          fusermount3 --version
 
       - name: Run tests
-        run: cargo test -p cloudreve-sync -p cloudreve-api
+        # HOME is a fresh empty directory: a test that resolves the real
+        # home (~/.cloudreve: drive caches, icons, logs, drives.json) instead
+        # of its own temp dir shows up in the check below. On a developer's
+        # machine such a test filled ~/.cloudreve/vfs-cache with hundreds
+        # of leftover drive caches.
+        run: |
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          export HOME="$RUNNER_TEMP/test-home"
+          mkdir -p "$HOME"
+          cargo test -p cloudreve-sync -p cloudreve-api -p cloudreve-uploader -p cloudreve-vfs -p cloudreve-finder-sync
+          # tauri-build requires the frontendDist directory to exist, but the
+          # Rust side (and the JSON the UI reads) needs no real frontend build.
+          mkdir -p ui/dist
+          cargo test -p cloudreve-desktop --lib
 
-      - name: Check desktop crate compiles
-        # tauri-build requires the frontendDist directory to exist,
-        # but type-checking the Rust code doesn't need a real frontend build
-        # need to add ci for frontend part
+      - name: Tests left the home directory alone
+        run: |
+          if [ -e "$RUNNER_TEMP/test-home/.cloudreve" ]; then
+            find "$RUNNER_TEMP/test-home/.cloudreve" | head -n 50
+            echo "::error::a test wrote into ~/.cloudreve (see app_dir::app_data_root)"
+            exit 1
+          fi
+
+  test-macos:
+    name: Rust tests (macOS)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2.9.1
+        with:
+          workspaces: '. -> target'
+
+      - name: Show macOS version
+        run: sw_vers
+
+      - name: Run tests
+        run: cargo test -p cloudreve-vfs
+
+      - name: What Foundation answers on the drive (safe save, trash, tags)
+        # Already run above; again with --nocapture so the log records each
+        # answer, not just the verdict.
+        run: cargo test -p cloudreve-vfs --test mounted_macos_apps -- --nocapture
+
+      - name: Finder sidebar (real LSSharedFileList and NSWorkspace)
+        # Edits the runner's Finder Favorites, so it is #[ignore]d for local runs;
+        # --include-ignored also runs the tests that never touch the sidebar.
+        run: |
+          cargo test -p cloudreve-sync --lib sidebar
+          cargo test -p cloudreve-sync --test drive_sidebar
+          # --nocapture: the E2E checkpoints locate a native crash, which
+          # prints no panic message.
+          RUST_BACKTRACE=1 cargo test -p cloudreve-sync --test finder_sidebar_macos -- --include-ignored --nocapture --test-threads=1
+
+      - name: Tests left ~/.cloudreve alone
+        # The runner starts without one: any here was made by a test.
+        run: |
+          if [ -e ~/.cloudreve ]; then
+            find ~/.cloudreve | head -n 50
+            echo "::error::a test wrote into ~/.cloudreve (see app_dir::app_data_root)"
+            exit 1
+          fi
+
+  finder-sync-macos:
+    # The Cloudreve glyph on the drive folders' Finder sidebar rows: the
+    # Finder Sync extension inside the real app bundle, registered and fed
+    # by the real app (crates/cloudreve-finder-sync, sidebar::finder_sync).
+    # What it cannot check is the pixel itself: that stays a look by eye.
+    name: Finder sidebar glyph (macOS)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2.9.1
+        with:
+          workspaces: '. -> target'
+
+      - name: Show macOS and Xcode versions
+        run: |
+          sw_vers
+          xcodebuild -version
+
+      - name: Symbol catalog compiles and is up to date
+        # actool (Xcode) is here, not necessarily on a dev machine: the
+        # committed Assets.car must come from the current Symbols.xcassets.
+        # The fresh catalog is uploaded either way, ready to commit.
+        run: |
+          D=src-tauri/macos/finder-sync
+          sh $D/compile-symbol.sh "$RUNNER_TEMP/symbol"
+          test -f $D/Assets.car || { echo "::error::$D/Assets.car is missing: commit the artifact 'sidebar-symbol'"; exit 1; }
+          assetutil --info $D/Assets.car | grep '"Name" : "custom.cloudreve.logo"'
+          test "$(cat $D/Assets.car.source)" = "$(sh $D/compile-symbol.sh --source-hash)" \
+            || { echo "::error::Symbols.xcassets changed since Assets.car was compiled: commit the artifact 'sidebar-symbol'"; exit 1; }
+
+      - name: Upload the compiled symbol catalog
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sidebar-symbol
+          path: ${{ runner.temp }}/symbol/
+
+      - name: Extension and app tests
+        run: |
+          cargo test -p cloudreve-finder-sync
+          cargo test -p cloudreve-sync --lib sidebar
+
+      - name: Build the app bundle (no frontend)
+        # The extension does not care about the UI: an empty page instead
+        # of the Vite build. `tauri build` runs build-helper.sh (beforeBundleCommand).
         run: |
           mkdir -p ui/dist
-          cargo check -p cloudreve-desktop
+          echo '<!doctype html><title>Cloudreve</title>' > ui/dist/index.html
+          npx --yes @tauri-apps/cli@2 build --debug --bundles app,dmg \
+            --config '{"build":{"beforeBuildCommand":null},"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Bundle structure and signatures
+        run: |
+          APP=target/debug/bundle/macos/Cloudreve.app
+          HELPER=$APP/Contents/Helpers/CloudreveSidebar.app
+          APPEX=$HELPER/Contents/PlugIns/CloudreveFinderSync.appex
+          test -x $HELPER/Contents/MacOS/CloudreveSidebar
+          test -x $APPEX/Contents/MacOS/CloudreveFinderSync
+          test -f $HELPER/Contents/Resources/Assets.car
+          plutil -lint $HELPER/Contents/Info.plist $APPEX/Contents/Info.plist
+          test "$(plutil -extract CFBundleIcons.CFBundlePrimaryIcon.CFBundleSymbolName raw $HELPER/Contents/Info.plist)" = custom.cloudreve.logo
+          test "$(plutil -extract NSExtension.NSExtensionPointIdentifier raw $APPEX/Contents/Info.plist)" = com.apple.FinderSync
+          # The main app keeps its own colour icon.
+          test "$(plutil -extract CFBundleIconFile raw $APP/Contents/Info.plist)" = icon.icns
+          if plutil -extract CFBundleIcons raw $APP/Contents/Info.plist; then echo "::error::the main app got CFBundleIcons"; exit 1; fi
+          codesign --verify --deep --strict --verbose=2 $APP
+          # Kept through the outer signing: PlugInKit refuses an unsandboxed extension.
+          codesign -d --entitlements - --xml $APPEX | plutil -p - | grep -F '"com.apple.security.app-sandbox" => true'
+          spctl --assess --type execute --verbose=4 $APP || true
+
+      - name: The dmg carries the same, intact (as release.yml checks it)
+        run: |
+          DMG=$(ls target/debug/bundle/dmg/*.dmg | head -n 1)
+          MNT=$(mktemp -d)
+          hdiutil attach -nobrowse -readonly -mountpoint "$MNT" "$DMG"
+          trap 'hdiutil detach "$MNT"' EXIT
+          APP="$MNT/Cloudreve.app"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          codesign -d --entitlements - --xml "$APP/Contents/Helpers/CloudreveSidebar.app/Contents/PlugIns/CloudreveFinderSync.appex" \
+            | plutil -p - | grep -F '"com.apple.security.app-sandbox" => true'
+
+      - name: The app registers the extension and feeds it the drive folder
+        run: |
+          APP="$PWD/target/debug/bundle/macos/Cloudreve.app"
+          ID=cloudreve.desktop.sidebar.FinderSync
+          DRIVE="$RUNNER_TEMP/CI Drive"
+          mkdir -p "$DRIVE" ~/.cloudreve
+          cat > ~/.cloudreve/drives.json <<JSON
+          {"drives":[{"id":"ci-drive","name":"CI Drive","instance_url":"http://127.0.0.1:9",
+            "remote_path":"cloudreve://my","sync_path":"$DRIVE","enabled":true,"user_id":"ci",
+            "credentials":{"refresh_token":"r","refresh_expires":"2099-01-01T00:00:00Z"}}]}
+          JSON
+          echo "registered before launch (none expected):"; pluginkit -m -A -v -i $ID || true
+          pgrep -x Finder || open -a Finder
+          open -g "$APP"
+          ok=
+          for i in $(seq 1 60); do
+            sleep 2
+            if pluginkit -m -v -i $ID | grep -q "^+.*Cloudreve.app/Contents/Helpers" \
+              && pgrep -f CloudreveFinderSync.appex >/dev/null \
+              && /usr/bin/log show --last 5m --style compact --predicate 'process == "CloudreveFinderSync"' \
+                 | grep -F "directoryURLs set, 1 folder(s)"; then
+              ok=1; break
+            fi
+          done
+          echo "--- pluginkit"; pluginkit -m -A -v -i $ID || true
+          echo "--- folder list"; cat ~/.cloudreve/finder-sync/folders.json || true
+          echo "--- extension log"; /usr/bin/log show --last 5m --style compact --predicate 'process == "CloudreveFinderSync" AND eventMessage CONTAINS "CloudreveFinderSync"' || true
+          echo "--- processes"; pgrep -fl Cloudreve || true
+          test -n "$ok"
+
+      - name: App log
+        if: always()
+        run: tail -n 80 ~/.cloudreve/logs/* 2>/dev/null || true

@@ -106,6 +106,8 @@ export default function ConflictItem({ conflict, onResolved }: ConflictItemProps
       </ListItemIcon>
       <ListItemText
         sx={{ pr: 9 }}
+        // The secondary line holds blocks (a Box): a <div>, not the default <p>.
+        slotProps={{ secondary: { component: "div" } }}
         primary={
           <Typography variant="body2" noWrap sx={{ fontWeight: 500 }}>
             {fileName}
@@ -143,7 +145,7 @@ export default function ConflictItem({ conflict, onResolved }: ConflictItemProps
           <ListItemText
             primary={t("popup.conflictKeepLocal", "Keep local version")}
             secondary={t("popup.conflictKeepLocalHint", "Overwrites the server file")}
-            secondaryTypographyProps={{ variant: "caption" }}
+            slotProps={{ secondary: { variant: "caption" } }}
           />
         </MenuItem>
         <MenuItem onClick={() => handleResolve("keep_remote")}>
@@ -153,7 +155,7 @@ export default function ConflictItem({ conflict, onResolved }: ConflictItemProps
           <ListItemText
             primary={t("popup.conflictKeepRemote", "Keep server version")}
             secondary={t("popup.conflictKeepRemoteHint", "Overwrites the local file")}
-            secondaryTypographyProps={{ variant: "caption" }}
+            slotProps={{ secondary: { variant: "caption" } }}
           />
         </MenuItem>
         <MenuItem onClick={() => handleResolve("keep_both")}>
@@ -163,7 +165,7 @@ export default function ConflictItem({ conflict, onResolved }: ConflictItemProps
           <ListItemText
             primary={t("popup.conflictKeepBoth", "Keep both")}
             secondary={t("popup.conflictKeepBothHint", "Renames the local copy")}
-            secondaryTypographyProps={{ variant: "caption" }}
+            slotProps={{ secondary: { variant: "caption" } }}
           />
         </MenuItem>
       </Menu>

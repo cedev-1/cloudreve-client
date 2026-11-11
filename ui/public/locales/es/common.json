@@ -13,6 +13,19 @@
     "finalSetupDescription": "Elija una carpeta local donde se montará su unidad en la nube.",
     "localPath": "Ruta local",
     "localDriveName": "Nombre del montaje",
+    "modeChoice": {
+      "title": "¿Cómo quieres guardar tus archivos en este equipo?",
+      "mirror": "Descargar todo",
+      "mirrorHint": "Cada archivo se copia en este equipo y se mantiene sincronizado.",
+      "mirrorDetails": "Los archivos se abren sin internet, pero ocupan tanto espacio en disco como tu nube.",
+      "onDemand": "Archivos bajo demanda",
+      "onDemandHint": "Tus archivos aparecen en la carpeta al instante, pero no ocupan espacio en disco hasta que los abres.",
+      "onDemandDetails": "Abrir un archivo por primera vez requiere conexión a internet; los archivos abiertos recientemente siguen disponibles.",
+      "fixedNote": "Esta opción no se puede cambiar después. Para cambiarla, quita la unidad y vuelve a añadirla.",
+      "macNote": "La primera vez, macOS puede preguntar si Cloudreve puede acceder a archivos de un volumen de red: pulsa Permitir.",
+      "linuxNote": "Requiere FUSE (el paquete \"fuse3\", ya instalado en la mayoría de sistemas Linux).",
+      "learnMore": "Más información"
+    },
     "localPathPlaceholder": "/Users/username/CloudDrive",
     "browse": "Examinar",
     "selectFolder": "Seleccionar carpeta",
@@ -59,7 +72,14 @@
     "conflictKeepRemote": "Conservar versión del servidor",
     "conflictKeepRemoteHint": "Sobrescribe el archivo local",
     "conflictKeepBoth": "Conservar ambos",
-    "conflictKeepBothHint": "Renombra la copia local"
+    "conflictKeepBothHint": "Renombra la copia local",
+    "pendingUploads": "{{count}} archivo(s) esperando subida",
+    "mountFailed": "\"{{name}}\" no está disponible",
+    "uploadProblem": "Los cambios en \"{{name}}\" no se suben",
+    "retry": "Reintentar",
+    "pause": "Pausar la sincronización",
+    "resume": "Reanudar la sincronización",
+    "pausedStatus": "Sincronización en pausa"
   },
   "settings": {
     "title": "Configuración",
@@ -118,7 +138,14 @@
       "active": "Activo",
       "eventPushLost": "Pérdida de notificaciones en tiempo real",
       "offline": "Fuera de línea",
-      "credentialExpired": "Credenciales expiradas"
+      "credentialExpired": "Credenciales expiradas",
+      "mountFailed": "No disponible"
+    },
+    "driveMode": {
+      "mirror": "Descargar todo",
+      "onDemand": "Archivos bajo demanda",
+      "mirrorHint": "Todos los archivos se guardan en este equipo",
+      "onDemandHint": "Los archivos se descargan al abrirlos"
     },
     "networkSettings": "Red",
     "heartbeatInterval": "Intervalo de heartbeat",
@@ -126,11 +153,17 @@
     "driveSettingsTitle": "Configuración de la unidad",
     "maxFileSize": "Tamaño máximo del archivo (MB)",
     "maxFileSizeDescription": "0 = ilimitado. Los archivos más grandes no se sincronizarán.",
+    "showInFinderSidebar": "Mostrar en la barra lateral del Finder",
+    "showInFileManagerSidebar": "Mostrar en la barra lateral del gestor de archivos",
+    "showInSidebarDescription": "Añade la carpeta de esta unidad a la barra lateral con el icono de Cloudreve, para abrirla con un clic.",
     "updateSettings": "Actualizaciones",
     "checkUpdatesOnStartup": "Buscar actualizaciones al iniciar",
     "checkUpdatesOnStartupDescription": "Buscar automáticamente nuevas versiones cuando la aplicación se inicia",
     "autoInstallUpdates": "Instalar actualizaciones automáticamente",
-    "autoInstallUpdatesDescription": "Descargar e instalar actualizaciones automáticamente sin preguntar"
+    "autoInstallUpdatesDescription": "Descargar e instalar actualizaciones automáticamente sin preguntar",
+    "retryMount": "Reintentar",
+    "deleteOnDemandDriveConfirm": "¿Quitar \"{{name}}\" de este equipo? Tus archivos siguen en la nube; la carpeta de este equipo quedará vacía.",
+    "deleteOnDemandDriveUnsynced": "\"{{name}}\" tiene {{count}} archivo(s) con cambios que aún no se han subido. Si quitas la unidad ahora, esos cambios se perderán. ¿Quitarla de todos modos?"
   },
   "about": {
     "homepage": "Página principal",

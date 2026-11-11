@@ -118,7 +118,9 @@ jobs:
       - name: Install Node.js
         uses: actions/setup-node@v6.4.0
         with:
-          node-version: '20'
+          # The ui tooling (vitest 5, react-i18next 18) requires Node 22+:
+          # yarn refuses to install under Node 20.
+          node-version: '24'
 
       - name: Install Yarn
         run: npm install -g yarn
@@ -172,6 +174,24 @@ jobs:
           releaseId: ${{ needs.create-release.outputs.release_id }}
           includeUpdaterJson: true
           args: ${{ matrix.args }}
+
+      # The app is ad-hoc signed (tauri.macos.conf.json) around the Finder
+      # Sync extension, which build-helper.sh signed first with its sandbox
+      # entitlements. A broken seal is what turns Gatekeeper's "cannot
+      # verify" into "damaged", and an extension without its sandbox is
+      # ignored by PlugInKit: check both on the app the dmg carries. Runs
+      # before `publish`, so a failure keeps the release a draft.
+      - name: Check the macOS bundle in the dmg
+        if: startsWith(matrix.platform, 'macos')
+        run: |
+          DMG=$(ls target/${{ matrix.target }}/release/bundle/dmg/*.dmg | head -n 1)
+          MNT=$(mktemp -d)
+          hdiutil attach -nobrowse -readonly -mountpoint "$MNT" "$DMG"
+          trap 'hdiutil detach "$MNT"' EXIT
+          APP="$MNT/Cloudreve.app"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          codesign -d --entitlements - --xml "$APP/Contents/Helpers/CloudreveSidebar.app/Contents/PlugIns/CloudreveFinderSync.appex" \
+            | plutil -p - | grep -F '"com.apple.security.app-sandbox" => true'
 
   # Only reached when every build succeeded, so the release becomes visible with
   # its full set of bundles and a `latest.json` that points at files that exist.

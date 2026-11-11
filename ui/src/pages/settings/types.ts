@@ -11,9 +11,19 @@ export interface DriveInfo {
   status: DriveStatus;
   max_file_size_mb?: number;
   capacity?: CapacitySummary;
+  mode: DriveMode;
+  // On-demand only: why the folder is not mounted, already a localized,
+  // plain-language explanation (`DriveInfo::mount_error`).
+  mount_error?: string | null;
+  // On-demand only: files with changes not on the server yet.
+  unsynced_files?: number;
 }
 
-export type DriveStatus = "active" | "event_push_lost" | "offline" | "credential_expired";
+export type DriveStatus = "active" | "event_push_lost" | "offline" | "credential_expired" | "mount_failed";
+
+// Must match `DriveMode`'s serde snake_case wire format exactly
+// (crates/cloudreve-sync/src/drive/mounts.rs).
+export type DriveMode = "full_mirror" | "on_demand";
 
 export interface CapacitySummary {
   total: number;

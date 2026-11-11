@@ -521,7 +521,7 @@ export default function GeneralSection() {
             size="small"
             value={heartbeatInterval}
             onChange={(e) => handleHeartbeatIntervalChange(e.target.value)}
-            inputProps={{ min: 5, max: 120 }}
+            slotProps={{ htmlInput: { min: 5, max: 120 } }}
             sx={{ width: 80 }}
             disabled={loading}
           />

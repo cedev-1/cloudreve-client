@@ -35,7 +35,7 @@ fn handle_open_settings_window(app_handle: &AppHandle) {
 /// Emit an event to the frontend
 pub fn emit_event(app_handle: &AppHandle, event: &Event) {
     if let Err(e) = app_handle.emit(event.name(), event) {
-        tracing::error!(target: "events", error = %e, "Failed to emit event to frontend");
+        tracing::error!(target: "events", error = %format_args!("{e:#}"), "Failed to emit event to frontend");
     } else {
         tracing::trace!(target: "events", event = ?event, "Event emitted to frontend");
     }

@@ -13,6 +13,19 @@
     "finalSetupDescription": "Choose a local folder where your cloud drive will be mounted.",
     "localPath": "Local Path",
     "localDriveName": "Mount Name",
+    "modeChoice": {
+      "title": "How should your files be kept on this computer?",
+      "mirror": "Download everything",
+      "mirrorHint": "Every file is copied to this computer and kept in sync.",
+      "mirrorDetails": "Files open without internet, but use as much disk space as your cloud.",
+      "onDemand": "Files on demand",
+      "onDemandHint": "Your files show up in the folder right away but use no disk space until you open them.",
+      "onDemandDetails": "Opening a file for the first time needs an internet connection; files you opened recently stay available.",
+      "fixedNote": "This choice can't be changed later. To switch, remove the drive and add it again.",
+      "macNote": "The first time, macOS may ask whether Cloudreve can access files on a network volume: click Allow.",
+      "linuxNote": "Needs FUSE (the \"fuse3\" package, already installed on most Linux systems).",
+      "learnMore": "Learn more"
+    },
     "localPathPlaceholder": "/Users/username/CloudDrive",
     "browse": "Browse",
     "selectFolder": "Select Folder",
@@ -59,7 +72,14 @@
     "conflictKeepRemote": "Keep server version",
     "conflictKeepRemoteHint": "Overwrites the local file",
     "conflictKeepBoth": "Keep both",
-    "conflictKeepBothHint": "Renames the local copy"
+    "conflictKeepBothHint": "Renames the local copy",
+    "pendingUploads": "{{count}} file(s) waiting to upload",
+    "mountFailed": "\"{{name}}\" is not available",
+    "uploadProblem": "Changes on \"{{name}}\" are not uploading",
+    "retry": "Retry",
+    "pause": "Pause sync",
+    "resume": "Resume sync",
+    "pausedStatus": "Sync paused"
   },
   "settings": {
     "title": "Settings",
@@ -115,13 +135,23 @@
     "driveSettingsTitle": "Drive Settings",
     "maxFileSize": "Max file size (MB)",
     "maxFileSizeDescription": "0 = unlimited. Files larger than this will not be synced.",
+    "showInFinderSidebar": "Show in Finder sidebar",
+    "showInFileManagerSidebar": "Show in file manager sidebar",
+    "showInSidebarDescription": "Adds this drive's folder to the sidebar with the Cloudreve icon, so you can open it in one click.",
     "save": "Save",
     "cancel": "Cancel",
     "driveStatus": {
       "active": "Active",
       "eventPushLost": "Real time event push lost",
       "offline": "Offline",
-      "credentialExpired": "Credential Expired"
+      "credentialExpired": "Credential Expired",
+      "mountFailed": "Not available"
+    },
+    "driveMode": {
+      "mirror": "Download everything",
+      "onDemand": "Files on demand",
+      "mirrorHint": "All files are kept on this computer",
+      "onDemandHint": "Files download when you open them"
     },
     "networkSettings": "Network",
     "heartbeatInterval": "Heartbeat interval",
@@ -130,7 +160,10 @@
     "checkUpdatesOnStartup": "Check for updates on startup",
     "checkUpdatesOnStartupDescription": "Automatically check for new versions when the app starts",
     "autoInstallUpdates": "Auto-install updates",
-    "autoInstallUpdatesDescription": "Download and install updates automatically without prompting"
+    "autoInstallUpdatesDescription": "Download and install updates automatically without prompting",
+    "retryMount": "Retry",
+    "deleteOnDemandDriveConfirm": "Remove \"{{name}}\" from this computer? Your files stay in the cloud; the folder on this computer will be empty.",
+    "deleteOnDemandDriveUnsynced": "\"{{name}}\" has {{count}} file(s) with changes that are not uploaded yet. If you remove the drive now, these changes will be lost. Remove it anyway?"
   },
   "about": {
     "homepage": "Homepage",

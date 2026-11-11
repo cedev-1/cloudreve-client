@@ -13,6 +13,19 @@
     "finalSetupDescription": "Wählen Sie einen lokalen Ordner aus, in dem Ihr Cloud-Laufwerk eingebunden wird.",
     "localPath": "Lokaler Pfad",
     "localDriveName": "Mount-Name",
+    "modeChoice": {
+      "title": "Wie sollen Ihre Dateien auf diesem Computer gespeichert werden?",
+      "mirror": "Alles herunterladen",
+      "mirrorHint": "Jede Datei wird auf diesen Computer kopiert und synchron gehalten.",
+      "mirrorDetails": "Dateien öffnen sich ohne Internet, belegen aber so viel Speicherplatz wie Ihre Cloud.",
+      "onDemand": "Dateien bei Bedarf",
+      "onDemandHint": "Ihre Dateien erscheinen sofort im Ordner, belegen aber keinen Speicherplatz, bis Sie sie öffnen.",
+      "onDemandDetails": "Zum ersten Öffnen einer Datei wird eine Internetverbindung benötigt; kürzlich geöffnete Dateien bleiben verfügbar.",
+      "fixedNote": "Diese Auswahl kann später nicht geändert werden. Zum Wechseln entfernen Sie das Laufwerk und fügen es erneut hinzu.",
+      "macNote": "Beim ersten Mal fragt macOS eventuell, ob Cloudreve auf Dateien eines Netzwerkvolumes zugreifen darf: Klicken Sie auf „Erlauben“.",
+      "linuxNote": "Benötigt FUSE (das Paket „fuse3“, auf den meisten Linux-Systemen bereits installiert).",
+      "learnMore": "Mehr erfahren"
+    },
     "localPathPlaceholder": "/Users/username/CloudDrive",
     "browse": "Durchsuchen",
     "selectFolder": "Ordner auswählen",
@@ -59,7 +72,14 @@
     "conflictKeepRemote": "Server-Version behalten",
     "conflictKeepRemoteHint": "Überschreibt die lokale Datei",
     "conflictKeepBoth": "Beide behalten",
-    "conflictKeepBothHint": "Benennt die lokale Kopie um"
+    "conflictKeepBothHint": "Benennt die lokale Kopie um",
+    "pendingUploads": "{{count}} Datei(en) warten auf Upload",
+    "mountFailed": "„{{name}}“ ist nicht verfügbar",
+    "uploadProblem": "Uploads auf „{{name}}“ hängen fest",
+    "retry": "Erneut versuchen",
+    "pause": "Synchronisierung pausieren",
+    "resume": "Synchronisierung fortsetzen",
+    "pausedStatus": "Synchronisierung pausiert"
   },
   "settings": {
     "title": "Einstellungen",
@@ -118,7 +138,14 @@
       "active": "Aktiv",
       "eventPushLost": "Echtzeit-Event-Push unterbrochen",
       "offline": "Offline",
-      "credentialExpired": "Anmeldedaten abgelaufen"
+      "credentialExpired": "Anmeldedaten abgelaufen",
+      "mountFailed": "Nicht verfügbar"
+    },
+    "driveMode": {
+      "mirror": "Alles herunterladen",
+      "onDemand": "Dateien bei Bedarf",
+      "mirrorHint": "Alle Dateien liegen auf diesem Computer",
+      "onDemandHint": "Dateien werden beim Öffnen geladen"
     },
     "networkSettings": "Netzwerk",
     "heartbeatInterval": "Heartbeat-Intervall",
@@ -126,11 +153,17 @@
     "driveSettingsTitle": "Laufwerk-Einstellungen",
     "maxFileSize": "Max. Dateigröße (MB)",
     "maxFileSizeDescription": "0 = unbegrenzt. Größere Dateien werden nicht synchronisiert.",
+    "showInFinderSidebar": "In der Finder-Seitenleiste anzeigen",
+    "showInFileManagerSidebar": "In der Seitenleiste des Dateimanagers anzeigen",
+    "showInSidebarDescription": "Fügt den Ordner dieses Laufwerks mit dem Cloudreve-Symbol zur Seitenleiste hinzu, damit Sie ihn mit einem Klick öffnen können.",
     "updateSettings": "Updates",
     "checkUpdatesOnStartup": "Beim Start nach Updates suchen",
     "checkUpdatesOnStartupDescription": "Automatisch nach neuen Versionen suchen, wenn die App startet",
     "autoInstallUpdates": "Updates automatisch installieren",
-    "autoInstallUpdatesDescription": "Updates automatisch herunterladen und installieren, ohne zu fragen"
+    "autoInstallUpdatesDescription": "Updates automatisch herunterladen und installieren, ohne zu fragen",
+    "retryMount": "Erneut versuchen",
+    "deleteOnDemandDriveConfirm": "„{{name}}“ von diesem Computer entfernen? Ihre Dateien bleiben in der Cloud; der Ordner auf diesem Computer ist danach leer.",
+    "deleteOnDemandDriveUnsynced": "„{{name}}“ hat {{count}} Datei(en) mit Änderungen, die noch nicht hochgeladen sind. Wenn Sie das Laufwerk jetzt entfernen, gehen diese Änderungen verloren. Trotzdem entfernen?"
   },
   "about": {
     "homepage": "Startseite",

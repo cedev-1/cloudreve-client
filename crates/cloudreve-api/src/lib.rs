@@ -42,6 +42,7 @@ pub mod boolset;
 pub mod client;
 pub mod error;
 pub mod models;
+pub mod redact;
 
 pub use boolset::Boolset;
 pub use client::{Client, ClientConfig};

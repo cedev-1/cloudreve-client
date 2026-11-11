@@ -2,7 +2,7 @@ use crate::AppStateHandle;
 use chrono::{Duration, Utc};
 use cloudreve_api::api::UserApi;
 use cloudreve_sync::{
-    config::LogLevel, ConfigManager, ConflictResolution, Credentials, DriveConfig, DriveInfo,
+    config::LogLevel, ConfigManager, ConflictResolution, Credentials, DriveConfig, DriveInfo, DriveMode, DriveSummary,
     StatusSummary,
 };
 #[cfg(target_os = "macos")]
@@ -80,12 +80,6 @@ pub async fn is_dir_empty(path: String) -> CommandResult<bool> {
     }
 }
 
-#[tauri::command]
-pub async fn list_drives(state: State<'_, AppStateHandle>) -> CommandResult<Vec<DriveConfig>> {
-    let app_state = state.get().ok_or_else(|| "App not yet initialized".to_string())?;
-    Ok(app_state.drive_manager.list_drives().await)
-}
-
 #[derive(serde::Deserialize)]
 pub struct AddDriveArgs {
     pub site_url: String,
@@ -98,6 +92,41 @@ pub struct AddDriveArgs {
     pub local_path: String,
     pub user_id: String,
     pub drive_id: Option<String>,
+    /// Full mirror vs. on-demand (D1/D9). Defaults to `FullMirror` so a
+    /// caller that predates this field (or simply omits it) keeps today's
+    /// behavior unchanged.
+    #[serde(default)]
+    pub mode: DriveMode,
+}
+
+/// Builds the `DriveConfig` for a brand-new drive from the command's args.
+/// Factored out of `add_drive` so the mode-threading behavior is exercised
+/// by a unit test through the exact same code the command runs.
+fn build_drive_config(
+    drive_id: String,
+    sse_client_id: String,
+    config: AddDriveArgs,
+    credentials: Credentials,
+) -> DriveConfig {
+    DriveConfig {
+        id: drive_id,
+        name: config.drive_name,
+        instance_url: config.site_url,
+        remote_path: config.remote_path,
+        credentials,
+        sync_path: config.local_path.into(),
+        icon_path: None,
+        raw_icon_path: None,
+        enabled: true,
+        user_id: config.user_id,
+        ignore_patterns: Vec::new(),
+        max_file_size_mb: 3072,
+        sse_client_id,
+        mode: config.mode,
+        // On by default, not added yet: `Mount::start` adds it.
+        sidebar: Default::default(),
+        extra: Default::default(),
+    }
 }
 
 #[tauri::command]
@@ -115,16 +144,19 @@ pub async fn add_drive(
     let access_expires = (now + Duration::seconds(config.access_token_expires as i64)).to_rfc3339();
     let refresh_expires = (now + Duration::seconds(config.refresh_token_expires as i64)).to_rfc3339();
 
+    // `build_drive_config` below takes `config` by whole-struct value, so no
+    // field of it can be moved out beforehand — clone the few fields the
+    // reauthorize branch needs instead of moving them.
     let credentials = Credentials {
-        access_token: Some(config.access_token),
-        refresh_token: config.refresh_token,
+        access_token: Some(config.access_token.clone()),
+        refresh_token: config.refresh_token.clone(),
         access_expires: Some(access_expires),
         refresh_expires,
     };
 
-    if let Some(drive_id) = config.drive_id {
+    if let Some(drive_id) = config.drive_id.clone() {
         app_state.drive_manager
-            .update_drive_credentials(&drive_id, config.drive_name, config.site_url, credentials, &config.user_id)
+            .update_drive_credentials(&drive_id, config.drive_name.clone(), config.site_url.clone(), credentials, &config.user_id)
             .await
             .map_err(|e| e.to_string())?;
         app_state.drive_manager.persist().await.map_err(|e| e.to_string())?;
@@ -133,22 +165,7 @@ pub async fn add_drive(
 
     let drive_id = Uuid::new_v4().to_string();
     let sse_client_id = Uuid::new_v4().to_string();
-    let drive_config = DriveConfig {
-        id: drive_id,
-        name: config.drive_name,
-        instance_url: config.site_url,
-        remote_path: config.remote_path,
-        credentials,
-        sync_path: config.local_path.into(),
-        icon_path: None,
-        raw_icon_path: None,
-        enabled: true,
-        user_id: config.user_id,
-        ignore_patterns: Vec::new(),
-        max_file_size_mb: 3072,
-        sse_client_id,
-        extra: Default::default(),
-    };
+    let drive_config = build_drive_config(drive_id, sse_client_id, config, credentials);
 
     let id = app_state.drive_manager.add_drive(drive_config).await.map_err(|e| e.to_string())?;
     app_state.drive_manager.persist().await.map_err(|e| e.to_string())?;
@@ -159,9 +176,10 @@ pub async fn add_drive(
 pub async fn remove_drive(
     state: State<'_, AppStateHandle>,
     drive_id: String,
-) -> CommandResult<Option<DriveConfig>> {
+) -> CommandResult<Option<DriveSummary>> {
     let app_state = state.get().ok_or_else(|| "App not yet initialized".to_string())?;
-    let result = app_state.drive_manager.remove_drive(&drive_id).await.map_err(|e| e.to_string())?;
+    // The removed drive as the UI knows it: never its tokens.
+    let result = app_state.drive_manager.remove_drive(&drive_id).await.map_err(|e| e.to_string())?.as_ref().map(DriveSummary::from);
     app_state.drive_manager.persist().await.map_err(|e| e.to_string())?;
     Ok(result)
 }
@@ -212,6 +230,29 @@ pub async fn set_drive_max_file_size(
 ) -> CommandResult<()> {
     let app_state = state.get().ok_or_else(|| "App not yet initialized".to_string())?;
     app_state.drive_manager.set_drive_max_file_size(&drive_id, max_mb).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_drive_sidebar(
+    state: State<'_, AppStateHandle>,
+    drive_id: String,
+) -> CommandResult<bool> {
+    let app_state = state.get().ok_or_else(|| "App not yet initialized".to_string())?;
+    app_state.drive_manager.get_drive_sidebar(&drive_id).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn set_drive_sidebar(
+    state: State<'_, AppStateHandle>,
+    drive_id: String,
+    enabled: bool,
+) -> CommandResult<()> {
+    let app_state = state.get().ok_or_else(|| "App not yet initialized".to_string())?;
+    app_state
+        .drive_manager
+        .set_drive_sidebar(&drive_id, enabled)
+        .await
+        .map_err(|e| t!("sidebarUpdateFailed", error = format!("{e:#}")).to_string())
 }
 
 #[tauri::command]
@@ -317,7 +358,7 @@ fn show_main_window_at_position(app: &AppHandle, position: Position) {
             let _ = window.set_focus();
         }
         Err(e) => {
-            tracing::error!(target: "main_popup", error = %e, "Failed to create main window");
+            tracing::error!(target: "main_popup", error = %format_args!("{e:#}"), "Failed to create main window");
         }
     }
 }
@@ -369,6 +410,7 @@ fn show_drive_window_internal(app: &AppHandle, title: &str, url_path: &str) {
         state: None,
         radius: None,
         color: None,
+        ..Default::default()
     };
 
     let builder = WebviewWindowBuilder::new(app, "add-drive", WebviewUrl::App(url_path.into()))
@@ -393,7 +435,7 @@ fn show_drive_window_internal(app: &AppHandle, title: &str, url_path: &str) {
             let _ = window.set_focus();
         }
         Err(e) => {
-            tracing::error!(target: "main", error = %e, "Failed to create window: {}", title);
+            tracing::error!(target: "main", error = %format_args!("{e:#}"), "Failed to create window: {}", title);
         }
     }
 }
@@ -434,7 +476,7 @@ pub fn show_settings_window_impl(app: &AppHandle) {
             let _ = window.set_focus();
         }
         Err(e) => {
-            tracing::error!(target: "main", error = %e, "Failed to create settings window");
+            tracing::error!(target: "main", error = %format_args!("{e:#}"), "Failed to create settings window");
         }
     }
 }
@@ -610,6 +652,122 @@ pub async fn get_user_profile(state: State<'_, AppStateHandle>) -> CommandResult
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// The settings window and the popup read these exact field names and
+    /// values (`ui/src/pages/settings/types.ts`, `ui/src/pages/popup/types.ts`):
+    /// a drive that could not be mounted must reach them as
+    /// `status: "mount_failed"` with its explanation, plus the count of
+    /// changes not uploaded yet that the remove dialog warns about.
+    #[test]
+    fn a_drive_that_failed_to_mount_reaches_the_ui_with_its_reason() {
+        let info = DriveInfo {
+            id: "d1".into(),
+            name: "Work".into(),
+            instance_url: "https://cloud.example".into(),
+            sync_path: "/home/ana/Cloud".into(),
+            icon_path: None,
+            remote_path: "cloudreve://my".into(),
+            raw_icon_path: None,
+            enabled: true,
+            paused: false,
+            user_id: "u".into(),
+            status: cloudreve_sync::DriveInfoStatus::MountFailed,
+            capacity: None,
+            mode: DriveMode::OnDemand,
+            mount_error: Some("Files on demand needs FUSE".into()),
+            unsynced_files: 3,
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["status"], "mount_failed");
+        assert_eq!(json["mode"], "on_demand");
+        assert_eq!(json["mount_error"], "Files on demand needs FUSE");
+        assert_eq!(json["unsynced_files"], 3);
+
+        let summary = StatusSummary {
+            drives: vec![],
+            active_tasks: vec![],
+            finished_tasks: vec![],
+            has_ever_synced: true,
+            conflicts: vec![],
+            paused_drives: vec![],
+            pending_uploads: [("d1".to_string(), 2u64)].into_iter().collect(),
+            mount_errors: [("d1".to_string(), "reason".to_string())].into_iter().collect(),
+            upload_problems: [("d1".to_string(), "storage full".to_string())].into_iter().collect(),
+        };
+        let json = serde_json::to_value(&summary).unwrap();
+        assert_eq!(json["mount_errors"]["d1"], "reason");
+        assert_eq!(json["pending_uploads"]["d1"], 2);
+        assert_eq!(json["upload_problems"]["d1"], "storage full");
+    }
+
+    /// `AddDriveArgs.mode` must default to `FullMirror` when the field is
+    /// absent (old/naive callers, and today's actual `AddDrive.tsx` before
+    /// this task wires the selector) and must carry `OnDemand` through when
+    /// present. Exercises `build_drive_config`, the exact helper `add_drive`
+    /// calls, so this cannot pass while the command still hardcodes the mode.
+    #[test]
+    fn add_drive_args_mode_defaults_to_full_mirror_and_threads_on_demand() {
+        let with_mode: AddDriveArgs = serde_json::from_str(
+            r#"{
+                "site_url": "https://example.com",
+                "access_token": "at",
+                "refresh_token": "rt",
+                "access_token_expires": 3600,
+                "refresh_token_expires": 3600,
+                "drive_name": "My Drive",
+                "remote_path": "/",
+                "local_path": "/tmp/drive",
+                "user_id": "u1",
+                "mode": "on_demand"
+            }"#,
+        )
+        .expect("valid AddDriveArgs JSON with mode");
+        assert_eq!(with_mode.mode, DriveMode::OnDemand);
+
+        let without_mode: AddDriveArgs = serde_json::from_str(
+            r#"{
+                "site_url": "https://example.com",
+                "access_token": "at",
+                "refresh_token": "rt",
+                "access_token_expires": 3600,
+                "refresh_token_expires": 3600,
+                "drive_name": "My Drive",
+                "remote_path": "/",
+                "local_path": "/tmp/drive",
+                "user_id": "u1"
+            }"#,
+        )
+        .expect("valid AddDriveArgs JSON without mode");
+        assert_eq!(without_mode.mode, DriveMode::FullMirror);
+
+        let credentials = Credentials {
+            access_token: Some("at".into()),
+            refresh_token: "rt".into(),
+            access_expires: Some("2030-01-01T00:00:00Z".into()),
+            refresh_expires: "2030-01-01T00:00:00Z".into(),
+        };
+
+        let on_demand_config = build_drive_config(
+            "drive-1".into(),
+            "sse-1".into(),
+            with_mode,
+            credentials.clone(),
+        );
+        assert_eq!(on_demand_config.mode, DriveMode::OnDemand);
+
+        let mirror_config = build_drive_config(
+            "drive-2".into(),
+            "sse-2".into(),
+            without_mode,
+            credentials,
+        );
+        assert_eq!(mirror_config.mode, DriveMode::FullMirror);
+        // Every new drive shows in the sidebar until the user says otherwise.
+        assert!(mirror_config.sidebar.enabled && !mirror_config.sidebar.added);
+        assert!(on_demand_config.sidebar.enabled && !on_demand_config.sidebar.added);
+    }
+
     /// The Settings dialog displays whatever this command returns, and nothing
     /// else describes the built-in rules. Wiring it to the drive's own list, or
     /// to an empty vector, would put the defaults back out of sight — a file

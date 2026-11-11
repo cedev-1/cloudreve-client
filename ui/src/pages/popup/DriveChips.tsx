@@ -1,5 +1,5 @@
 import { Box, Chip, styled } from "@mui/material";
-import { Add as AddIcon } from "@mui/icons-material";
+import { Add as AddIcon, CloudUpload as CloudUploadIcon } from "@mui/icons-material";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { convertFileSrc } from "@tauri-apps/api/core";
@@ -20,6 +20,7 @@ interface DriveChipsProps {
   selectedDrive: string | null;
   onDriveSelect: (driveId: string | null) => void;
   onAddDrive: () => void;
+  pendingUploads?: Record<string, number>;
 }
 
 export default function DriveChips({
@@ -27,6 +28,7 @@ export default function DriveChips({
   selectedDrive,
   onDriveSelect,
   onAddDrive,
+  pendingUploads,
 }: DriveChipsProps) {
   const { t } = useTranslation();
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -148,24 +150,66 @@ export default function DriveChips({
           selected={selectedDrive === null}
           onClick={() => onDriveSelect(null)}
         />
-        {drives.map((drive) => (
-          <StyledChip
-            key={drive.id}
-            icon={
-              drive.icon_path ? (
-                <img
-                  src={convertFileSrc(drive.icon_path)}
-                  alt=""
-                  style={{ width: 18,borderRadius:"6px", height: 18 }}
-                />
-              ) : undefined
-            }
-            label={drive.name}
-            size="small"
-            selected={selectedDrive === drive.id}
-            onClick={() => onDriveSelect(drive.id)}
-          />
-        ))}
+        {drives.map((drive) => {
+          const pendingCount = pendingUploads?.[drive.id] ?? 0;
+          return (
+            <StyledChip
+              key={drive.id}
+              icon={
+                drive.icon_path ? (
+                  <img
+                    src={convertFileSrc(drive.icon_path)}
+                    alt=""
+                    style={{ width: 18,borderRadius:"6px", height: 18 }}
+                  />
+                ) : undefined
+              }
+              label={
+                <Box component="span" sx={{ display: "inline-flex", alignItems: "center", gap: 0.5 }}>
+                  <span>{drive.name}</span>
+                  <Box
+                    component="span"
+                    sx={{
+                      fontSize: 10,
+                      lineHeight: 1.4,
+                      px: 0.5,
+                      borderRadius: 0.75,
+                      bgcolor: "action.selected",
+                      color: "text.secondary",
+                    }}
+                  >
+                    {drive.mode === "on_demand"
+                      ? t("settings.driveMode.onDemand")
+                      : t("settings.driveMode.mirror")}
+                  </Box>
+                  {pendingCount > 0 && (
+                    <Box
+                      component="span"
+                      title={t("popup.pendingUploads", "{{count}} pending upload(s)", { count: pendingCount })}
+                      sx={{
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: 0.25,
+                        fontSize: 10,
+                        lineHeight: 1.4,
+                        px: 0.5,
+                        borderRadius: 0.75,
+                        bgcolor: "primary.main",
+                        color: "primary.contrastText",
+                      }}
+                    >
+                      <CloudUploadIcon sx={{ fontSize: 10 }} />
+                      {pendingCount}
+                    </Box>
+                  )}
+                </Box>
+              }
+              size="small"
+              selected={selectedDrive === drive.id}
+              onClick={() => onDriveSelect(drive.id)}
+            />
+          );
+        })}
         <Chip
           icon={<AddIcon />}
           label={t("popup.newDrive", "New Drive")}

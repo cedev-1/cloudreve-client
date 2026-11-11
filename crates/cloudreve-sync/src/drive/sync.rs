@@ -1,4 +1,4 @@
-use crate::drive::mounts::Mount;
+use crate::drive::mounts::{DriveMode, Mount};
 use crate::drive::utils::{is_partial_download, remote_path_to_local_relative_path};
 use crate::inventory::{MetadataEntry, FileMetadata};
 use crate::tasks::TaskPayload;
@@ -121,7 +121,7 @@ async fn warn_if_sync_will_not_fit(mount: &Mount, local_root: &PathBuf, needed: 
             tracing::warn!(
                 target: "drive::sync",
                 id = %mount.id,
-                error = %e,
+                error = %format_args!("{e:#}"),
                 "Failed to query available disk space"
             );
         }
@@ -129,6 +129,21 @@ async fn warn_if_sync_will_not_fit(mount: &Mount, local_root: &PathBuf, needed: 
 }
 
 pub async fn full_sync(mount: &Mount, local_root: &PathBuf, remote_path: &str) -> Result<()> {
+    // Unreachable guard (D2): an on-demand drive never triggers a full sync
+    // — no fs watcher event enqueues `SyncMode::Full`, and `DriveManager`
+    // skips both the initial and periodic `FullSync` command for it. This
+    // is the single choke point every full-sync path (`perform_sync`'s
+    // `SyncMode::Full` branch and `perform_full_sync`) funnels through, so
+    // one guard here covers both call sites documented in the plan.
+    if mount.get_config().await.mode == DriveMode::OnDemand {
+        tracing::warn!(
+            target: "drive::sync",
+            id = %mount.id,
+            "full_sync called for an on-demand drive — this should be unreachable; on-demand \
+             drives never trigger a full sync"
+        );
+        return Ok(());
+    }
     if mount.is_paused() {
         tracing::info!(target: "drive::sync", id = %mount.id, "Sync skipped: drive is paused");
         return Ok(());
@@ -144,8 +159,13 @@ pub async fn full_sync(mount: &Mount, local_root: &PathBuf, remote_path: &str) -
         .filter(|f| f.file_type != file_type::FOLDER)
         .filter_map(|f| {
             let uri = CrUri::new(&f.path).ok()?;
-            let rel = remote_path_to_local_relative_path(&uri, &remote_base).ok()?;
-            Some((rel, f))
+            match remote_path_to_local_relative_path(&uri, &remote_base) {
+                Ok(rel) => Some((rel, f)),
+                Err(e) => {
+                    tracing::warn!(target: "drive::sync", id = %mount.id, error = %format_args!("{e:#}"), "Skipping a listed entry with an unsafe path");
+                    None
+                }
+            }
         })
         .collect();
 
@@ -353,7 +373,7 @@ pub async fn full_sync(mount: &Mount, local_root: &PathBuf, remote_path: &str) -
                         crate::utils::toast::send_conflict_toast(
                             &mount.id,
                             &local_path,
-                            db_entry.id,
+                            None,
                         );
                         mount.task_queue.notifier().notify();
                         continue;
@@ -527,14 +547,26 @@ async fn walk_local(root: PathBuf) -> Result<Vec<PathBuf>> {
             );
         }
         let mut files = Vec::new();
-        walk_dir_recursive(&root, &mut files)?;
+        let device = device_of(&root);
+        walk_dir_recursive(&root, device, &mut files)?;
         Ok(files)
     })
     .await
     .context("Local walk panicked")?
 }
 
-fn walk_dir_recursive(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+/// The device (`st_dev`) `path` lives on, `None` when it cannot be read.
+fn device_of(path: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| m.dev())
+}
+
+/// `device`: the sync folder's. A directory on another device is a volume
+/// mounted inside the folder (an external disk, a network share, another
+/// drive's on-demand mount): not part of this drive. Walking into it would
+/// upload all of it, and unmounting it would then look like the user
+/// deleting every file.
+fn walk_dir_recursive(dir: &Path, device: Option<u64>, files: &mut Vec<PathBuf>) -> Result<()> {
     // Only the root is a hard requirement; a subdirectory removed mid-walk is
     // ordinary churn, not a reason to abort the whole sync.
     if !dir.is_dir() {
@@ -544,7 +576,11 @@ fn walk_dir_recursive(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
         let entry = entry?;
         let path = entry.path();
         if path.is_dir() {
-            walk_dir_recursive(&path, files)?;
+            if device.is_some() && device_of(&path) != device {
+                tracing::debug!(target: "drive::sync", path = %path.display(), "Not scanning a volume mounted inside the sync folder");
+                continue;
+            }
+            walk_dir_recursive(&path, device, files)?;
         } else if !is_partial_download(&path) {
             // A download in flight is not a local file the user created.
             files.push(path);

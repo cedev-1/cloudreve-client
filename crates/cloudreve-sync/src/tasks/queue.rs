@@ -73,6 +73,15 @@ pub struct TaskQueue {
 }
 
 impl TaskQueue {
+    /// `resume_on_start`: whether to replay Pending/Running tasks left in
+    /// the inventory from a previous run (`resume_incomplete_tasks`).
+    /// `false` for an on-demand drive (phase 4, D2) — the least-invasive
+    /// seam for that: this is the queue's only constructor and its only
+    /// caller (`Mount::new`), so a plain bool threaded straight through
+    /// avoids a second constructor or a wrapper type just to skip one
+    /// internal call. There is no local mirror for a stale on-demand task
+    /// to apply to, and the queue otherwise stays inert for that mode (no
+    /// fs watcher, no full sync ever enqueues into it either).
     pub async fn new(
         drive_id: impl Into<String>,
         cr_client: Arc<Client>,
@@ -84,6 +93,7 @@ impl TaskQueue {
         max_file_size_mb: u64,
         notifier: Arc<SummaryNotifier>,
         ignore: &IgnoreMatcher,
+        resume_on_start: bool,
     ) -> Arc<Self> {
         let drive_id = drive_id.into();
         let max_concurrent = config.max_concurrent.max(1);
@@ -113,11 +123,13 @@ impl TaskQueue {
         });
 
         queue.spawn_dispatcher(command_rx).await;
-        if let Err(err) = queue.resume_incomplete_tasks(ignore).await {
+        if resume_on_start
+            && let Err(err) = queue.resume_incomplete_tasks(ignore).await
+        {
             warn!(
                 target: "tasks::queue",
                 drive = %queue.drive_id,
-                error = %err,
+                error = %format_args!("{err:#}"),
                 "Failed to resume pending tasks from inventory"
             );
         }
@@ -280,7 +292,7 @@ impl TaskQueue {
         self.cancel_requested.store(true, Ordering::SeqCst);
 
         if let Err(err) = self.command_tx.send(QueueCommand::Shutdown) {
-            warn!(target: "tasks::queue", error = %err, "Task queue dispatcher already closed");
+            warn!(target: "tasks::queue", error = %format_args!("{err:#}"), "Task queue dispatcher already closed");
         }
 
         if let Some(handle) = self.dispatcher_handle.lock().await.take() {
@@ -374,7 +386,7 @@ impl TaskQueue {
             let payload = match Self::payload_from_record(&record) {
                 Ok(p) => p,
                 Err(err) => {
-                    warn!(target: "tasks::queue", task_id = %record.id, error = %err, "Failed to build payload");
+                    warn!(target: "tasks::queue", task_id = %record.id, error = %format_args!("{err:#}"), "Failed to build payload");
                     continue;
                 }
             };
@@ -528,7 +540,7 @@ impl TaskQueue {
 
         // Cancel pending tasks in the DB
         if let Err(e) = self.inventory.cancel_all_active_tasks(&self.drive_id) {
-            warn!(target: "tasks::queue", error = %e, "Failed to cancel active tasks in inventory");
+            warn!(target: "tasks::queue", error = %format_args!("{e:#}"), "Failed to cancel active tasks in inventory");
         }
 
         self.notifier.notify();
@@ -581,7 +593,7 @@ impl TaskQueue {
                 error!(
                     target: "tasks::queue",
                     drive = %self.drive_id,
-                    error = %err,
+                    error = %format_args!("{err:#}"),
                     "Failed to acquire semaphore permit"
                 );
                 if let Err(update_err) = self.inventory.update_task(
@@ -680,7 +692,7 @@ impl TaskQueue {
                     target: "tasks::queue",
                     drive = %self.drive_id,
                     task_id = %task.task_id,
-                    error = %err,
+                    error = %format_args!("{err:#}"),
                     "Failed to check task status, proceeding with execution"
                 );
             }
@@ -698,7 +710,7 @@ impl TaskQueue {
                 target: "tasks::queue",
                 drive = %self.drive_id,
                 task_id = %task.task_id,
-                error = %err,
+                error = %format_args!("{err:#}"),
                 "Failed to mark task as running"
             );
             return;
@@ -724,7 +736,7 @@ impl TaskQueue {
                         target: "tasks::queue",
                         drive = %self.drive_id,
                         task_id = %task.task_id,
-                        error = %err,
+                        error = %format_args!("{err:#}"),
                         "Failed to mark task as completed"
                     );
                 }
@@ -742,7 +754,7 @@ impl TaskQueue {
                         target: "tasks::queue",
                         drive = %self.drive_id,
                         task_id = %task.task_id,
-                        error = %err,
+                        error = %format_args!("{err:#}"),
                         "Failed to mark task as cancelled"
                     );
                 }
@@ -897,7 +909,7 @@ impl TaskQueue {
         //             target: "tasks::queue",
         //             drive = %self.drive_id,
         //             task_id = %task.task_id,
-        //             error = %err,
+        //             error = %format_args!("{err:#}"),
         //             "Failed to persist placeholder progress"
         //         );
         //     }
@@ -1003,7 +1015,7 @@ impl TaskQueue {
                         target: "tasks::queue",
                         drive = %self.drive_id,
                         task_id = %record.id,
-                        error = %err,
+                        error = %format_args!("{err:#}"),
                         "Failed to build payload for resumed task"
                     );
                     continue;

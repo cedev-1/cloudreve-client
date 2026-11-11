@@ -21,7 +21,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::{
-    drive::{event_blocker::EventBlocker, utils::local_path_to_cr_uri},
+    drive::{event_blocker::EventBlocker, utils::{is_inside, local_path_to_cr_uri}},
     events::SummaryNotifier,
     inventory::{local_mtime_secs, ConflictState, FileMetadata, InventoryDb, MetadataEntry},
     tasks::queue::QueuedTask,
@@ -208,6 +208,14 @@ impl<'a> DownloadTask<'a> {
         let local_path = self.task.payload.local_path.clone();
         info!(target: "tasks::download", task_id = %self.task.task_id, path = %local_path.display(), "Starting download");
 
+        // Defense in depth, before anything below can write or remove a
+        // file: paths built from server data are already checked
+        // (`safe_relative_path`), but this is the one place every download
+        // passes through, whatever queued it.
+        if !is_inside(&self.sync_path, &local_path) {
+            anyhow::bail!("refusing to download outside the sync folder: {}", local_path.display());
+        }
+
         // Compute remote URI
         let uri = local_path_to_cr_uri(local_path.clone(), self.sync_path.clone(), self.remote_base.clone())
             .context("failed to compute remote URI")?
@@ -241,7 +249,7 @@ impl<'a> DownloadTask<'a> {
                             target: "tasks::download",
                             task_id = %self.task.task_id,
                             path = %local_path.display(),
-                            error = %e,
+                            error = %format_args!("{e:#}"),
                             "Failed to remove local file mirroring remote deletion"
                         );
                     }
@@ -300,7 +308,7 @@ impl<'a> DownloadTask<'a> {
                             warn!(target: "tasks::download", error = ?e, "Failed to mark conflict");
                         }
                     }
-                    send_conflict_toast(self.drive_id, &local_path, meta.id);
+                    send_conflict_toast(self.drive_id, &local_path, None);
                     return Ok(());
                 }
             }
@@ -341,7 +349,7 @@ impl<'a> DownloadTask<'a> {
             self.cr_client.rewrite_url_origin(&raw)
         };
 
-        debug!(target: "tasks::download", task_id = %self.task.task_id, url = %download_url, size = file_size, "Got download URL");
+        debug!(target: "tasks::download", task_id = %self.task.task_id, url = %cloudreve_api::redact::redact_url(&download_url), size = file_size, "Got download URL");
 
         // Create parent directory
         if let Some(parent) = local_path.parent() {
@@ -397,7 +405,7 @@ impl<'a> DownloadTask<'a> {
                             .with_size(file_info.size)
                             .with_local_mtime(local_mtime_secs(&local_path));
                         if let Err(e) = self.inventory.upsert(&entry) {
-                            warn!(target: "tasks::download", task_id = %self.task.task_id, error = %e, "Failed to update inventory after download");
+                            warn!(target: "tasks::download", task_id = %self.task.task_id, error = %format_args!("{e:#}"), "Failed to update inventory after download");
                         }
                     }
                 }
@@ -418,7 +426,7 @@ impl<'a> DownloadTask<'a> {
         reporter: &InMemoryDownloadProgressReporter,
     ) -> Result<()> {
         let client = reqwest::Client::new();
-        let response = client.get(url).send().await.context("download request failed")?;
+        let response = client.get(url).send().await.map_err(|e| e.without_url()).context("download request failed")?;
 
         if !response.status().is_success() {
             anyhow::bail!("Download failed with status: {}", response.status());
@@ -433,7 +441,7 @@ impl<'a> DownloadTask<'a> {
             if self.cancel_token.is_cancelled() {
                 anyhow::bail!("Download cancelled");
             }
-            let chunk = chunk_result.context("failed to read download chunk")?;
+            let chunk = chunk_result.map_err(|e| e.without_url()).context("failed to read download chunk")?;
             file.write_all(&chunk).await.context("failed to write chunk")?;
             tracker.add_bytes(chunk.len() as u64);
             if last_report.elapsed() >= REPORT_INTERVAL {

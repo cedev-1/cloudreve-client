@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -13,6 +13,18 @@ static OS_NOTIFIER: OnceLock<UnboundedSender<(String, String)>> = OnceLock::new(
 /// A sync short on space hits the guard on every single file, so the warning is
 /// rate-limited per drive rather than repeated hundreds of times.
 static LOW_DISK_THROTTLE: LazyLock<Throttle> =
+    LazyLock::new(|| Throttle::new(Duration::from_secs(3600)));
+
+/// An on-demand drive's effective cache cap (D3) is recomputed on every
+/// mount/remount (pause+resume, app relaunch), which would otherwise repeat
+/// the same warning every time — throttled per drive like the low-disk-space
+/// warning above.
+static SMALL_VFS_CACHE_THROTTLE: LazyLock<Throttle> =
+    LazyLock::new(|| Throttle::new(Duration::from_secs(3600)));
+
+/// A drive whose uploads keep failing would otherwise notify on every
+/// retry cycle; once an hour per drive is enough to be heard.
+static UPLOAD_PROBLEM_THROTTLE: LazyLock<Throttle> =
     LazyLock::new(|| Throttle::new(Duration::from_secs(3600)));
 
 /// Rate limiter keyed by an arbitrary string (a drive id, in practice).
@@ -59,13 +71,14 @@ fn push_notification(title: impl Into<String>, body: impl Into<String>) {
 
 /// Send a general text notification.
 pub fn send_general_text_toast(title: &str, message: &str) {
-    tracing::info!(target: "toast", title = title, message = message, "Notification");
+    // The message often holds file paths: the title says what it was about.
+    tracing::info!(target: "toast", title = title, "Notification");
     push_notification(title, message);
 }
 
 /// Send a warning notification.
 pub fn send_warning_toast(title: &str, message: &str) {
-    tracing::warn!(target: "toast", title = title, message = message, "Warning notification");
+    tracing::warn!(target: "toast", title = title, "Warning notification");
     push_notification(title, message);
 }
 
@@ -82,30 +95,28 @@ pub fn send_token_expiry_toast(drive_id: &str, title: &str, message: &str) {
         target: "toast",
         drive_id = drive_id,
         title = title,
-        message = message,
         "Token expiry notification"
     );
     push_notification(title, message);
 }
 
-/// Send a file conflict notification.
+/// Send a file conflict notification: which file, and — when the other
+/// version was kept as a copy (on-demand drives) — where that copy is.
 /// Respects the notify_file_conflict config setting.
-pub fn send_conflict_toast(_drive_id: &str, path: &PathBuf, _inventory_id: i64) {
+pub fn send_conflict_toast(drive_id: &str, path: &Path, conflict_copy: Option<&Path>) {
     if let Some(config) = ConfigManager::try_get() {
         if !config.notify_file_conflict() {
             tracing::debug!(target: "toast", "Conflict notification suppressed by config");
             return;
         }
     }
-    tracing::warn!(
-        target: "toast",
-        path = %path.display(),
-        "File conflict notification"
-    );
-    push_notification(
-        "Sync Conflict",
-        format!("File conflict: {}", path.display()),
-    );
+    tracing::warn!(target: "toast", drive_id, path = %path.display(), "File conflict notification");
+    let mut body = path.display().to_string();
+    if let Some(copy) = conflict_copy {
+        body.push('\n');
+        body.push_str(&t!("conflictCopySaved", copy = copy.display().to_string()));
+    }
+    push_notification(t!("conflictToastTitle"), body);
 }
 
 /// Warn that a sync needs more room than the volume has. Throttled to at most
@@ -115,10 +126,11 @@ pub fn send_low_disk_space_toast(drive_id: &str, drive_name: &str, required: u64
         return;
     }
     let clamp = |b: u64| b.min(i64::MAX as u64) as i64;
-    let message = format!(
-        "{drive_name} needs {} but only {} is available on this volume. Some files will not be downloaded.",
-        format_bytes(clamp(required)),
-        format_bytes(clamp(available)),
+    let message = t!(
+        "lowDiskSpaceMessage",
+        drive = drive_name,
+        required = format_bytes(clamp(required)),
+        available = format_bytes(clamp(available))
     );
     tracing::warn!(
         target: "toast",
@@ -127,7 +139,40 @@ pub fn send_low_disk_space_toast(drive_id: &str, drive_name: &str, required: u64
         available = available,
         "Low disk space notification"
     );
-    push_notification("Not enough disk space", message);
+    push_notification(t!("lowDiskSpaceTitle"), message);
+}
+
+/// Tell the user why a drive's uploads keep failing (`message`, already
+/// in plain language — see `drive::upload_health`). At most once an hour
+/// per drive.
+pub fn send_upload_problem_toast(drive_id: &str, message: &str) {
+    if !UPLOAD_PROBLEM_THROTTLE.allow(drive_id) {
+        return;
+    }
+    tracing::warn!(target: "toast", drive_id, "Upload problem notification");
+    push_notification(t!("uploadFailedTitle"), message);
+}
+
+/// Warn that an on-demand drive's effective cache cap (D3) was clamped
+/// below the 10 GiB default because of limited free space. Throttled to at
+/// most one notification per hour per drive.
+pub fn send_small_vfs_cache_toast(drive_id: &str, drive_name: &str, cap: u64) {
+    if !SMALL_VFS_CACHE_THROTTLE.allow(drive_id) {
+        return;
+    }
+    let clamp = |b: u64| b.min(i64::MAX as u64) as i64;
+    let message = t!(
+        "limitedOnDemandCacheMessage",
+        drive = drive_name,
+        cap = format_bytes(clamp(cap))
+    );
+    tracing::warn!(
+        target: "toast",
+        drive_id = drive_id,
+        cap = cap,
+        "Small on-demand cache cap notification"
+    );
+    push_notification(t!("limitedOnDemandCacheTitle"), message);
 }
 
 #[cfg(test)]

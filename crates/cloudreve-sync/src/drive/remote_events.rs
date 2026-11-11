@@ -1,4 +1,4 @@
-use crate::drive::{commands::MountCommand, mounts::Mount, sync::SyncMode};
+use crate::drive::{commands::MountCommand, mounts::DriveMode, mounts::Mount, sync::SyncMode};
 use anyhow::{Context, Result};
 use cloudreve_api::{
     api::explorer::FileEventsApi,
@@ -6,10 +6,11 @@ use cloudreve_api::{
 };
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
+use crate::drive::utils::{is_inside, safe_relative_path};
 
 const INITIAL_BACKOFF_SECS: u64 = 1;
 // Cap low enough that the client recovers quickly once the server is back:
@@ -46,6 +47,32 @@ impl BackoffState {
     }
 }
 
+/// The local path an SSE event's `from`/`to` names under `sync_root`, or
+/// `None` when it names nothing there: the root itself, or a path that
+/// would escape the sync folder (see `safe_relative_path`) — the event is
+/// then dropped rather than acted upon.
+fn local_event_path(sync_root: &Path, event_path: &str) -> Option<PathBuf> {
+    if event_path.trim_matches('/').is_empty() {
+        return None;
+    }
+    match safe_relative_path(event_path) {
+        Some(rel) => Some(sync_root.join(rel)),
+        None => {
+            tracing::warn!(target: "drive::remote_events", path = event_path, "Ignoring a remote event whose path escapes the sync folder");
+            None
+        }
+    }
+}
+
+/// Consecutive failures after which the outage is logged as an error.
+const ERROR_AFTER_FAILURES: u32 = 5;
+
+/// How to log the `retry_count`-th consecutive subscription failure: a
+/// warning each time, and one error when the outage starts to last.
+fn failure_log_level(retry_count: u32) -> Option<tracing::Level> {
+    if retry_count == ERROR_AFTER_FAILURES { Some(tracing::Level::ERROR) } else { Some(tracing::Level::WARN) }
+}
+
 #[cfg(test)]
 mod backoff_tests {
     use super::*;
@@ -66,6 +93,18 @@ mod backoff_tests {
             Duration::from_secs(MAX_BACKOFF_SECS),
             "repeated failures must settle at the max delay, not stop"
         );
+    }
+
+    /// A server unreachable for a moment (a laptop waking up, a proxy
+    /// restart) is routine: warnings. Still failing after a while, it is an
+    /// error — logged once, not on every retry.
+    #[test]
+    fn only_a_lasting_outage_is_logged_as_an_error_and_only_once() {
+        let levels: Vec<_> = (1..=12).map(failure_log_level).collect();
+        assert_eq!(levels.iter().filter(|l| **l == Some(tracing::Level::ERROR)).count(), 1, "{levels:?}");
+        assert_eq!(levels[0], Some(tracing::Level::WARN));
+        assert_eq!(levels[1], Some(tracing::Level::WARN));
+        assert!(levels[11].is_some(), "a lasting outage still shows in the log: {levels:?}");
     }
 
     /// A successful connection resets the backoff to the initial delay.
@@ -119,13 +158,12 @@ impl Mount {
                 }
                 ListenResult::Error(e) => {
                     let delay = backoff.next_delay();
-                    tracing::error!(
-                        target: "drive::remote_events",
-                        error = %e,
-                        retry_count = backoff.retry_count,
-                        delay_secs = delay.as_secs(),
-                        "Failed to listen to remote events, retrying"
-                    );
+                    // The one log line per failure (`listen_remote_events` logs none).
+                    if failure_log_level(backoff.retry_count) == Some(tracing::Level::ERROR) {
+                        tracing::error!(target: "drive::remote_events", id = %s.id, error = %format_args!("{e:#}"), retry_count = backoff.retry_count, delay_secs = delay.as_secs(), "Remote events still unreachable, retrying");
+                    } else {
+                        tracing::warn!(target: "drive::remote_events", id = %s.id, error = %format_args!("{e:#}"), retry_count = backoff.retry_count, delay_secs = delay.as_secs(), "Failed to listen to remote events, retrying");
+                    }
                     tokio::time::sleep(delay).await;
                 }
             }
@@ -145,7 +183,6 @@ impl Mount {
                 sub
             }
             Err(e) => {
-                tracing::warn!(target: "drive::remote_events", id = %self.id, remote_base = %remote_base, error = %e, "SSE subscription failed");
                 self.set_event_push_subscribed(false).await;
                 return ListenResult::Error(e.into());
             }
@@ -188,9 +225,7 @@ impl Mount {
                     }
                     FileEvent::Resumed => {
                         self.set_event_push_subscribed(true).await;
-                        if let Err(e) = self.re_enqueue_offline_tasks().await {
-                            tracing::warn!(target: "drive::remote_events", error = %e, "Failed to re-enqueue offline tasks on resume");
-                        }
+                        self.retry_after_reconnect().await;
                         // The server replayed every event missed while we were
                         // disconnected (buffered per Client-Id): nothing was
                         // lost, so no full sync is needed. Proxies like
@@ -201,11 +236,26 @@ impl Mount {
                     }
                     FileEvent::Subscribed => {
                         self.set_event_push_subscribed(true).await;
-                        if let Err(e) = self.re_enqueue_offline_tasks().await {
-                            tracing::warn!(target: "drive::remote_events", error = %e, "Failed to re-enqueue offline tasks on subscribe");
+                        self.retry_after_reconnect().await;
+                        // D4/D2: a brand-new subscription means the server-side
+                        // event buffer is gone — events may have been missed.
+                        // `FullMirror` recovers by re-listing the whole drive
+                        // (`FullSync`, already a no-op for on-demand — Task 4's
+                        // guard in `mounts.rs`'s command processor). `OnDemand`
+                        // has no local mirror to re-list at all: instead,
+                        // forget the root's cached listing so the very next
+                        // readdir/lookup anywhere under it refetches rather
+                        // than possibly serving a listing that predates
+                        // whatever was missed.
+                        if self.config.read().await.mode == DriveMode::OnDemand {
+                            if let Some(vfs) = self.vfs.lock().await.clone() {
+                                let remote_base = self.config.read().await.remote_path.clone();
+                                vfs.remote_changed(&remote_base).await;
+                            }
+                        } else {
+                            tracing::info!(target: "drive::remote_events", "New subscription, triggering full sync");
+                            let _ = self.command_tx.send(MountCommand::FullSync);
                         }
-                        tracing::info!(target: "drive::remote_events", "New subscription, triggering full sync");
-                        let _ = self.command_tx.send(MountCommand::FullSync);
                     }
                     FileEvent::KeepAlive => {
                         tracing::trace!(target: "drive::remote_events", "Keep-alive");
@@ -219,11 +269,45 @@ impl Mount {
         }
     }
 
+    /// D4: reconnect recovery is mode-aware. `FullMirror` replays parked
+    /// tasks through the task queue (`re_enqueue_offline_tasks`, which
+    /// already no-ops for on-demand — Task 4's guard in `mounts.rs`). An
+    /// `OnDemand` drive has no task queue for that to go through at all —
+    /// instead, every draft still `Pending` gets re-armed for immediate
+    /// upload (`Vfs::retry_pending_uploads`), the on-demand equivalent of
+    /// "catch up on whatever this drive owed the server while disconnected".
+    async fn retry_after_reconnect(&self) {
+        if self.config.read().await.mode == DriveMode::OnDemand {
+            if let Some(vfs) = self.vfs.lock().await.clone() {
+                let n = vfs.retry_pending_uploads().await;
+                tracing::info!(
+                    target: "drive::remote_events",
+                    id = %self.id,
+                    count = n,
+                    "Reconnect: retried pending on-demand uploads"
+                );
+            }
+            return;
+        }
+        if let Err(e) = self.re_enqueue_offline_tasks().await {
+            tracing::warn!(target: "drive::remote_events", error = %format_args!("{e:#}"), "Failed to re-enqueue offline tasks on reconnect");
+        }
+    }
+
     async fn handle_file_events(
         &self,
         sync_root: PathBuf,
         events: Vec<FileEventData>,
     ) -> Result<()> {
+        // Tracked obligation (Task-4 review): an on-demand drive has no
+        // local mirror for the full-mirror handlers below to enqueue
+        // downloads/deletes INTO — routing SSE events through them would
+        // write into the mounted volume behind the vfs's back. This branch
+        // is the ONLY thing an on-demand drive's file events ever reach.
+        if self.config.read().await.mode == DriveMode::OnDemand {
+            return self.handle_file_events_on_demand(events).await;
+        }
+
         let mut create_update: Vec<FileEventData> = Vec::new();
         let mut rename: Vec<FileEventData> = Vec::new();
         let mut delete: Vec<FileEventData> = Vec::new();
@@ -249,33 +333,60 @@ impl Mount {
         Ok(())
     }
 
+    /// D4 (on-demand): folds a batch of SSE events straight into vfs tree
+    /// invalidation — no local paths, no `task_queue`, no `command_tx`.
+    /// `Vfs::remote_changed` already does the heavy lifting for a single
+    /// call (tree invalidation of the path and its parent, then a refresh of
+    /// that folder in any open file-manager window, coalesced per folder —
+    /// see `cloudreve_vfs::nudge`), so this only needs to call it once per
+    /// event's `from`, plus once more for `to` on a rename: the source's old
+    /// parent and the destination's (possibly different) new parent both
+    /// need their cached listing forgotten and their window refreshed.
+    async fn handle_file_events_on_demand(&self, events: Vec<FileEventData>) -> Result<()> {
+        let Some(vfs) = self.vfs.lock().await.clone() else {
+            // `start()` hasn't finished building the vfs yet (or this drive
+            // was never actually on-demand — shouldn't happen, the caller
+            // already checked `mode`). Nothing to invalidate against.
+            return Ok(());
+        };
+        let remote_base = self.config.read().await.remote_path.clone();
+
+        for event in &events {
+            vfs.remote_changed(&event_path_to_remote_uri(&remote_base, &event.from)).await;
+            if event.event_type == FileEventType::Rename && !event.to.is_empty() {
+                vfs.remote_changed(&event_path_to_remote_uri(&remote_base, &event.to)).await;
+            }
+        }
+        Ok(())
+    }
+
     async fn handle_rename_events(&self, sync_root: PathBuf, events: Vec<FileEventData>) -> Result<()> {
         let mut from_grouped: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
         let mut to_grouped: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
 
         for event in events {
-            let from_rel: PathBuf = event.from.trim_start_matches('/').split('/').collect();
-            let local_from = sync_root.join(&from_rel);
-            if local_from.exists() {
-                if let Some(parent) = local_from.parent() {
-                    from_grouped.entry(parent.to_path_buf()).or_default().push(local_from.clone());
+            if let Some(local_from) = local_event_path(&sync_root, &event.from) {
+                if local_from.exists() {
+                    if let Some(parent) = local_from.parent() {
+                        from_grouped.entry(parent.to_path_buf()).or_default().push(local_from.clone());
+                    }
+                }
+
+                // Cancel any pending tasks for the old path since the file was moved remotely
+                if let Err(e) = self.task_queue.cancel_by_path(&local_from).await {
+                    tracing::warn!(
+                        target: "drive::remote_events",
+                        path = %local_from.display(),
+                        error = %format_args!("{e:#}"),
+                        "Failed to cancel tasks for renamed-from path"
+                    );
                 }
             }
 
-            // Cancel any pending tasks for the old path since the file was moved remotely
-            if let Err(e) = self.task_queue.cancel_by_path(&local_from).await {
-                tracing::warn!(
-                    target: "drive::remote_events",
-                    path = %local_from.display(),
-                    error = %e,
-                    "Failed to cancel tasks for renamed-from path"
-                );
-            }
-
-            let to_rel: PathBuf = event.to.trim_start_matches('/').split('/').collect();
-            let local_to = sync_root.join(&to_rel);
-            if let Some(parent) = local_to.parent() {
-                to_grouped.entry(parent.to_path_buf()).or_default().push(local_to);
+            if let Some(local_to) = local_event_path(&sync_root, &event.to) {
+                if let Some(parent) = local_to.parent() {
+                    to_grouped.entry(parent.to_path_buf()).or_default().push(local_to);
+                }
             }
         }
 
@@ -288,8 +399,9 @@ impl Mount {
     async fn handle_delete_events(&self, sync_root: PathBuf, events: Vec<FileEventData>) -> Result<()> {
         let mut grouped: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
         for event in events {
-            let rel: PathBuf = event.from.trim_start_matches('/').split('/').collect();
-            let local_path = sync_root.join(&rel);
+            let Some(local_path) = local_event_path(&sync_root, &event.from) else {
+                continue;
+            };
             if local_path.exists() {
                 if let Some(parent) = local_path.parent() {
                     grouped.entry(parent.to_path_buf()).or_default().push(local_path);
@@ -305,8 +417,9 @@ impl Mount {
     async fn handle_create_update_events(&self, sync_root: PathBuf, events: Vec<FileEventData>) -> Result<()> {
         let mut grouped: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
         for event in events {
-            let rel: PathBuf = event.from.trim_start_matches('/').split('/').collect();
-            let local_path = sync_root.join(&rel);
+            let Some(local_path) = local_event_path(&sync_root, &event.from) else {
+                continue;
+            };
             if let Some(parent) = local_path.parent() {
                 grouped.entry(parent.to_path_buf()).or_default().push(local_path);
             }
@@ -324,7 +437,8 @@ impl Mount {
         parent: PathBuf,
         paths: Vec<PathBuf>,
     ) -> Result<()> {
-        if !parent.starts_with(&sync_root) {
+        // Component-wise, not `starts_with`: `sync/..` starts with `sync`.
+        if parent != sync_root && !is_inside(&sync_root, &parent) {
             tracing::warn!(target: "drive::remote_events", "Event parent outside sync root, skipping");
             return Ok(());
         }
@@ -342,5 +456,45 @@ impl Mount {
     pub async fn set_event_push_subscribed(&self, subscribed: bool) {
         let mut flags = self.status_flags.lock().await;
         flags.set_event_push_subscribed(subscribed);
+    }
+}
+
+/// Turns an SSE event's `from`/`to` into the full `cloudreve://` uri
+/// `VfsTree`'s `NodeAttr::remote_path` uses, so `invalidate_path`'s exact-
+/// string comparisons actually match.
+///
+/// The server sends `from`/`to` already relative to the URI this drive
+/// subscribed with (`remote_base`/`config.remote_path`) — decoded, leading-
+/// slash-prefixed, root as `"/"` (confirmed against the Cloudreve server's
+/// `relativePath`, `pkg/filemanager/fs/dbfs/events.go`). Deliberately plain
+/// string concatenation, NOT `CrUri::join` (which percent-encodes each
+/// segment it's given): the tree's own `NodeAttr::remote_path` entries are
+/// never percent-encoded either — `VfsTree::ensure_listed` stores the
+/// server listing's `path` field verbatim — so re-encoding here would make
+/// every invalidation silently miss its target for any name that needed
+/// encoding at all.
+fn event_path_to_remote_uri(remote_base: &str, event_path: &str) -> String {
+    if event_path.is_empty() || event_path == "/" {
+        remote_base.to_string()
+    } else {
+        format!("{remote_base}{event_path}")
+    }
+}
+
+#[cfg(test)]
+mod event_path_tests {
+    use super::*;
+
+    #[test]
+    fn root_event_path_maps_to_the_remote_base_itself() {
+        assert_eq!(event_path_to_remote_uri("cloudreve://my/sync", "/"), "cloudreve://my/sync");
+    }
+
+    #[test]
+    fn a_nested_event_path_is_appended_verbatim() {
+        assert_eq!(
+            event_path_to_remote_uri("cloudreve://my/sync", "/a/b.txt"),
+            "cloudreve://my/sync/a/b.txt"
+        );
     }
 }

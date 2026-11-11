@@ -132,6 +132,9 @@ export default function TaskItem({ task, isActive = false }: TaskItemProps) {
         </Box>
       </ListItemIcon>
       <ListItemText
+        // The secondary line holds blocks (a Box, a progress bar): a <div>,
+        // not the default <p>.
+        slotProps={{ secondary: { component: "div" } }}
         primary={
           <Typography variant="body2" noWrap sx={{ fontWeight: 500 }}>
             {fileName}
