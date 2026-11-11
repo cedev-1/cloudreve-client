@@ -63,7 +63,8 @@ jobs:
           status=0
           for pkg in $(grep -o '"@tauri-apps/\(api\|plugin-[a-z-]*\)"' package.json | tr -d '"' | sort -u); do
             crate=$(echo "$pkg" | sed 's|@tauri-apps/api|tauri|; s|@tauri-apps/plugin-|tauri-plugin-|')
-            js=$(node -p "require('$pkg/package.json').version")
+            # By path: plugin-deep-link's "exports" does not list ./package.json.
+            js=$(node -p "require('./node_modules/$pkg/package.json').version")
             rust=$(grep -A1 "^name = \"$crate\"$" ../Cargo.lock | sed -n 's/^version = "\(.*\)"/\1/p' | head -n 1)
             if [ "${js%.*}" != "${rust%.*}" ]; then
               echo "::error::$pkg is $js but the $crate crate is $rust (major.minor must match)"
