@@ -76,7 +76,10 @@
     "pendingUploads": "{{count}} file(s) waiting to upload",
     "mountFailed": "\"{{name}}\" is not available",
     "uploadProblem": "Changes on \"{{name}}\" are not uploading",
-    "retry": "Retry"
+    "retry": "Retry",
+    "pause": "Pause sync",
+    "resume": "Resume sync",
+    "pausedStatus": "Sync paused"
   },
   "settings": {
     "title": "Settings",

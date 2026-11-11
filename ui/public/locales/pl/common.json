@@ -76,7 +76,10 @@
     "pendingUploads": "{{count}} plik(ów) czeka na wysłanie",
     "mountFailed": "„{{name}}” jest niedostępny",
     "uploadProblem": "Zmiany na „{{name}}” nie są wysyłane",
-    "retry": "Ponów"
+    "retry": "Ponów",
+    "pause": "Wstrzymaj synchronizację",
+    "resume": "Wznów synchronizację",
+    "pausedStatus": "Synchronizacja wstrzymana"
   },
   "settings": {
     "title": "Ustawienia",

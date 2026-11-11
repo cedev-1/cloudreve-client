@@ -76,7 +76,10 @@
     "pendingUploads": "{{count}} Datei(en) warten auf Upload",
     "mountFailed": "„{{name}}“ ist nicht verfügbar",
     "uploadProblem": "Uploads auf „{{name}}“ hängen fest",
-    "retry": "Erneut versuchen"
+    "retry": "Erneut versuchen",
+    "pause": "Synchronisierung pausieren",
+    "resume": "Synchronisierung fortsetzen",
+    "pausedStatus": "Synchronisierung pausiert"
   },
   "settings": {
     "title": "Einstellungen",

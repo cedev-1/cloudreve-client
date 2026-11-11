@@ -76,7 +76,10 @@
     "pendingUploads": "파일 {{count}}개 업로드 대기 중",
     "mountFailed": "\"{{name}}\"을(를) 사용할 수 없습니다",
     "uploadProblem": "\"{{name}}\"의 변경 사항이 업로드되지 않습니다",
-    "retry": "다시 시도"
+    "retry": "다시 시도",
+    "pause": "동기화 일시 중지",
+    "resume": "동기화 재개",
+    "pausedStatus": "동기화가 일시 중지됨"
   },
   "settings": {
     "title": "설정",

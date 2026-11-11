@@ -76,7 +76,10 @@
     "pendingUploads": "{{count}} archivo(s) esperando subida",
     "mountFailed": "\"{{name}}\" no está disponible",
     "uploadProblem": "Los cambios en \"{{name}}\" no se suben",
-    "retry": "Reintentar"
+    "retry": "Reintentar",
+    "pause": "Pausar la sincronización",
+    "resume": "Reanudar la sincronización",
+    "pausedStatus": "Sincronización en pausa"
   },
   "settings": {
     "title": "Configuración",

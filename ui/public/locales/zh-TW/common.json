@@ -76,7 +76,10 @@
     "pendingUploads": "{{count}} 個檔案等待上傳",
     "mountFailed": "「{{name}}」無法使用",
     "uploadProblem": "「{{name}}」上的變更未能上傳",
-    "retry": "重試"
+    "retry": "重試",
+    "pause": "暫停同步",
+    "resume": "繼續同步",
+    "pausedStatus": "同步已暫停"
   },
   "settings": {
     "title": "設定",
