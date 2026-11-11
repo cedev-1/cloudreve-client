@@ -13,11 +13,15 @@ export default defineConfig([
       js.configs.recommended,
       tseslint.configs.recommended,
       reactHooks.configs.flat.recommended,
-      reactRefresh.configs.vite,
     ],
     languageOptions: {
       ecmaVersion: 2020,
       globals: globals.browser,
     },
+  },
+  {
+    // Hot reload only concerns the app's modules, not the test helpers.
+    files: ['src/**/*.{ts,tsx}'],
+    extends: [reactRefresh.configs.vite],
   },
 ])

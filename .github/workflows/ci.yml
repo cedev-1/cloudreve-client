@@ -35,7 +35,8 @@ jobs:
       - name: Install Node.js
         uses: actions/setup-node@v6.4.0
         with:
-          node-version: '20'
+          # vitest 5 needs Node 22.12+.
+          node-version: '24'
 
       - name: Install dependencies
         run: yarn install --frozen-lockfile
@@ -46,6 +47,10 @@ jobs:
         run: |
           yarn tsc -p tsconfig.app.json --noEmit
           yarn tsc -p tsconfig.node.json --noEmit
+          yarn tsc -p tsconfig.test.json --noEmit
+
+      - name: Smoke tests (every window, en-US and fr)
+        run: yarn test
 
       - name: Tauri JS packages match the Rust crates
         # A plugin's JS half and Rust half speak a private IPC protocol: a
