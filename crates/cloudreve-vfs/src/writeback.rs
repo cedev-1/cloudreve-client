@@ -103,7 +103,7 @@ pub struct DraftStore {
     /// by NFC name -> exact names: what `local_only_children` and
     /// `local_only_child` answer from, so a lookup in a folder costs the
     /// same however many drafts the store holds. Kept in step with
-    /// `entries` by `index_add`/`index_remove`, around every change of an
+    /// `entries` by `insert_entry`/`take_entry`, around every change of an
     /// entry's `remote_path` or `base_etag`.
     local_only: HashMap<String, HashMap<String, Vec<String>>>,
     /// Test-only fault injection: when `true`, the NEXT `set_state` call
@@ -116,6 +116,39 @@ pub struct DraftStore {
     /// this kind of disk fault — see `set_state`'s own doc and
     /// `fail_next_set_state_for_tests`.
     fail_next_set_state: bool,
+    /// Flushes to the disk what a crash must not take back: see
+    /// `write_meta`'s `syncer` for which calls ask for it.
+    syncer: Syncer,
+}
+
+/// Something a draft transition needs on the disk itself, not only in the
+/// page cache.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Durable {
+    /// A file's content.
+    File(PathBuf),
+    /// A directory's entries: a file created, renamed or removed in it.
+    Dir(PathBuf),
+}
+
+/// Flushes one [`Durable`] to the disk. Injectable so a test can see which
+/// transitions ask for it (`DraftStore::open_with_syncer`).
+pub type Syncer = Arc<dyn Fn(&Durable) -> std::io::Result<()> + Send + Sync>;
+
+/// The real [`Syncer`]: `fsync(2)` on the file or directory.
+pub fn fsync_syncer() -> Syncer {
+    Arc::new(|target: &Durable| {
+        let (Durable::File(path) | Durable::Dir(path)) = target;
+        let file = fs::File::open(path)?;
+        // Plain fsync, not std's `sync_all`: on macOS that is F_FULLFSYNC,
+        // which also drains the drive's own cache and costs milliseconds
+        // per call. This survives a crash of the app or of the OS, at a
+        // price a folder of thousands of files can pay once per file.
+        if unsafe { libc::fsync(std::os::unix::io::AsRawFd::as_raw_fd(&file)) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    })
 }
 
 impl DraftStore {
@@ -133,6 +166,12 @@ impl DraftStore {
     /// launch — it must be retried, not silently lost. Demoting back to
     /// `Pending` puts it back in the queue Task 8's flusher drains.
     pub fn open(root: &Path) -> Result<Self> {
+        Self::open_with_syncer(root, fsync_syncer())
+    }
+
+    /// [`open`](Self::open) with `syncer` in place of `fsync(2)`, so a test
+    /// can see what each transition flushes.
+    pub fn open_with_syncer(root: &Path, syncer: Syncer) -> Result<Self> {
         fs::create_dir_all(root)
             .with_context(|| format!("failed to create drafts root {}", root.display()))?;
 
@@ -183,13 +222,13 @@ impl DraftStore {
                 // Persist the demotion immediately: every mutation of a
                 // draft's state is written atomically, and being found
                 // mid-upload after a crash is itself a state change.
-                write_meta(root, &hash, &entry)?;
+                write_meta(root, &hash, &entry, Some(&syncer))?;
             }
 
             entries.insert(hash, entry);
         }
 
-        let mut store = Self { root: root.to_path_buf(), entries: HashMap::new(), local_only: HashMap::new(), fail_next_set_state: false };
+        let mut store = Self { root: root.to_path_buf(), entries: HashMap::new(), local_only: HashMap::new(), fail_next_set_state: false, syncer };
         for (hash, entry) in entries {
             store.insert_entry(hash, entry);
         }
@@ -234,7 +273,8 @@ impl DraftStore {
             last_write_unix: now_unix(),
             write_seq: 0,
         };
-        write_meta(&self.root, &hash, &entry)?;
+        write_meta(&self.root, &hash, &entry, Some(&self.syncer))?;
+        flush(&self.syncer, Durable::Dir(self.root.clone()))?;
         self.insert_entry(hash, entry);
         Ok(())
     }
@@ -262,7 +302,7 @@ impl DraftStore {
         entry.size = entry.size.max(offset + data.len() as u64);
         entry.last_write_unix = now_unix();
         entry.write_seq += 1;
-        write_meta(&self.root, &hash, entry)?;
+        write_meta(&self.root, &hash, entry, None)?;
         Ok(())
     }
 
@@ -311,7 +351,7 @@ impl DraftStore {
         entry.size = size;
         entry.last_write_unix = now_unix();
         entry.write_seq += 1;
-        write_meta(&self.root, &hash, entry)?;
+        write_meta(&self.root, &hash, entry, None)?;
         Ok(())
     }
 
@@ -373,7 +413,11 @@ impl DraftStore {
                  (see fail_next_set_state_for_tests)"
             );
         }
-        write_meta(&self.root, &hash, entry)?;
+        // The bytes first: a state that reaches the disk must never
+        // describe content that did not (closing the file is the moment
+        // its content is final, see `write_meta`).
+        flush(&self.syncer, Durable::File(self.root.join(&hash).join("data")))?;
+        write_meta(&self.root, &hash, entry, Some(&self.syncer))?;
         Ok(())
     }
 
@@ -492,7 +536,7 @@ impl DraftStore {
             .take_entry(&hash)
             .ok_or_else(|| anyhow::anyhow!("no draft open for {remote_path}"))?;
         entry.base_etag = etag.to_string();
-        let persisted = write_meta(&self.root, &hash, &entry);
+        let persisted = write_meta(&self.root, &hash, &entry, Some(&self.syncer));
         self.insert_entry(hash, entry);
         persisted
     }
@@ -513,6 +557,7 @@ impl DraftStore {
         if dir.exists() {
             fs::remove_dir_all(&dir)
                 .with_context(|| format!("failed to remove draft dir {}", dir.display()))?;
+            flush(&self.syncer, Durable::Dir(self.root.clone()))?;
         }
         Ok(())
     }
@@ -543,7 +588,7 @@ impl DraftStore {
         if to_hash == from_hash {
             // Same shard (only possible if `from == to`): nothing to move
             // on disk, just persist the updated `remote_path`.
-            write_meta(&self.root, &to_hash, &entry)?;
+            write_meta(&self.root, &to_hash, &entry, Some(&self.syncer))?;
             self.insert_entry(to_hash, entry);
             return Ok(());
         }
@@ -561,7 +606,8 @@ impl DraftStore {
             format!("failed to rename {} to {}", from_dir.display(), to_dir.display())
         })?;
 
-        write_meta(&self.root, &to_hash, &entry)?;
+        write_meta(&self.root, &to_hash, &entry, Some(&self.syncer))?;
+        flush(&self.syncer, Durable::Dir(self.root.clone()))?;
         self.insert_entry(to_hash, entry);
         Ok(())
     }
@@ -1847,7 +1893,13 @@ fn hash16(remote_path: &str) -> String {
     digest[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn write_meta(root: &Path, hash: &str, entry: &Entry) -> Result<()> {
+/// Persists `entry` as its `draft.json`. With a `syncer`, a crash cannot
+/// take it back: the new content is flushed before the rename, and the
+/// rename after it. Every state transition passes one; `write` and
+/// `truncate` do not — an editor's every write would cost an fsync, and
+/// the content they record is flushed when the file is closed
+/// (`set_state` to `Pending`).
+fn write_meta(root: &Path, hash: &str, entry: &Entry, syncer: Option<&Syncer>) -> Result<()> {
     let meta = DraftMeta {
         remote_path: entry.remote_path.clone(),
         base_etag: entry.base_etag.clone(),
@@ -1865,9 +1917,20 @@ fn write_meta(root: &Path, hash: &str, entry: &Entry) -> Result<()> {
     let tmp_path = dir.join("draft.json.tmp");
     fs::write(&tmp_path, json)
         .with_context(|| format!("failed to write {}", tmp_path.display()))?;
+    if let Some(syncer) = syncer {
+        flush(syncer, Durable::File(tmp_path.clone()))?;
+    }
     fs::rename(&tmp_path, &path).with_context(|| {
         format!("failed to rename {} to {}", tmp_path.display(), path.display())
-    })
+    })?;
+    if let Some(syncer) = syncer {
+        flush(syncer, Durable::Dir(dir))?;
+    }
+    Ok(())
+}
+
+fn flush(syncer: &Syncer, target: Durable) -> Result<()> {
+    syncer(&target).with_context(|| format!("failed to flush {target:?} to disk"))
 }
 
 /// Moves `from` into `to` by renaming; if that fails (e.g. `from` sits on a
@@ -2167,5 +2230,108 @@ mod tests {
         let s = DraftStore::open(dir.path()).unwrap();
         assert_eq!(s.local_only_child(FOLDER, "scan.pdf"), Some("scan.pdf".to_string()));
         assert_eq!(s.local_only_child(FOLDER, "known.pdf"), None);
+    }
+
+    /// A store whose flushes are recorded instead of performed.
+    fn recording_store(root: &Path) -> (DraftStore, Arc<StdMutex<Vec<Durable>>>) {
+        let log = Arc::new(StdMutex::new(Vec::new()));
+        let sink = log.clone();
+        let syncer: Syncer = Arc::new(move |d: &Durable| {
+            sink.lock().unwrap().push(d.clone());
+            Ok(())
+        });
+        (DraftStore::open_with_syncer(root, syncer).unwrap(), log)
+    }
+
+    fn taken(log: &Arc<StdMutex<Vec<Durable>>>) -> Vec<Durable> {
+        std::mem::take(&mut *log.lock().unwrap())
+    }
+
+    const REPORT: &str = "cloudreve://my/sync/Reports/q3.xlsx";
+
+    #[test]
+    fn writes_while_editing_are_not_flushed_one_by_one() {
+        let dir = TempDir::new().unwrap();
+        let (mut s, log) = recording_store(dir.path());
+        s.begin(REPORT, "", DraftInit::Empty).unwrap();
+        taken(&log);
+        for i in 0..200u64 {
+            s.write(REPORT, i * 4096, &[7u8; 4096]).unwrap();
+        }
+        s.truncate(REPORT, 100_000).unwrap();
+        assert!(taken(&log).is_empty(), "an editor's 200 writes must not each cost an fsync");
+    }
+
+    #[test]
+    fn queuing_a_draft_for_upload_flushes_its_bytes_and_its_state() {
+        let dir = TempDir::new().unwrap();
+        let (mut s, log) = recording_store(dir.path());
+        s.begin(REPORT, "", DraftInit::Empty).unwrap();
+        s.write(REPORT, 0, b"totals").unwrap();
+        taken(&log);
+        // `Vfs::close`: the app closed the file, its content is final.
+        s.set_state(REPORT, DraftState::Pending).unwrap();
+        let flushed = taken(&log);
+        let entry = dir.path().join(hash16(REPORT));
+        assert!(flushed.contains(&Durable::File(entry.join("data"))), "data not flushed: {flushed:?}");
+        let meta = flushed.iter().position(|d| *d == Durable::File(entry.join("draft.json.tmp")));
+        let dir_entry = flushed.iter().position(|d| *d == Durable::Dir(entry.clone()));
+        assert!(meta.is_some(), "draft.json not flushed before its rename: {flushed:?}");
+        assert!(dir_entry > meta, "the draft's folder must be flushed after draft.json lands: {flushed:?}");
+        // On disk: the state reloaded is the one flushed.
+        drop(s);
+        assert_eq!(DraftStore::open(dir.path()).unwrap().state(REPORT), Some(DraftState::Pending));
+    }
+
+    #[test]
+    fn a_new_draft_is_flushed_into_the_drafts_folder() {
+        let dir = TempDir::new().unwrap();
+        let (mut s, log) = recording_store(dir.path());
+        s.begin(REPORT, "", DraftInit::Empty).unwrap();
+        let flushed = taken(&log);
+        let entry = dir.path().join(hash16(REPORT));
+        assert!(flushed.contains(&Durable::Dir(entry)), "{flushed:?}");
+        assert!(flushed.contains(&Durable::Dir(dir.path().to_path_buf())), "{flushed:?}");
+    }
+
+    #[test]
+    fn renaming_or_removing_a_draft_flushes_the_drafts_folder() {
+        let dir = TempDir::new().unwrap();
+        let (mut s, log) = recording_store(dir.path());
+        s.begin(REPORT, "", DraftInit::Empty).unwrap();
+        taken(&log);
+        let renamed = "cloudreve://my/sync/Reports/q3 final.xlsx";
+        s.rename(REPORT, renamed, None).unwrap();
+        let flushed = taken(&log);
+        assert!(flushed.contains(&Durable::Dir(dir.path().to_path_buf())), "{flushed:?}");
+        assert!(flushed.contains(&Durable::File(dir.path().join(hash16(renamed)).join("draft.json.tmp"))), "{flushed:?}");
+        // Uploaded: gone for good, not back as Pending after a crash.
+        s.remove(renamed).unwrap();
+        assert!(taken(&log).contains(&Durable::Dir(dir.path().to_path_buf())));
+    }
+
+    #[test]
+    fn adopting_a_remote_etag_flushes_the_state() {
+        let dir = TempDir::new().unwrap();
+        let (mut s, log) = recording_store(dir.path());
+        s.begin(REPORT, "", DraftInit::Empty).unwrap();
+        taken(&log);
+        s.set_base_etag(REPORT, "etag-after-upload").unwrap();
+        let entry = dir.path().join(hash16(REPORT));
+        assert!(taken(&log).contains(&Durable::File(entry.join("draft.json.tmp"))));
+    }
+
+    #[test]
+    fn a_draft_demoted_at_launch_flushes_its_new_state() {
+        let dir = TempDir::new().unwrap();
+        {
+            let mut s = DraftStore::open(dir.path()).unwrap();
+            s.begin(REPORT, "", DraftInit::Empty).unwrap();
+            s.set_state(REPORT, DraftState::Uploading).unwrap();
+        }
+        let (s, log) = recording_store(dir.path());
+        assert_eq!(s.state(REPORT), Some(DraftState::Pending));
+        let entry = dir.path().join(hash16(REPORT));
+        assert!(taken(&log).contains(&Durable::File(entry.join("draft.json.tmp"))));
     }
 }
