@@ -1777,3 +1777,113 @@ async fn a_remote_change_reaches_an_fsevents_stream_on_the_open_folder_within_3s
     let took = took.expect("no FSEvents event for the open folder: Finder would never refresh it");
     assert!(took <= REMOTE_CHANGE_VISIBLE_WITHIN, "FSEvents took {took:?}");
 }
+
+/// Dragging a big folder into the drive: `cp -R` of 2000 small files
+/// must finish in a bounded time (each create used to cost a scan of the
+/// whole folder, so a folder this size took minutes) and every file must
+/// reach the server with its own bytes, and nothing else.
+#[tokio::test(flavor = "multi_thread")]
+async fn copying_a_folder_of_2000_files_in_finishes_and_uploads_every_file() {
+    const FILES: usize = 2000;
+    let env = VfsTestEnv::new().await;
+    env.set_remote_files(vec![]).await;
+    env.expect_uploads().await;
+    env.expect_namespace_ops().await;
+    let vfs = new_test_vfs(&env).await;
+
+    let source = tempfile::tempdir().unwrap();
+    let album = source.path().join("Album");
+    std::fs::create_dir(&album).unwrap();
+    for i in 0..FILES {
+        std::fs::write(album.join(format!("IMG_{i:04}.jpg")), format!("photo number {i}")).unwrap();
+    }
+
+    let mp = tempfile::tempdir().unwrap();
+    let mountpoint = mp.path().to_path_buf();
+    let _guard = MountpointGuard(mountpoint.clone());
+    let mounted = mount::mount(vfs.clone(), &mountpoint, "CloudreveTest", env.cache_dir())
+        .await
+        .expect("mount should succeed");
+
+    let (from, to) = (album.clone(), mountpoint.clone());
+    let started = std::time::Instant::now();
+    let copied = tokio::time::timeout(
+        Duration::from_secs(120),
+        tokio::task::spawn_blocking(move || std::process::Command::new("/bin/cp").arg("-R").arg(&from).arg(&to).output()),
+    )
+    .await
+    .expect("cp -R of 2000 files into the mount did not finish within 120 s")
+    .expect("blocking task panicked")
+    .expect("run cp");
+    eprintln!("cp -R of {FILES} files took {:?}", started.elapsed());
+    assert!(copied.status.success(), "cp -R failed: {}", String::from_utf8_lossy(&copied.stderr));
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    while env.uploaded_names().len() < FILES && std::time::Instant::now() < deadline {
+        vfs.wait_for_writeback_idle().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    mounted.unmount().await.expect("unmount should succeed");
+
+    let names = env.uploaded_names();
+    assert_eq!(names.len(), FILES, "uploaded {} files, expected {FILES}", names.len());
+    for i in 0..FILES {
+        let name = format!("IMG_{i:04}.jpg");
+        assert_eq!(
+            env.uploaded_content(&name).as_deref(),
+            Some(format!("photo number {i}").as_bytes()),
+            "{name} never reached the server intact"
+        );
+    }
+}
+
+/// Appending to a big remote file first downloads it whole (the draft must
+/// hold every byte before the new ones land). From a slow server that takes
+/// longer than the `soft` mount's patience: the WRITE must still succeed —
+/// the server answers JUKEBOX while it waits, the kernel resends — rather
+/// than fail with EIO, and the upload must hold the old bytes plus the new.
+#[tokio::test(flavor = "multi_thread")]
+async fn appending_to_a_big_file_from_a_slow_server_succeeds_and_uploads_every_byte() {
+    let env = VfsTestEnv::new().await;
+    let original: Vec<u8> = (0..=255u8).cycle().take(4 * 1024 * 1024).collect();
+    env.set_remote_files(vec![remote_file("export.log", original.len() as i64, "e1")]).await;
+    env.serve_file_content("export.log", &original).await;
+    env.slow_down_downloads("export.log", Duration::from_secs(12));
+    env.expect_uploads().await;
+    let vfs = new_test_vfs(&env).await;
+
+    let mp = tempfile::tempdir().unwrap();
+    let mountpoint = mp.path().to_path_buf();
+    let _guard = MountpointGuard(mountpoint.clone());
+    let mounted = mount::mount(vfs.clone(), &mountpoint, "CloudreveTest", env.cache_dir())
+        .await
+        .expect("mount should succeed");
+
+    let path = mountpoint.join("export.log");
+    let appended = tokio::time::timeout(
+        Duration::from_secs(90),
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&path)?;
+            f.write_all(b"\nlast line")?;
+            f.sync_all()?;
+            Ok(())
+        }),
+    )
+    .await
+    .expect("the append through the mount hung")
+    .expect("blocking task panicked");
+    assert!(appended.is_ok(), "appending to a slowly served file failed: {appended:?}");
+
+    let mut expected = original.clone();
+    expected.extend_from_slice(b"\nlast line");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while env.uploaded_content("export.log").as_deref() != Some(&expected[..]) && std::time::Instant::now() < deadline {
+        vfs.wait_for_writeback_idle().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    mounted.unmount().await.expect("unmount should succeed");
+    let uploaded = env.uploaded_content("export.log").expect("export.log was never uploaded");
+    assert_eq!(uploaded.len(), expected.len());
+    assert!(uploaded == expected, "the upload does not hold the old bytes followed by the appended ones");
+}

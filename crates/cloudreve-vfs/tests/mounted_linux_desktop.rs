@@ -318,6 +318,70 @@ async fn a_slow_download_does_not_freeze_browsing() {
     handle.unmount().await.unwrap();
 }
 
+/// The first write to a big remote file downloads it whole first (the
+/// draft must hold every byte before the new ones land). Browsing must not
+/// wait behind that download, and the upload must hold the old bytes plus
+/// the appended ones.
+#[tokio::test(flavor = "multi_thread")]
+async fn appending_to_a_slow_big_file_does_not_freeze_browsing() {
+    let env = VfsTestEnv::new().await;
+    let big: Vec<u8> = (0..=255u8).cycle().take(2 * 1024 * 1024).collect();
+    env.set_remote_files(vec![
+        remote_file("export.log", big.len() as i64, "e1"),
+        remote_file("todo.txt", 4, "e2"),
+    ])
+    .await;
+    env.serve_file_content("export.log", &big).await;
+    env.serve_file_content("todo.txt", b"milk").await;
+    env.slow_down_downloads("export.log", Duration::from_secs(4));
+    env.expect_uploads().await;
+    let mp = tempfile::tempdir().unwrap();
+    let mountpoint = mp.path().to_path_buf();
+    let _guard = MountpointGuard(mountpoint.clone());
+    let (vfs, handle) = mounted(&env, &mountpoint).await;
+
+    let root = mountpoint.clone();
+    blocking(move || std::fs::read_dir(&root).unwrap().count()).await;
+
+    let log = mountpoint.join("export.log");
+    let append = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&log)?;
+        f.write_all(b"\nlast line")?;
+        Ok(())
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let root = mountpoint.clone();
+    let (took, names, todo) = blocking(move || {
+        let start = Instant::now();
+        let names: Vec<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        let todo = std::fs::read(root.join("todo.txt")).unwrap();
+        (start.elapsed(), names, todo)
+    })
+    .await;
+
+    assert!(names.contains(&"export.log".to_string()));
+    assert_eq!(todo, b"milk");
+    assert!(
+        took < Duration::from_millis(2000),
+        "browsing waited {took:?} behind the first write's download (the download takes 4 s)"
+    );
+    let appended = tokio::time::timeout(Duration::from_secs(30), append)
+        .await
+        .expect("the append hung")
+        .unwrap();
+    assert!(appended.is_ok(), "appending to a slowly served file failed: {appended:?}");
+
+    let mut expected = big.clone();
+    expected.extend_from_slice(b"\nlast line");
+    wait_for_upload(&vfs, &env, "export.log", &expected).await;
+    handle.unmount().await.unwrap();
+}
+
 const CHILD_MOUNTPOINT: &str = "CLOUDREVE_TEST_CHILD_MOUNTPOINT";
 const CHILD_CACHE: &str = "CLOUDREVE_TEST_CHILD_CACHE";
 
