@@ -81,21 +81,18 @@ export default function Popup() {
     }
 
     isFetchingRef.current = true;
-    try {
-      const result = await invoke<StatusSummary>("get_status_summary", {
+    // Loop instead of calling itself again: a callback that refers to itself
+    // defeats the React Compiler's memoization.
+    do {
+      refetchQueuedRef.current = false;
+      await invoke<StatusSummary>("get_status_summary", {
         driveId: selectedDrive,
+      }).then(setSummary, (error) => {
+        console.error("Failed to fetch status summary:", error);
       });
-      setSummary(result);
-    } catch (error) {
-      console.error("Failed to fetch status summary:", error);
-    } finally {
-      isFetchingRef.current = false;
       setLoading(false);
-      if (refetchQueuedRef.current) {
-        refetchQueuedRef.current = false;
-        fetchSummary();
-      }
-    }
+    } while (refetchQueuedRef.current);
+    isFetchingRef.current = false;
   }, [selectedDrive]);
 
   // Initial fetch, then refetch whenever the backend signals a change

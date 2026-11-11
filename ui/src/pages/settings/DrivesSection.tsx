@@ -119,7 +119,8 @@ export default function DrivesSection() {
   const handleToggleSidebar = async (driveId: string, enabled: boolean) => {
     setSidebarShown((prev) => ({ ...prev, [driveId]: enabled }));
     setSidebarErrors((prev) => {
-      const { [driveId]: _, ...rest } = prev;
+      const rest = { ...prev };
+      delete rest[driveId];
       return rest;
     });
     try {

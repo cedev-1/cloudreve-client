@@ -139,7 +139,7 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
       pkceSessionRef.current.callbackData = callbackData;
 
       // Transition to final setup page
-      callbackData.name && setDriveName(callbackData.name);
+      if (callbackData.name) setDriveName(callbackData.name);
       setPageState("final_setup");
     }).then((fn) => {
       unlisten = fn;
@@ -184,13 +184,14 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
   };
 
   // Reset logo when URL is cleared or becomes invalid
-  useEffect(() => {
-    if (!siteUrl.trim() || !isValidUrl(siteUrl.trim())) {
+  const handleSiteUrlChange = (value: string) => {
+    setSiteUrl(value);
+    if (!value.trim() || !isValidUrl(value.trim())) {
       setLogo(defaultLogo);
       lastFetchedUrl.current = "";
       currentIconUrl.current = undefined;
     }
-  }, [siteUrl]);
+  };
 
   // Shared authorization logic
   const startAuthorization = useCallback(async (urlToAuthorize: string) => {
@@ -757,7 +758,7 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
                   label={t("addDrive.siteUrl")}
                   placeholder={t("addDrive.siteUrlPlaceholder")}
                   value={siteUrl}
-                  onChange={(e) => setSiteUrl(e.target.value)}
+                  onChange={(e) => handleSiteUrlChange(e.target.value)}
                   onBlur={handleUrlBlur}
                   variant="filled"
                   type="url"

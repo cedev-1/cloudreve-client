@@ -49,6 +49,9 @@ jobs:
           yarn tsc -p tsconfig.node.json --noEmit
           yarn tsc -p tsconfig.test.json --noEmit
 
+      - name: Lint
+        run: yarn lint
+
       - name: Smoke tests (every window, en-US and fr)
         run: yarn test
 

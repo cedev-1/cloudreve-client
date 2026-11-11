@@ -165,6 +165,32 @@ describe.each(LANGUAGES)("popup (%s)", (lng) => {
     await waitFor(() => expect(callsTo("resume_sync")).toEqual([{ driveId: workDrive.id }]));
   });
 
+  it("does not miss a change signalled while it is still loading", async () => {
+    let release!: () => void;
+    const firstAnswer = new Promise<void>((resolve) => (release = resolve));
+    let answers = 0;
+    mockCommands({
+      get_status_summary: async () => {
+        answers += 1;
+        if (answers === 1) {
+          await firstAnswer;
+          return emptySummary();
+        }
+        return emptySummary({ has_ever_synced: false });
+      },
+    });
+    await renderApp("/popup", lng);
+    await waitFor(() => expect(callsTo("get_status_summary")).toHaveLength(1));
+    emitEvent("SummaryChanged", null);
+    emitEvent("SummaryChanged", null);
+    // Coalesced: no second request while the first is in flight...
+    expect(callsTo("get_status_summary")).toHaveLength(1);
+    release();
+    // ...then exactly one more, whose answer is what stays on screen.
+    expect(await screen.findByText(s.preparing)).toBeInTheDocument();
+    expect(callsTo("get_status_summary")).toHaveLength(2);
+  });
+
   it("says when the connection is lost", async () => {
     mockCommands({ get_status_summary: () => emptySummary() });
     await renderApp("/popup", lng);
