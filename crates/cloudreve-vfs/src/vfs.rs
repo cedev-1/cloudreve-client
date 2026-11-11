@@ -1457,7 +1457,7 @@ impl Vfs {
     /// this call's own registration window use unrelated lock keys and can
     /// interleave.
     pub async fn create(&self, parent: NodeId, name: &str) -> Result<(NodeId, FileHandle)> {
-        // Created on the server under its NFC form (see `tree::same_name`).
+        // Created on the server under its NFC form (see `tree::to_nfc`).
         let name = &crate::tree::to_nfc(name);
         let _ns_guard = self.namespace_lock.read().await;
 
@@ -1869,7 +1869,7 @@ impl Vfs {
             .await?
             .with_context(|| format!("rename: no such entry {name:?}"))?;
         // The tree knows the entry by its stored name, which may differ
-        // from `name` by Unicode normalization (see `tree::same_name`);
+        // from `name` by Unicode normalization (see `tree::to_nfc`);
         // the new name is created in NFC.
         let name = &attr.name.clone();
         let new_name = &crate::tree::to_nfc(new_name);
@@ -2284,9 +2284,7 @@ impl Vfs {
         // Junk is never listed, local-only files included (see
         // `crate::junk`); the tree already drops the server's copies.
         listing.retain(|(_, attr)| junk::classify(&attr.name).is_none());
-        for (_, attr) in listing.iter_mut() {
-            self.overlay_draft(attr).await;
-        }
+        self.overlay_drafts(listing.iter_mut().map(|(_, attr)| attr)).await;
         Ok(listing)
     }
 
@@ -2304,20 +2302,22 @@ impl Vfs {
             self.overlay_draft(&mut attr).await;
             return Ok(Some((id, attr)));
         }
-        for (id, mut attr) in self.tree.known_children_of(parent).await {
-            if crate::tree::same_name(&attr.name, name) {
-                self.overlay_draft(&mut attr).await;
-                return Ok(Some((id, attr)));
-            }
+        if let Some((id, mut attr)) = self.tree.lookup_known(parent, name).await {
+            self.overlay_draft(&mut attr).await;
+            return Ok(Some((id, attr)));
         }
-        let mut drafted = Vec::new();
-        self.add_local_only_drafts(parent, &mut drafted).await?;
-        for (id, attr) in drafted {
-            if crate::tree::same_name(&attr.name, name) {
-                return Ok(Some((id, attr)));
-            }
+        // A never-uploaded draft the tree does not know (yet, after a
+        // restart): see `add_local_only_drafts`.
+        let Some(dir_attr) = self.tree.getattr(parent).await? else { return Ok(None) };
+        if !dir_attr.is_dir {
+            return Ok(None);
         }
-        Ok(None)
+        let drafted = self.drafts.lock().await.local_only_child(&dir_attr.remote_path, name);
+        let Some(drafted) = drafted else { return Ok(None) };
+        let id = self.tree.insert_local_entry(parent, &drafted).await?;
+        let Some(mut attr) = self.tree.getattr(id).await? else { return Ok(None) };
+        self.overlay_draft(&mut attr).await;
+        Ok(Some((id, attr)))
     }
 
     /// Puts back into the tree (and into `listing`) every never-uploaded
@@ -2331,8 +2331,13 @@ impl Vfs {
             return Ok(());
         }
         let names = self.drafts.lock().await.local_only_children(&dir_attr.remote_path);
+        if names.is_empty() {
+            return Ok(());
+        }
+        // Compared under NFC (see `tree::to_nfc`), each name once.
+        let mut listed: HashSet<String> = listing.iter().map(|(_, a)| crate::tree::to_nfc(&a.name)).collect();
         for name in names {
-            if listing.iter().any(|(_, a)| crate::tree::same_name(&a.name, &name)) {
+            if !listed.insert(crate::tree::to_nfc(&name)) {
                 continue;
             }
             let id = self.tree.insert_local_entry(dir, &name).await?;
@@ -2379,17 +2384,26 @@ impl Vfs {
     /// stale, possibly nonexistent-yet) attributes. A local-only junk file
     /// (see `crate::junk`) takes them from the overlay instead.
     async fn overlay_draft(&self, attr: &mut NodeAttr) {
-        if junk::is_local_only_path(&attr.remote_path) {
-            if let Some(file) = self.junk.lock().unwrap().get(&attr.remote_path) {
-                attr.size = file.data.len() as u64;
-                attr.mtime_secs = file.mtime_secs;
+        self.overlay_drafts(std::iter::once(attr)).await;
+    }
+
+    /// `overlay_draft` for many entries under one `drafts` lock: a big
+    /// folder's `readdir` takes it once, not once per entry.
+    async fn overlay_drafts(&self, attrs: impl Iterator<Item = &mut NodeAttr>) {
+        let mut drafts = None;
+        for attr in attrs {
+            if junk::is_local_only_path(&attr.remote_path) {
+                if let Some(file) = self.junk.lock().unwrap().get(&attr.remote_path) {
+                    attr.size = file.data.len() as u64;
+                    attr.mtime_secs = file.mtime_secs;
+                }
+                continue;
             }
-            return;
-        }
-        let drafts = self.drafts.lock().await;
-        if let Some(size) = drafts.size(&attr.remote_path) {
-            attr.size = size;
-            if let Some(mtime) = drafts.mtime_unix(&attr.remote_path) {
+            if drafts.is_none() {
+                drafts = Some(self.drafts.lock().await);
+            }
+            if let Some((size, mtime)) = drafts.as_ref().and_then(|d| d.overlay(&attr.remote_path)) {
+                attr.size = size;
                 attr.mtime_secs = mtime;
             }
         }

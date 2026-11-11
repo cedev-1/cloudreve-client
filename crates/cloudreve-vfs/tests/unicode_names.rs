@@ -125,3 +125,19 @@ async fn renaming_to_a_decomposed_name_renames_composed() {
 
     assert_eq!(env.last_rename().map(|(_, to)| to), Some(format!("{RESUME_NFC}.txt")));
 }
+
+/// A server can hold both spellings side by side (uploaded by clients that
+/// do not normalize). Each name then opens its own file, whichever the
+/// listing returns first.
+#[tokio::test]
+async fn when_both_spellings_exist_each_name_opens_its_own_file() {
+    let env = VfsTestEnv::new().await;
+    env.set_remote_files(vec![remote_file(CAFE_NFD, 3, "from-mac"), remote_file(CAFE_NFC, 5, "from-linux")]).await;
+    let vfs = vfs_for(&env).await;
+    let root = vfs.tree().root();
+
+    let (_, nfc) = vfs.lookup(root, CAFE_NFC).await.unwrap().unwrap();
+    assert_eq!(nfc.etag, "from-linux");
+    let (_, nfd) = vfs.lookup(root, CAFE_NFD).await.unwrap().unwrap();
+    assert_eq!(nfd.etag, "from-mac");
+}

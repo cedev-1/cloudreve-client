@@ -99,6 +99,13 @@ pub struct DraftStore {
     /// from a path is cheap and keeps this in lockstep with `BlockCache`'s
     /// equivalent map in `cache.rs`.
     entries: HashMap<String, Entry>,
+    /// The never-uploaded drafts (empty `base_etag`) by folder path, then
+    /// by NFC name -> exact names: what `local_only_children` and
+    /// `local_only_child` answer from, so a lookup in a folder costs the
+    /// same however many drafts the store holds. Kept in step with
+    /// `entries` by `index_add`/`index_remove`, around every change of an
+    /// entry's `remote_path` or `base_etag`.
+    local_only: HashMap<String, HashMap<String, Vec<String>>>,
     /// Test-only fault injection: when `true`, the NEXT `set_state` call
     /// fails (consuming this flag) instead of persisting, without touching
     /// disk. Not `#[cfg(test)]` — see `WriteBackQueue::debounce`'s field doc
@@ -182,7 +189,11 @@ impl DraftStore {
             entries.insert(hash, entry);
         }
 
-        Ok(Self { root: root.to_path_buf(), entries, fail_next_set_state: false })
+        let mut store = Self { root: root.to_path_buf(), entries: HashMap::new(), local_only: HashMap::new(), fail_next_set_state: false };
+        for (hash, entry) in entries {
+            store.insert_entry(hash, entry);
+        }
+        Ok(store)
     }
 
     /// Starts (or restarts) a draft for `remote_path`. Overwrites any
@@ -224,7 +235,7 @@ impl DraftStore {
             write_seq: 0,
         };
         write_meta(&self.root, &hash, &entry)?;
-        self.entries.insert(hash, entry);
+        self.insert_entry(hash, entry);
         Ok(())
     }
 
@@ -306,6 +317,12 @@ impl DraftStore {
 
     pub fn size(&self, remote_path: &str) -> Option<u64> {
         self.entries.get(&hash16(remote_path)).map(|e| e.size)
+    }
+
+    /// The draft's `(size, mtime_unix)`, one hash for both — what the
+    /// facade's attribute overlay (D3) reads per listed entry.
+    pub fn overlay(&self, remote_path: &str) -> Option<(u64, i64)> {
+        self.entries.get(&hash16(remote_path)).map(|e| (e.size, e.last_write_unix))
     }
 
     pub fn state(&self, remote_path: &str) -> Option<DraftState> {
@@ -404,14 +421,58 @@ impl DraftStore {
     /// overlays them from here so they stay visible (and `create` keeps
     /// answering EEXIST instead of truncating their only copy).
     pub fn local_only_children(&self, dir_path: &str) -> Vec<String> {
-        let prefix = format!("{dir_path}/");
-        self.entries
-            .values()
-            .filter(|e| e.base_etag.is_empty())
-            .filter_map(|e| e.remote_path.strip_prefix(&prefix))
-            .filter(|name| !name.is_empty() && !name.contains('/'))
-            .map(str::to_string)
+        self.local_only
+            .get(dir_path)
+            .into_iter()
+            .flat_map(|names| names.values().flatten().cloned())
             .collect()
+    }
+
+    /// The exact name of the never-uploaded draft in `dir_path` named
+    /// `name` (equal under NFC, exact spelling first), if any — one entry
+    /// of `local_only_children`, without listing the folder.
+    pub fn local_only_child(&self, dir_path: &str, name: &str) -> Option<String> {
+        let spellings = self.local_only.get(dir_path)?.get(&crate::tree::to_nfc(name))?;
+        spellings.iter().find(|n| *n == name).or_else(|| spellings.first()).cloned()
+    }
+
+    /// Puts `entry` in `entries` (replacing any entry under `hash`) and in
+    /// the `local_only` index if it belongs there.
+    fn insert_entry(&mut self, hash: String, entry: Entry) {
+        self.take_entry(&hash);
+        if entry.base_etag.is_empty() {
+            if let Some((dir, name)) = entry.remote_path.rsplit_once('/') {
+                if !name.is_empty() {
+                    self.local_only
+                        .entry(dir.to_string())
+                        .or_default()
+                        .entry(crate::tree::to_nfc(name))
+                        .or_default()
+                        .push(name.to_string());
+                }
+            }
+        }
+        self.entries.insert(hash, entry);
+    }
+
+    /// Takes `hash`'s entry out of `entries` and of the `local_only` index.
+    fn take_entry(&mut self, hash: &str) -> Option<Entry> {
+        let entry = self.entries.remove(hash)?;
+        if let Some((dir, name)) = entry.remote_path.rsplit_once('/') {
+            if let Some(names) = self.local_only.get_mut(dir) {
+                let nfc = crate::tree::to_nfc(name);
+                if let Some(spellings) = names.get_mut(&nfc) {
+                    spellings.retain(|n| n != name);
+                    if spellings.is_empty() {
+                        names.remove(&nfc);
+                    }
+                }
+                if names.is_empty() {
+                    self.local_only.remove(dir);
+                }
+            }
+        }
+        Some(entry)
     }
 
     /// The draft's content-mutation counter — see `Entry::write_seq`'s doc.
@@ -427,13 +488,13 @@ impl DraftStore {
     /// landed upload as someone else's conflicting edit.
     pub fn set_base_etag(&mut self, remote_path: &str, etag: &str) -> Result<()> {
         let hash = hash16(remote_path);
-        let entry = self
-            .entries
-            .get_mut(&hash)
+        let mut entry = self
+            .take_entry(&hash)
             .ok_or_else(|| anyhow::anyhow!("no draft open for {remote_path}"))?;
         entry.base_etag = etag.to_string();
-        write_meta(&self.root, &hash, entry)?;
-        Ok(())
+        let persisted = write_meta(&self.root, &hash, &entry);
+        self.insert_entry(hash, entry);
+        persisted
     }
 
     /// The path the Uploader reads the draft's bytes from directly.
@@ -447,7 +508,7 @@ impl DraftStore {
     /// `BlockCache::remove_entry`'s style.
     pub fn remove(&mut self, remote_path: &str) -> Result<()> {
         let hash = hash16(remote_path);
-        self.entries.remove(&hash);
+        self.take_entry(&hash);
         let dir = self.entry_dir(&hash);
         if dir.exists() {
             fs::remove_dir_all(&dir)
@@ -471,8 +532,7 @@ impl DraftStore {
     pub fn rename(&mut self, from: &str, to: &str, new_base_etag: Option<&str>) -> Result<()> {
         let from_hash = hash16(from);
         let mut entry = self
-            .entries
-            .remove(&from_hash)
+            .take_entry(&from_hash)
             .ok_or_else(|| anyhow::anyhow!("no draft open for {from}"))?;
         entry.remote_path = to.to_string();
         if let Some(etag) = new_base_etag {
@@ -484,7 +544,7 @@ impl DraftStore {
             // Same shard (only possible if `from == to`): nothing to move
             // on disk, just persist the updated `remote_path`.
             write_meta(&self.root, &to_hash, &entry)?;
-            self.entries.insert(to_hash, entry);
+            self.insert_entry(to_hash, entry);
             return Ok(());
         }
 
@@ -502,7 +562,7 @@ impl DraftStore {
         })?;
 
         write_meta(&self.root, &to_hash, &entry)?;
-        self.entries.insert(to_hash, entry);
+        self.insert_entry(to_hash, entry);
         Ok(())
     }
 
@@ -2045,5 +2105,67 @@ mod tests {
             "a draft found Uploading after a restart must be demoted, never left/lost"
         );
         assert_eq!(s.pending(), vec!["crash-me.txt".to_string()]);
+    }
+
+    const FOLDER: &str = "cloudreve://my/sync/Photos";
+
+    #[test]
+    fn a_never_uploaded_draft_is_found_in_its_folder_by_either_unicode_form() {
+        let dir = TempDir::new().unwrap();
+        let mut s = DraftStore::open(dir.path()).unwrap();
+        // "été.jpg" as Linux writes it (NFC) ...
+        s.begin(&format!("{FOLDER}/\u{e9}t\u{e9}.jpg"), "", DraftInit::Empty).unwrap();
+        // ... found by the name Finder sends (NFD).
+        assert_eq!(s.local_only_child(FOLDER, "e\u{301}te\u{301}.jpg"), Some("\u{e9}t\u{e9}.jpg".to_string()));
+        assert_eq!(s.local_only_children(FOLDER), vec!["\u{e9}t\u{e9}.jpg".to_string()]);
+        // Only the folder it sits directly in.
+        assert_eq!(s.local_only_child("cloudreve://my/sync", "Photos"), None);
+        assert!(s.local_only_children("cloudreve://my/sync").is_empty());
+        // And the other way round: a draft left by a build that kept the
+        // name Finder sent.
+        s.begin(&format!("{FOLDER}/Mu\u{308}ller.pdf"), "", DraftInit::Empty).unwrap();
+        assert_eq!(s.local_only_child(FOLDER, "M\u{fc}ller.pdf"), Some("Mu\u{308}ller.pdf".to_string()));
+    }
+
+    #[test]
+    fn a_draft_with_a_remote_counterpart_is_not_a_local_only_child() {
+        let dir = TempDir::new().unwrap();
+        let mut s = DraftStore::open(dir.path()).unwrap();
+        s.begin(&format!("{FOLDER}/edited.jpg"), "etag-9", DraftInit::Empty).unwrap();
+        s.begin(&format!("{FOLDER}/new.jpg"), "", DraftInit::Empty).unwrap();
+        assert_eq!(s.local_only_child(FOLDER, "edited.jpg"), None);
+        // Its in-place upload landed while it was being written again.
+        s.set_base_etag(&format!("{FOLDER}/new.jpg"), "etag-10").unwrap();
+        assert_eq!(s.local_only_child(FOLDER, "new.jpg"), None);
+        assert!(s.local_only_children(FOLDER).is_empty());
+    }
+
+    #[test]
+    fn a_renamed_or_removed_draft_leaves_its_old_name_behind() {
+        let dir = TempDir::new().unwrap();
+        let mut s = DraftStore::open(dir.path()).unwrap();
+        let old = format!("{FOLDER}/IMG_0001.jpg.part");
+        s.begin(&old, "", DraftInit::Empty).unwrap();
+        s.rename(&old, "cloudreve://my/sync/Archive/IMG_0001.jpg", None).unwrap();
+        assert_eq!(s.local_only_child(FOLDER, "IMG_0001.jpg.part"), None);
+        assert_eq!(
+            s.local_only_child("cloudreve://my/sync/Archive", "IMG_0001.jpg"),
+            Some("IMG_0001.jpg".to_string())
+        );
+        s.remove("cloudreve://my/sync/Archive/IMG_0001.jpg").unwrap();
+        assert_eq!(s.local_only_child("cloudreve://my/sync/Archive", "IMG_0001.jpg"), None);
+    }
+
+    #[test]
+    fn reopening_the_store_still_finds_never_uploaded_drafts_by_name() {
+        let dir = TempDir::new().unwrap();
+        {
+            let mut s = DraftStore::open(dir.path()).unwrap();
+            s.begin(&format!("{FOLDER}/scan.pdf"), "", DraftInit::Empty).unwrap();
+            s.begin(&format!("{FOLDER}/known.pdf"), "etag-3", DraftInit::Empty).unwrap();
+        }
+        let s = DraftStore::open(dir.path()).unwrap();
+        assert_eq!(s.local_only_child(FOLDER, "scan.pdf"), Some("scan.pdf".to_string()));
+        assert_eq!(s.local_only_child(FOLDER, "known.pdf"), None);
     }
 }

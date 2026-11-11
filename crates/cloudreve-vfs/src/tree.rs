@@ -75,7 +75,7 @@ struct Inner {
     /// Ids assigned to (parent, name) pairs, kept even if the directory is
     /// ever re-listed, so a node's id never changes for the tree's lifetime
     /// — a rename re-keys the pair rather than minting a new id.
-    known_children: HashMap<(NodeId, String), NodeId>,
+    known_children: KnownChildren,
     /// Files whose own path was invalidated (SSE, write-back), mapped to
     /// the directory that lists them. Their `attrs` entry is kept — the
     /// kernel keeps addressing the file by this NodeId — but the next
@@ -83,6 +83,75 @@ struct Inner {
     /// serves the stale copy either. Cleared by that re-list.
     stale_files: HashMap<NodeId, NodeId>,
     next_id: u64,
+}
+
+/// `Inner::known_children`: the (parent, name) -> id map, plus a per-parent
+/// index of the same pairs keyed by NFC name. Every name lookup goes
+/// through the index, so resolving one child costs the same in a folder of
+/// ten files or of ten thousand — a linear scan of the folder per lookup
+/// made copying a big folder in quadratic (every CREATE is preceded by
+/// LOOKUPs of the new name). All mutation goes through `insert`/`remove`,
+/// which keep the two maps in step.
+#[derive(Default)]
+struct KnownChildren {
+    ids: HashMap<(NodeId, String), NodeId>,
+    /// parent -> NFC name -> the exact names under it (more than one only
+    /// when the server holds both an NFC and an NFD spelling).
+    by_nfc: HashMap<NodeId, HashMap<String, Vec<String>>>,
+}
+
+impl KnownChildren {
+    fn get(&self, key: &(NodeId, String)) -> Option<&NodeId> {
+        self.ids.get(key)
+    }
+
+    fn insert(&mut self, key: (NodeId, String), id: NodeId) {
+        let (parent, name) = key;
+        if self.ids.insert((parent, name.clone()), id).is_none() {
+            self.by_nfc.entry(parent).or_default().entry(to_nfc(&name)).or_default().push(name);
+        }
+    }
+
+    fn remove(&mut self, key: &(NodeId, String)) -> Option<NodeId> {
+        let id = self.ids.remove(key)?;
+        let (parent, name) = key;
+        if let Some(names) = self.by_nfc.get_mut(parent) {
+            let nfc = to_nfc(name);
+            if let Some(spellings) = names.get_mut(&nfc) {
+                spellings.retain(|n| n != name);
+                if spellings.is_empty() {
+                    names.remove(&nfc);
+                }
+            }
+            if names.is_empty() {
+                self.by_nfc.remove(parent);
+            }
+        }
+        Some(id)
+    }
+
+    /// Every known child of `parent`.
+    fn of(&self, parent: NodeId) -> impl Iterator<Item = NodeId> + '_ {
+        self.by_nfc
+            .get(&parent)
+            .into_iter()
+            .flat_map(|names| names.values().flatten())
+            .filter_map(move |name| self.ids.get(&(parent, name.clone())).copied())
+    }
+
+    /// The known children of `parent` whose name is `name` under NFC (see
+    /// [`to_nfc`]), the exact spelling first.
+    fn named(&self, parent: NodeId, name: &str) -> Vec<NodeId> {
+        let Some(spellings) = self.by_nfc.get(&parent).and_then(|names| names.get(&to_nfc(name))) else {
+            return Vec::new();
+        };
+        let mut ids: Vec<(bool, NodeId)> = spellings
+            .iter()
+            .filter_map(|n| self.ids.get(&(parent, n.clone())).map(|id| (n != name, *id)))
+            .collect();
+        ids.sort_by_key(|(inexact, _)| *inexact);
+        ids.into_iter().map(|(_, id)| id).collect()
+    }
 }
 
 pub struct VfsTree {
@@ -111,7 +180,7 @@ impl VfsTree {
                 attrs,
                 children: HashMap::new(),
                 listed_at: HashMap::new(),
-                known_children: HashMap::new(),
+                known_children: KnownChildren::default(),
                 stale_files: HashMap::new(),
                 next_id: 2, // NodeId(1) is the root.
             }),
@@ -136,19 +205,37 @@ impl VfsTree {
 
     /// Resolves one child by name, listing the parent first if needed.
     /// An exact match wins; otherwise a name equal under Unicode NFC
-    /// matches too (see [`same_name`]).
+    /// matches too (see [`to_nfc`]). Only a child of the listing
+    /// counts: a local-only entry is `lookup_known`'s.
     pub async fn lookup(&self, parent: NodeId, name: &str) -> Result<Option<(NodeId, NodeAttr)>> {
         self.ensure_listed(parent).await?;
         let inner = self.inner.read().await;
         let Some(ids) = inner.children.get(&parent) else {
             return Ok(None);
         };
-        let find = |matches: &dyn Fn(&str) -> bool| {
-            ids.iter().find_map(|id| {
-                inner.attrs.get(id).filter(|attr| matches(&attr.name)).map(|attr| (*id, attr.clone()))
-            })
-        };
-        Ok(find(&|n| n == name).or_else(|| find(&|n| same_name(n, name))))
+        // The index narrows to one or two candidates; the membership test
+        // compares ids only, never names.
+        Ok(inner
+            .known_children
+            .named(parent, name)
+            .into_iter()
+            .find(|id| ids.contains(id))
+            .and_then(|id| inner.attrs.get(&id).map(|attr| (id, attr.clone()))))
+    }
+
+    /// Resolves one child of `parent` among every child the tree knows by
+    /// (parent, name) — listed or local-only (`insert_local_entry`) — by
+    /// exact name, then by name under NFC. Never lists: what
+    /// `known_children_of` would return, filtered by name, without
+    /// collecting the whole folder.
+    #[doc(hidden)]
+    pub async fn lookup_known(&self, parent: NodeId, name: &str) -> Option<(NodeId, NodeAttr)> {
+        let inner = self.inner.read().await;
+        inner
+            .known_children
+            .named(parent, name)
+            .into_iter()
+            .find_map(|id| inner.attrs.get(&id).map(|attr| (id, attr.clone())))
     }
 
     /// Reads a node's own attributes. `node` must already be known, e.g.
@@ -677,9 +764,8 @@ impl VfsTree {
         let inner = self.inner.read().await;
         inner
             .known_children
-            .iter()
-            .filter(|((p, _), _)| *p == parent)
-            .filter_map(|(_, id)| inner.attrs.get(id).map(|attr| (*id, attr.clone())))
+            .of(parent)
+            .filter_map(|id| inner.attrs.get(&id).map(|attr| (id, attr.clone())))
             .collect()
     }
 
@@ -822,20 +908,16 @@ fn parse_rfc3339(s: &str) -> i64 {
         .unwrap_or(0)
 }
 
-/// Whether two file names are the same name to a user: byte-equal, or
-/// equal once both are in Unicode NFC. macOS hands names from Finder to a
-/// network volume decomposed (NFD: "e" + U+0301), while Linux, Windows and
-/// the Cloudreve web UI write them composed (NFC: U+00E9) — both render
-/// as "é", and must resolve to the same file.
-pub(crate) fn same_name(a: &str, b: &str) -> bool {
-    use unicode_normalization::UnicodeNormalization;
-    a == b || a.nfc().eq(b.nfc())
-}
-
-/// The NFC form of a name this facade is about to CREATE on the server
-/// (create, mkdir, rename target), so a file made on a Mac reaches the
-/// server under the same bytes every other client writes — see
-/// [`same_name`].
+/// The NFC form of a name. Two file names are the same name to a user
+/// when byte-equal, or equal once both are in Unicode NFC. macOS hands
+/// names from Finder to a network volume decomposed (NFD: "e" + U+0301),
+/// while Linux, Windows and the Cloudreve web UI write them composed (NFC:
+/// U+00E9) — both render as "é", and must resolve to the same file.
+/// Names are resolved through their NFC form (`KnownChildren`,
+/// `DraftStore::local_only_child`), and a name this facade is about to
+/// CREATE on the server (create, mkdir, rename target) is sent in it, so a
+/// file made on a Mac reaches the server under the same bytes every other
+/// client writes.
 pub(crate) fn to_nfc(name: &str) -> String {
     use unicode_normalization::UnicodeNormalization;
     name.nfc().collect()
