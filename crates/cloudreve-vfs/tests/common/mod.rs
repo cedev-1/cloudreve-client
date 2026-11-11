@@ -30,6 +30,14 @@ use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 /// index-keyed reassembly rather than a single-shot upload.
 pub const UPLOAD_CHUNK_SIZE: i64 = 5;
 
+/// The chunk size a session for `size` bytes gets: [`UPLOAD_CHUNK_SIZE`], or
+/// bigger for a file that would otherwise need more than 64 chunks — a
+/// multi-MiB file in 5-byte chunks is ~a million requests, minutes of a
+/// test spent on the mock alone.
+fn session_chunk_size(size: i64) -> i64 {
+    UPLOAD_CHUNK_SIZE.max((size + 63) / 64)
+}
+
 pub const REMOTE_BASE: &str = "cloudreve://my/sync";
 
 /// Full `cloudreve://` uri of a root-level file/dir under [`REMOTE_BASE`].
@@ -707,8 +715,9 @@ impl VfsTestEnv {
                     // A session is "in flight" from creation until its last
                     // expected chunk arrives (see the chunk-upload mock
                     // below) — review finding 3's concurrency signal.
+                    let chunk_size = session_chunk_size(request.size);
                     let expected_chunks =
-                        ((request.size.max(1) + UPLOAD_CHUNK_SIZE - 1) / UPLOAD_CHUNK_SIZE).max(1)
+                        ((request.size.max(1) + chunk_size - 1) / chunk_size).max(1)
                             as usize;
                     session_expected_chunks
                         .lock()
@@ -723,7 +732,7 @@ impl VfsTestEnv {
                         "data": {
                             "session_id": session_id,
                             "expires": 9_999_999_999i64,
-                            "chunk_size": UPLOAD_CHUNK_SIZE,
+                            "chunk_size": chunk_size,
                             "callback_secret": "",
                             "uri": request.uri,
                         },
