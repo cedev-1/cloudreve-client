@@ -13,8 +13,8 @@ import {
   Refresh as RefreshIcon,
   CloudOff as CloudOffIcon,
   Sync as SyncIcon,
-  PauseCircleOutline as PauseIcon,
-  PlayCircleOutline as PlayIcon,
+  PauseCircleOutlined as PauseIcon,
+  PlayCircleOutlined as PlayIcon,
   PauseCircle as PausedStatusIcon,
 } from "@mui/icons-material";
 import { useCallback, useEffect, useRef, useState } from "react";

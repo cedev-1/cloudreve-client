@@ -366,7 +366,7 @@ export default function DrivesSection() {
                         mb: 1,
                       }}
                     >
-                      <Typography variant="body1" fontWeight={600} noWrap>
+                      <Typography variant="body1" noWrap sx={{ fontWeight: 600 }}>
                         {drive.name}
                       </Typography>
                       <Box
@@ -677,9 +677,7 @@ export default function DrivesSection() {
             helperText={t("settings.maxFileSizeDescription", "0 = unlimited. Files larger than this will not be synced.")}
             variant="outlined"
             slotProps={{
-              input: {
-                inputProps: { min: 0 },
-              },
+              htmlInput: { min: 0 },
             }}
           />
         </DialogContent>

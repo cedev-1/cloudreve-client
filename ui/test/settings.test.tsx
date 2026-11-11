@@ -239,6 +239,7 @@ describe.each(LANGUAGES)("settings (%s)", (lng) => {
     expect(within(dlg).getByText(".DS_Store")).toBeInTheDocument();
     const size = within(dlg).getByRole("spinbutton", { name: s.maxFileSize });
     expect(size).toHaveValue(3072);
+    expect(size).toHaveAttribute("min", "0");
 
     await user.type(patterns, "{Enter}[[abc");
     await user.clear(size);
@@ -298,7 +299,10 @@ describe.each(LANGUAGES)("settings (%s)", (lng) => {
     expect(screen.getAllByText(s.language).length).toBeGreaterThan(0);
     expect(screen.getByText(generalSettings.log_dir)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: s.openFolder })).toBeInTheDocument();
-    expect(screen.getByRole("spinbutton")).toHaveValue(15);
+    const heartbeat = screen.getByRole("spinbutton");
+    expect(heartbeat).toHaveValue(15);
+    expect(heartbeat).toHaveAttribute("min", "5");
+    expect(heartbeat).toHaveAttribute("max", "120");
     // Language "auto" (null in the config), log level, kept log files.
     const selects = screen.getAllByRole("combobox");
     expect(selects.map((el) => el.textContent)).toEqual([s.languageAuto, "Info", "5"]);

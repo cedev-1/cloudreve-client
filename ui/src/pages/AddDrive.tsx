@@ -439,11 +439,9 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
                 🎉
               </Typography>
               <Typography
-                sx={{ mt: 2 }}
+                sx={{ mt: 2, fontWeight: 500, textAlign: "center" }}
                 variant="h5"
                 component="h1"
-                fontWeight={500}
-                textAlign="center"
               >
                 {isReauthorize ? t("addDrive.reauthorizeSuccessTitle") : t("addDrive.successTitle")}
               </Typography>
@@ -483,11 +481,9 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
             <>
               <CircularProgress size={48} sx={{ mt: 2 }} />
               <Typography
-                sx={{ mt: 2 }}
+                sx={{ mt: 2, fontWeight: 500, textAlign: "center" }}
                 variant="h6"
                 component="h1"
-                fontWeight={500}
-                textAlign="center"
               >
                 {t("addDrive.settingUp")}
               </Typography>
@@ -496,10 +492,9 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
             // Final setup state - local path input (hidden in reauthorize mode)
             <>
               <Typography
-                sx={{ mt: 2 }}
+                sx={{ mt: 2, fontWeight: 500 }}
                 variant="h5"
                 component="h1"
-                fontWeight={500}
               >
                 {isReauthorize ? t("addDrive.reauthorizeTitle") : t("addDrive.finalSetupTitle")}
               </Typography>
@@ -507,7 +502,7 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
               <Typography
                 variant="body2"
                 color="text.secondary"
-                textAlign="center"
+                sx={{ textAlign: "center" }}
               >
                 {isReauthorize ? t("addDrive.reauthorizeDescription") : t("addDrive.finalSetupDescription")}
               </Typography>
@@ -672,10 +667,9 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
             // Waiting for sign-in state
             <>
               <Typography
-                sx={{ mt: 2 }}
+                sx={{ mt: 2, fontWeight: 500 }}
                 variant="h5"
                 component="h1"
-                fontWeight={500}
               >
                 {t("addDrive.waitingTitle")}
               </Typography>
@@ -683,7 +677,7 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
               <Typography
                 variant="body2"
                 color="text.secondary"
-                textAlign="center"
+                sx={{ textAlign: "center" }}
               >
                 {t("addDrive.waitingDescription")}
               </Typography>
@@ -720,10 +714,9 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
             // Initial URL input state
             <>
               <Typography
-                sx={{ mt: 2 }}
+                sx={{ mt: 2, fontWeight: 500 }}
                 variant="h5"
                 component="h1"
-                fontWeight={500}
               >
                 {t("addDrive.title")}
               </Typography>
@@ -731,7 +724,7 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
               <Typography
                 variant="body2"
                 color="text.secondary"
-                textAlign="center"
+                sx={{ textAlign: "center" }}
               >
                 {t("addDrive.description")}
               </Typography>
