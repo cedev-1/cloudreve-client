@@ -37,8 +37,7 @@ enum IconType {
 
 /// Get the icons directory path
 fn get_icons_dir() -> Result<PathBuf> {
-    let home_dir = dirs::home_dir().context("Failed to get user home directory")?;
-    let icons_dir = home_dir.join(".cloudreve").join("icos");
+    let icons_dir = crate::utils::app_dir::app_data_root()?.join("icos");
 
     // Ensure icons directory exists
     if !icons_dir.exists() {

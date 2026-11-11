@@ -92,8 +92,7 @@ impl DriveManager {
 
     /// Get the .cloudreve config directory path
     fn get_config_dir() -> Result<PathBuf> {
-        let home_dir = dirs::home_dir().context("Failed to get user home directory")?;
-        Ok(home_dir.join(".cloudreve"))
+        crate::utils::app_dir::app_data_root()
     }
 
     /// Get the config file path
@@ -1260,8 +1259,24 @@ mod tests {
     /// (`ensure_listed`'s EEXIST check), so it needs a real (wiremock)
     /// server behind the config rather than a connection that always
     /// refuses.
+    /// Removes the drive's on-demand cache (`vfs_mode::cache_dir_for`, under the
+    /// app data root, not the temp dir) when the test ends, pass or fail:
+    /// left behind, every run added one more to it.
+    struct CacheCleanup {
+        _tmp: tempfile::TempDir,
+        drive_id: String,
+    }
+
+    impl Drop for CacheCleanup {
+        fn drop(&mut self) {
+            if let Ok(dir) = crate::drive::vfs_mode::cache_dir_for(&self.drive_id) {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+    }
+
     async fn manager_with_one_on_demand_drive_at(instance_url: &str)
-    -> (DriveManager, String, Arc<MountTestHook>, tempfile::TempDir) {
+    -> (DriveManager, String, Arc<MountTestHook>, CacheCleanup) {
         let tmp = tempfile::tempdir().unwrap();
         let inventory =
             Arc::new(InventoryDb::with_path(tmp.path().join("meta.db")).unwrap());
@@ -1321,7 +1336,8 @@ mod tests {
             glyphs: Default::default(),
         };
 
-        (manager, drive_id, hook, tmp)
+        let cleanup = CacheCleanup { _tmp: tmp, drive_id: drive_id.clone() };
+        (manager, drive_id, hook, cleanup)
     }
 
     /// Deleting `mount.remount_on_demand().await?` from `resume_drive`'s

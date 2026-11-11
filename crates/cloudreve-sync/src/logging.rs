@@ -27,9 +27,8 @@ pub struct LogConfig {
 
 impl Default for LogConfig {
     fn default() -> Self {
-        let log_dir = dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".cloudreve")
+        let log_dir = crate::utils::app_dir::app_data_root()
+            .unwrap_or_else(|_| PathBuf::from(".cloudreve"))
             .join("logs");
 
         Self {

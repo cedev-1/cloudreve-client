@@ -27,6 +27,16 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 pub const REMOTE_BASE: &str = "cloudreve://my/sync";
 
+/// Points the app's data root (drive caches, icons, logs, see
+/// `cloudreve_sync::utils::app_dir`) at a directory of this test process
+/// under the system temp dir, never the developer's real `~/.cloudreve`.
+/// Called by every `TestEnv`; a test that reaches the data root without
+/// one calls it itself.
+pub fn redirect_app_data() -> PathBuf {
+    let root = std::env::temp_dir().join("cloudreve-test-home");
+    cloudreve_sync::utils::app_dir::redirect_for_tests(&root)
+}
+
 /// A real, temporary HFS+ volume backed by RAM, detached on drop.
 ///
 /// Lets tests exercise behavior that only shows up on a separate filesystem
@@ -177,6 +187,7 @@ impl TestEnv {
         real_mount: bool,
         precreate_sync_dir: bool,
     ) -> Self {
+        redirect_app_data();
         let tmp = TempDir::new().expect("create temp dir");
         // The inventory DB deliberately stays in the temp dir: on an overridden
         // sync volume it would eat into the very free space under test.

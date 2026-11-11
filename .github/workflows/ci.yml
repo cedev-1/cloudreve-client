@@ -105,14 +105,28 @@ jobs:
           fusermount3 --version
 
       - name: Run tests
-        run: cargo test -p cloudreve-sync -p cloudreve-api -p cloudreve-uploader -p cloudreve-vfs -p cloudreve-finder-sync
-
-      - name: Desktop crate (Tauri commands)
-        # tauri-build requires the frontendDist directory to exist, but the
-        # Rust side (and the JSON the UI reads) needs no real frontend build.
+        # HOME is a fresh empty directory: a test that resolves the real
+        # home (~/.cloudreve: drive caches, icons, logs, drives.json) instead
+        # of its own temp dir shows up in the check below. On a developer's
+        # machine such a test filled ~/.cloudreve/vfs-cache with hundreds
+        # of leftover drive caches.
         run: |
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          export HOME="$RUNNER_TEMP/test-home"
+          mkdir -p "$HOME"
+          cargo test -p cloudreve-sync -p cloudreve-api -p cloudreve-uploader -p cloudreve-vfs -p cloudreve-finder-sync
+          # tauri-build requires the frontendDist directory to exist, but the
+          # Rust side (and the JSON the UI reads) needs no real frontend build.
           mkdir -p ui/dist
           cargo test -p cloudreve-desktop --lib
+
+      - name: Tests left the home directory alone
+        run: |
+          if [ -e "$RUNNER_TEMP/test-home/.cloudreve" ]; then
+            find "$RUNNER_TEMP/test-home/.cloudreve" | head -n 50
+            echo "::error::a test wrote into ~/.cloudreve (see app_dir::app_data_root)"
+            exit 1
+          fi
 
   test-macos:
     name: Rust tests (macOS)
@@ -149,6 +163,15 @@ jobs:
           # --nocapture: the E2E checkpoints locate a native crash, which
           # prints no panic message.
           RUST_BACKTRACE=1 cargo test -p cloudreve-sync --test finder_sidebar_macos -- --include-ignored --nocapture --test-threads=1
+
+      - name: Tests left ~/.cloudreve alone
+        # The runner starts without one: any here was made by a test.
+        run: |
+          if [ -e ~/.cloudreve ]; then
+            find ~/.cloudreve | head -n 50
+            echo "::error::a test wrote into ~/.cloudreve (see app_dir::app_data_root)"
+            exit 1
+          fi
 
   finder-sync-macos:
     # The Cloudreve glyph on the drive folders' Finder sidebar rows: the

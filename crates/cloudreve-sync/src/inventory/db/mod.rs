@@ -10,7 +10,6 @@ use diesel::Connection;
 use diesel::r2d2::{ConnectionManager, Pool, PooledConnection};
 use diesel::sqlite::SqliteConnection;
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
-use dirs::home_dir;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -60,8 +59,7 @@ impl InventoryDb {
     }
 
     fn get_db_path() -> Result<PathBuf> {
-        let home = home_dir().ok_or_else(|| anyhow!("Unable to determine home directory"))?;
-        Ok(home.join(".cloudreve").join("meta.db"))
+        Ok(crate::utils::app_dir::app_data_root()?.join("meta.db"))
     }
 
     pub(crate) fn connection(

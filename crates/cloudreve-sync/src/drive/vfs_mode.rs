@@ -45,8 +45,7 @@ pub const CACHE_FLOOR_BYTES: u64 = 512 * 1024 * 1024; // 512 MiB
 /// on disk) — this is purely `Vfs::new`'s block-cache/draft-store root plus
 /// the mount-identity marker `cleanup_stale_mount` reads.
 pub fn cache_dir_for(drive_id: &str) -> Result<PathBuf> {
-    let home = dirs::home_dir().context("failed to resolve the user's home directory")?;
-    Ok(home.join(".cloudreve").join("vfs-cache").join(drive_id))
+    Ok(crate::utils::app_dir::app_data_root()?.join("vfs-cache").join(drive_id))
 }
 
 /// Pure D3 formula: `min(default, max(floor, (available − reserve) / drives))`.
