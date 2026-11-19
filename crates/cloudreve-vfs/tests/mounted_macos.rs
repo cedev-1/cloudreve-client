@@ -1789,6 +1789,10 @@ async fn copying_a_folder_of_2000_files_in_finishes_and_uploads_every_file() {
     env.set_remote_files(vec![]).await;
     env.expect_uploads().await;
     env.expect_namespace_ops().await;
+    // With the 20 ms debounce, a file's empty CREATE draft can upload
+    // before the kernel sends its WRITE: the bytes then go up as a second
+    // upload, which overwrites the etag the listing gives the first one.
+    env.list_uploaded_files();
     let vfs = new_test_vfs(&env).await;
 
     let source = tempfile::tempdir().unwrap();

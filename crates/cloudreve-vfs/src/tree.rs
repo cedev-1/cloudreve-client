@@ -781,18 +781,32 @@ impl VfsTree {
     /// with a 40004 actually a file this could safely adopt, or a
     /// directory it must not) doesn't have to re-derive the same
     /// parent-lookup dance a second time.
+    ///
+    /// Only the parent's listing is expired — the entry itself is NOT
+    /// marked stale the way `invalidate_path` would. This is a question
+    /// the write-back asks about a draft it holds (before an upload, after
+    /// one), and a stale mark would let any listing that lacks the file
+    /// drop its node: a listing fetched before the upload landed (Finder,
+    /// a LOOKUP past the TTL) applied after this call, or a server still
+    /// catching up. The kernel keeps writing a just-copied file by its
+    /// fileid after its empty first draft uploaded, so each of its later
+    /// WRITE/SETATTRs then failed with ENOENT. A server entry missing from
+    /// the fresh listing is still pruned as a ghost; a remote delete of a
+    /// local-only one still comes through `invalidate_path` (SSE).
     pub async fn refresh_attrs(&self, remote_path: &str) -> Result<Option<NodeAttr>> {
         let Some((parent_path, name)) = remote_path.rsplit_once('/') else {
             return Ok(None);
         };
-        self.invalidate_path(remote_path).await;
         let parent_id = {
-            let inner = self.inner.read().await;
-            inner
+            let mut inner = self.inner.write().await;
+            let parent_id = inner
                 .attrs
                 .iter()
                 .find(|(_, attr)| attr.is_dir && attr.remote_path == parent_path)
-                .map(|(id, _)| *id)
+                .map(|(id, _)| *id);
+            if let Some(dir_id) = parent_id {
+                inner.listed_at.remove(&dir_id);            }
+            parent_id
         };
         let Some(parent_id) = parent_id else { return Ok(None) };
         Ok(self.lookup(parent_id, name).await?.map(|(_, attr)| attr))

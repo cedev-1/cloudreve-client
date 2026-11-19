@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -116,6 +116,10 @@ pub struct VfsTestEnv {
     /// drain sequentially, so this must never exceed 1.
     concurrent_uploads: Arc<AtomicUsize>,
     max_concurrent_uploads: Arc<AtomicUsize>,
+    /// Session id -> (uri, declared size), for `list_uploaded_files`.
+    session_targets: Arc<Mutex<HashMap<String, (String, i64)>>>,
+    /// See `list_uploaded_files`.
+    list_uploads: Arc<AtomicBool>,
     /// Artificial per-chunk delay applied by the chunk-upload mock, so a
     /// concurrency test has a wide enough window to actually observe two
     /// sessions overlapping if the write-back queue ever failed to
@@ -174,6 +178,8 @@ impl VfsTestEnv {
             Arc::new(Mutex::new(HashMap::new()));
         let concurrent_uploads = Arc::new(AtomicUsize::new(0));
         let max_concurrent_uploads = Arc::new(AtomicUsize::new(0));
+        let session_targets = Arc::new(Mutex::new(HashMap::new()));
+        let list_uploads = Arc::new(AtomicBool::new(false));
         let chunk_upload_delay = Arc::new(Mutex::new(Duration::ZERO));
         let create_file_calls = Arc::new(AtomicUsize::new(0));
         let delete_calls = Arc::new(AtomicUsize::new(0));
@@ -390,6 +396,8 @@ impl VfsTestEnv {
             session_expected_chunks,
             concurrent_uploads,
             max_concurrent_uploads,
+            session_targets,
+            list_uploads,
             chunk_upload_delay,
             create_file_calls,
             delete_calls,
@@ -653,6 +661,7 @@ impl VfsTestEnv {
             let session_expected_chunks = self.session_expected_chunks.clone();
             let concurrent_uploads = self.concurrent_uploads.clone();
             let max_concurrent_uploads = self.max_concurrent_uploads.clone();
+            let session_targets = self.session_targets.clone();
             Mock::given(method("PUT"))
                 .and(path("/api/v4/file/upload"))
                 .respond_with(move |req: &Request| {
@@ -711,6 +720,10 @@ impl VfsTestEnv {
                         .unwrap()
                         .insert(name, session_id.clone());
                     existing_upload_uris.lock().unwrap().insert(request.uri.clone());
+                    session_targets
+                        .lock()
+                        .unwrap()
+                        .insert(session_id.clone(), (request.uri.clone(), request.size));
 
                     // A session is "in flight" from creation until its last
                     // expected chunk arrives (see the chunk-upload mock
@@ -751,6 +764,9 @@ impl VfsTestEnv {
             let session_expected_chunks = self.session_expected_chunks.clone();
             let concurrent_uploads = self.concurrent_uploads.clone();
             let chunk_upload_delay = self.chunk_upload_delay.clone();
+            let session_targets = self.session_targets.clone();
+            let list_uploads = self.list_uploads.clone();
+            let files = self.files.clone();
             Mock::given(method("POST"))
                 .and(path_regex(r"^/api/v4/file/upload/[^/]+/[0-9]+$"))
                 .respond_with(move |req: &Request| {
@@ -781,6 +797,10 @@ impl VfsTestEnv {
                         .copied();
                     if expected == Some(received_count) {
                         concurrent_uploads.fetch_sub(1, Ordering::SeqCst);
+                        let target = session_targets.lock().unwrap().get(&session_id).cloned();
+                        if let (true, Some((uri, size))) = (list_uploads.load(Ordering::SeqCst), target) {
+                            list_upload(&mut files.lock().unwrap(), &uri, size, &session_id);
+                        }
                     }
 
                     let delay = *chunk_upload_delay.lock().unwrap();
@@ -790,6 +810,17 @@ impl VfsTestEnv {
                 .mount(&self.server)
                 .await;
         }
+    }
+
+    /// From now on, a completed upload shows up in its folder's listing
+    /// (replacing any entry at that path, with a fresh etag), as on a real
+    /// Cloudreve server. Off by default: most tests here pin what a listing
+    /// that lags the upload does. A file the kernel writes again after its
+    /// first upload landed (an NFS `cp` whose empty CREATE draft uploads
+    /// before its WRITE) can only re-upload once the listing gives it an
+    /// etag to overwrite.
+    pub fn list_uploaded_files(&self) {
+        self.list_uploads.store(true, Ordering::SeqCst);
     }
 
     /// The highest number of upload sessions ever simultaneously "in
@@ -1138,6 +1169,24 @@ impl VfsTestEnv {
 /// at exactly `target_path` — the read-only counterpart of
 /// `remove_entry_by_path`, used by the upload-session mock's `ObjectExisted`
 /// simulation (see `expect_uploads`'s doc).
+/// `list_uploaded_files`: puts the file an upload session created at `uri`
+/// into its folder's listing, the session id as its new etag.
+fn list_upload(files: &mut HashMap<String, Vec<Value>>, uri: &str, size: i64, session_id: &str) {
+    let Some((dir, name)) = uri.rsplit_once('/') else { return };
+    let list = files.entry(dir.to_string()).or_default();
+    list.retain(|f| f.get("path").and_then(Value::as_str) != Some(uri));
+    list.push(json!({
+        "type": 0,
+        "id": format!("file-{name}"),
+        "name": name,
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-02T00:00:00Z",
+        "size": size,
+        "path": uri,
+        "primary_entity": session_id,
+    }));
+}
+
 fn path_exists_in_files(files: &HashMap<String, Vec<Value>>, target_path: &str) -> bool {
     files
         .values()
