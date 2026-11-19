@@ -805,7 +805,8 @@ impl VfsTree {
                 .find(|(_, attr)| attr.is_dir && attr.remote_path == parent_path)
                 .map(|(id, _)| *id);
             if let Some(dir_id) = parent_id {
-                inner.listed_at.remove(&dir_id);            }
+                inner.listed_at.remove(&dir_id);
+            }
             parent_id
         };
         let Some(parent_id) = parent_id else { return Ok(None) };
