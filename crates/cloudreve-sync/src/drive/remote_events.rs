@@ -64,6 +64,23 @@ fn local_event_path(sync_root: &Path, event_path: &str) -> Option<PathBuf> {
     }
 }
 
+/// `dir` and every folder under it (not following symlinks).
+fn walkdir_dirs(dir: &Path) -> Vec<PathBuf> {
+    let mut out = vec![dir.to_path_buf()];
+    let mut i = 0;
+    while i < out.len() {
+        if let Ok(entries) = std::fs::read_dir(&out[i]) {
+            for entry in entries.flatten() {
+                if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                    out.push(entry.path());
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 /// Consecutive failures after which the outage is logged as an error.
 const ERROR_AFTER_FAILURES: u32 = 5;
 
@@ -364,21 +381,22 @@ impl Mount {
         let mut from_grouped: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
         let mut to_grouped: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
         // A folder renamed or moved on the server arrives as ONE event: its
-        // old local copy goes file by file (`perform_sync` expands it), and
-        // its content under the new name can only come from a listing — a
-        // download of the new path is a download of a folder.
+        // old local copy is removed right here, and its content under the
+        // new name can only come from a listing — a download of the new path
+        // is a download of a folder. Removed BEFORE that full sync, not by
+        // queued downloads: the full sync forgets the old files' inventory
+        // rows (server-deleted, kept locally), and a download running after
+        // that could no longer tell them from local work.
         let mut folder_moved = false;
 
         for event in events {
             if let Some(local_from) = local_event_path(&sync_root, &event.from) {
                 if local_from.is_dir() {
                     folder_moved = true;
-                    if let Some(parent) = local_from.parent() {
-                        from_grouped.entry(parent.to_path_buf()).or_default().push(local_from.clone());
-                    }
                     if let Err(e) = self.task_queue.cancel_by_path(&local_from).await {
                         tracing::warn!(target: "drive::remote_events", path = %local_from.display(), error = %format_args!("{e:#}"), "Failed to cancel tasks for renamed-from path");
                     }
+                    self.remove_synced_copies_under(&sync_root, &local_from).await;
                     continue;
                 }
                 if local_from.exists() {
@@ -412,6 +430,39 @@ impl Mount {
             self.command_tx.send(MountCommand::FullSync).context("Failed to send full sync command")?;
         }
         Ok(())
+    }
+
+    /// Removes the files under `dir` that are exactly what was last synced
+    /// (tracked, unchanged here) and forgets them, then the folders that
+    /// leaves empty. A file added or edited here since stays, with its
+    /// folders: it exists nowhere else.
+    async fn remove_synced_copies_under(&self, sync_root: &Path, dir: &Path) {
+        let files = match crate::drive::sync::walk_local(dir.to_path_buf()).await {
+            Ok(files) => files,
+            Err(e) => {
+                tracing::warn!(target: "drive::remote_events", path = %dir.display(), error = %format_args!("{e:#}"), "Failed to list a folder moved on the server");
+                return;
+            }
+        };
+        for file in files {
+            let Some(path_str) = file.to_str() else { continue };
+            let synced = matches!(self.inventory.query_by_path(path_str), Ok(Some(meta)) if !meta.is_locally_modified(&file));
+            if !synced {
+                tracing::info!(target: "drive::remote_events", path = %file.display(), "Keeping a local file of a folder moved on the server: changed here since the last sync");
+                continue;
+            }
+            if std::fs::remove_file(&file).is_ok() {
+                let _ = self.inventory.batch_delete_by_path(vec![path_str]);
+            }
+        }
+        // Deepest first; `remove_dir` only removes an empty folder.
+        let mut dirs: Vec<PathBuf> = walkdir_dirs(dir);
+        dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
+        for d in dirs {
+            if is_inside(sync_root, &d) {
+                let _ = std::fs::remove_dir(&d);
+            }
+        }
     }
 
     async fn handle_delete_events(&self, sync_root: PathBuf, events: Vec<FileEventData>) -> Result<()> {

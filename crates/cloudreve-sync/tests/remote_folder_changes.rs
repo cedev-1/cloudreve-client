@@ -119,6 +119,7 @@ async fn a_folder_renamed_on_the_server_leaves_its_old_name_and_is_fetched_under
     env.set_remote_files(vec![remote_file("report.txt", 6, "e-report")]).await;
     env.write_local("old-name/report.txt", b"report");
     env.track_synced("old-name/report.txt", "e-report");
+    env.write_local("old-name/draft.txt", b"local draft");
     mock_gone_under(&env.server, "cloudreve://my/sync/old-name/report.txt").await;
     mock_sse_event(
         &env.server,
@@ -131,8 +132,10 @@ async fn a_folder_renamed_on_the_server_leaves_its_old_name_and_is_fetched_under
     mount.spawn_command_processor(mount.clone()).await;
     tokio::spawn(run_remote_event_loop(mount));
 
-    let old = env.local_path("old-name");
-    wait_until("the old folder name is still here", || !old.exists()).await;
+    let old = env.local_path("old-name/report.txt");
+    wait_until("the old folder's synced file is still here", || !old.exists()).await;
+    // Work the server never saw stays where it was.
+    assert_eq!(std::fs::read(env.local_path("old-name/draft.txt")).unwrap(), b"local draft");
     // The new name's content comes from a listing of the drive.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
