@@ -243,7 +243,17 @@ impl<'a> DownloadTask<'a> {
                     code = code,
                     "Remote file no longer exists, removing local file"
                 );
-                if local_path.exists() && !local_path.is_dir() {
+                // Only what the server had and this computer did not change
+                // since: a file added here and not uploaded yet, or edited
+                // here after the last sync, exists nowhere else — the
+                // server deleting its folder is no reason to destroy it.
+                let synced_copy = self
+                    .inventory_meta
+                    .as_ref()
+                    .is_some_and(|meta| !meta.is_locally_modified(&local_path));
+                if local_path.exists() && !local_path.is_dir() && !synced_copy {
+                    info!(target: "tasks::download", task_id = %self.task.task_id, path = %local_path.display(), "Keeping a local file the server never had in this state");
+                } else if local_path.exists() && !local_path.is_dir() {
                     if let Err(e) = std::fs::remove_file(&local_path) {
                         warn!(
                             target: "tasks::download",
@@ -252,6 +262,18 @@ impl<'a> DownloadTask<'a> {
                             error = %format_args!("{e:#}"),
                             "Failed to remove local file mirroring remote deletion"
                         );
+                    } else {
+                        // A folder deleted on the server goes file by file
+                        // (see `perform_sync`'s RemoteChanged arm): the last
+                        // file out takes the folders it emptied with it.
+                        // `remove_dir` only ever removes an empty folder.
+                        let mut dir = local_path.parent();
+                        while let Some(d) = dir {
+                            if d == self.sync_path || !is_inside(&self.sync_path, d) || std::fs::remove_dir(d).is_err() {
+                                break;
+                            }
+                            dir = d.parent();
+                        }
                     }
                 }
                 return Ok(());

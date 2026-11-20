@@ -879,8 +879,27 @@ impl Mount {
                 }
             }
             SyncMode::RemoteChanged => {
+                // The server sends one event for a folder, never one per
+                // file in it. A folder that changed (deleted, renamed away)
+                // is checked file by file: each download asks the server
+                // about its own path, and removes the local copy when the
+                // server no longer has it. Skipping folders left a folder
+                // deleted on the web on this computer for good.
+                let mut expanded = Vec::with_capacity(local_paths.len());
                 for path in local_paths {
-                    if path.is_dir() || self.is_ignored(&path).await {
+                    if path.is_dir() {
+                        match crate::drive::sync::walk_local(path.clone()).await {
+                            Ok(files) => expanded.extend(files),
+                            Err(e) => {
+                                tracing::warn!(target: "drive::mounts", path = %path.display(), error = %format_args!("{e:#}"), "Failed to list a remotely changed folder");
+                            }
+                        }
+                    } else {
+                        expanded.push(path);
+                    }
+                }
+                for path in expanded {
+                    if self.is_ignored(&path).await {
                         continue;
                     }
                     tracing::debug!(target: "drive::mounts", path = %path.display(), "Enqueuing download for remote change");

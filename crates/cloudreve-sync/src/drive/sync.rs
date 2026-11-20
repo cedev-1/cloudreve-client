@@ -538,7 +538,7 @@ async fn load_db_entries(
 /// syscall, and on a large sync folder the walk takes long enough that doing it
 /// on a runtime thread stalls every other task on that thread — downloads,
 /// uploads and the UI's status polling included.
-async fn walk_local(root: PathBuf) -> Result<Vec<PathBuf>> {
+pub(crate) async fn walk_local(root: PathBuf) -> Result<Vec<PathBuf>> {
     tokio::task::spawn_blocking(move || {
         if !root.is_dir() {
             anyhow::bail!(

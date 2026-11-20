@@ -363,9 +363,24 @@ impl Mount {
     async fn handle_rename_events(&self, sync_root: PathBuf, events: Vec<FileEventData>) -> Result<()> {
         let mut from_grouped: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
         let mut to_grouped: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+        // A folder renamed or moved on the server arrives as ONE event: its
+        // old local copy goes file by file (`perform_sync` expands it), and
+        // its content under the new name can only come from a listing — a
+        // download of the new path is a download of a folder.
+        let mut folder_moved = false;
 
         for event in events {
             if let Some(local_from) = local_event_path(&sync_root, &event.from) {
+                if local_from.is_dir() {
+                    folder_moved = true;
+                    if let Some(parent) = local_from.parent() {
+                        from_grouped.entry(parent.to_path_buf()).or_default().push(local_from.clone());
+                    }
+                    if let Err(e) = self.task_queue.cancel_by_path(&local_from).await {
+                        tracing::warn!(target: "drive::remote_events", path = %local_from.display(), error = %format_args!("{e:#}"), "Failed to cancel tasks for renamed-from path");
+                    }
+                    continue;
+                }
                 if local_from.exists() {
                     if let Some(parent) = local_from.parent() {
                         from_grouped.entry(parent.to_path_buf()).or_default().push(local_from.clone());
@@ -392,6 +407,9 @@ impl Mount {
 
         for (parent, paths) in from_grouped.into_iter().chain(to_grouped) {
             self.sync_parent(sync_root.clone(), parent, paths).await?;
+        }
+        if folder_moved {
+            self.command_tx.send(MountCommand::FullSync).context("Failed to send full sync command")?;
         }
         Ok(())
     }
