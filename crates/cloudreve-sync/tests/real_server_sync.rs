@@ -183,6 +183,41 @@ fn deleting_in_a_mirror_drive_moves_files_and_folders_to_the_server_trash() {
     })
 }
 
+/// "Delete and rename in the cloud too" off (every drive added before the
+/// switch existed): the server keeps what is deleted here, and a renamed
+/// file is uploaded under its new name next to the old one. Turned on from
+/// Settings, the next delete goes through — no restart.
+#[test]
+fn a_mirror_drive_switched_off_keeps_the_server_untouched_until_switched_on() {
+    run(async {
+        let Some(app) = App::add("mirror-switch", Opts { propagate_deletes: false, ..Opts::default() }, |r| async move {
+            r.put("kept.txt", b"kept").await;
+            r.put("old-name.txt", b"renamed").await;
+            r.put("later.txt", b"later").await;
+        })
+        .await
+        else {
+            return;
+        };
+        wait_local(&app, "kept.txt", b"kept").await;
+        wait_local(&app, "old-name.txt", b"renamed").await;
+        wait_local(&app, "later.txt", b"later").await;
+        tokio::time::sleep(SETTLE).await;
+
+        std::fs::remove_file(app.local("kept.txt")).unwrap();
+        std::fs::rename(app.local("old-name.txt"), app.local("new-name.txt")).unwrap();
+        wait_remote(&app.remote, "new-name.txt", b"renamed").await;
+        tokio::time::sleep(SETTLE).await;
+        assert_eq!(app.remote.read("kept.txt").await.unwrap(), b"kept", "deleted while switched off");
+        assert_eq!(app.remote.read("old-name.txt").await.unwrap(), b"renamed", "renamed while switched off");
+
+        app.manager.set_drive_propagate_deletes(&app.id, true).await.unwrap();
+        std::fs::remove_file(app.local("later.txt")).unwrap();
+        wait_remote_gone(&app.remote, "later.txt").await;
+        app.cleanup().await;
+    })
+}
+
 #[test]
 fn renaming_and_moving_in_a_mirror_drive_renames_and_moves_on_the_server() {
     run(async {

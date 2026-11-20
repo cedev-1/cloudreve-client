@@ -7,6 +7,19 @@
 //! is renamed or moved there. On-demand drives are not concerned: their
 //! volume (`cloudreve-vfs`) sends deletes and renames itself.
 //!
+//! # A per-drive choice
+//!
+//! All of this follows `DriveConfig::propagate_deletes` ("Delete and
+//! rename in the cloud too"): on by default for a drive added since it
+//! exists, off for a drive saved before (an upgrade must never start
+//! deleting on the server by itself), switchable live from Settings. Off,
+//! a mirror drive behaves as it always did: a local delete only forgets the
+//! file, a rename uploads the new name. The switch is checked at every
+//! entry: [`Mount::propagate_local_removals`], `full_sync`, and the
+//! executors when a queued task runs (`RemoteOps::propagate`) — so a task
+//! queued while it was on and replayed after it was turned off (reconnect,
+//! next launch) touches nothing; turning it off also drops those queued.
+//!
 //! # Two ways in
 //!
 //! **Live** — the fs watcher (`Mount::start_fs_watcher`, 2 s debounce)

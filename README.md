@@ -39,6 +39,8 @@ The choice is made when you add the drive and cannot be changed afterwards. To s
 
 ### Deleting and renaming in a "Download everything" drive
 
+This follows the drive's **Delete and rename in the cloud too** switch, on by default when you add a drive and changeable at any time in **Settings › Drives**. Drives added with an older version keep it off until you turn it on: an update never starts deleting in your cloud by itself. When it is off, nothing you delete here is deleted from your cloud, and a renamed file is uploaded again under its new name. When it is on:
+
 - **Deleting** a file or folder deletes it from your cloud too, into the Cloudreve trash: restore it from the web interface if it was a mistake. Deleted while the app was closed or offline, it is deleted at the next sync.
 - **Renaming or moving** a file or folder inside the drive renames or moves it in your cloud (no second copy under the new name). A rename made while the app was closed is applied as a delete of the old name plus an upload of the new one; the old version stays in the trash.
 - **Changed elsewhere first**: if a file you deleted here was changed on the server since it was last synced, the server's version wins: it is downloaded back instead of deleted.

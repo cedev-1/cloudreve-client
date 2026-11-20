@@ -104,11 +104,14 @@ pub struct Opts {
     /// On-demand only: mount through the OS for real (NFS on macOS, FUSE on
     /// Linux) instead of stubbing the mount seam.
     pub real_mount: bool,
+    /// Mirror drives: "delete and rename in the cloud too". On, like a
+    /// drive added from the add-drive window by default.
+    pub propagate_deletes: bool,
 }
 
 impl Default for Opts {
     fn default() -> Self {
-        Opts { mode: DriveMode::FullMirror, proxied: false, max_file_size_mb: 3072, real_mount: false }
+        Opts { mode: DriveMode::FullMirror, proxied: false, max_file_size_mb: 3072, real_mount: false, propagate_deletes: true }
     }
 }
 
@@ -158,6 +161,7 @@ impl App {
             max_file_size_mb: opts.max_file_size_mb,
             sse_client_id: uuid::Uuid::new_v4().to_string(),
             mode: opts.mode,
+            propagate_deletes: opts.propagate_deletes,
             // Never touch the Finder sidebar of the machine running this.
             sidebar: SidebarSettings { enabled: false, added: false },
             ..Default::default()
