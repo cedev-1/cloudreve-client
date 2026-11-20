@@ -428,8 +428,12 @@ impl Remote {
             .send()
             .await
             .expect("file url request");
-        let data = unwrap_envelope("file url", resp).await;
-        let url = data["urls"][0]["url"].as_str().expect("download url").to_string();
+        let v: Value = resp.json().await.expect("file url json");
+        if v["code"].as_i64() != Some(0) {
+            // Same: listed, but no content to hand out yet.
+            return None;
+        }
+        let url = v["data"]["urls"][0]["url"].as_str().expect("download url").to_string();
         // The server signs urls with its own SiteURL; aim them at the server
         // we actually talk to.
         let path = url.splitn(4, '/').nth(3).unwrap_or_default();
@@ -439,6 +443,11 @@ impl Remote {
             .send()
             .await
             .expect("download request");
+        // A file whose upload is still running is listed before it has any
+        // content: no bytes yet, like a file that does not exist.
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return None;
+        }
         assert!(resp.status().is_success(), "download of {rel}: HTTP {}", resp.status());
         Some(resp.bytes().await.expect("download body").to_vec())
     }
