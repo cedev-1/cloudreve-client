@@ -333,6 +333,7 @@ async fn an_ignored_file_deleted_locally_is_never_deleted_on_the_server() {
     env.track_synced(".DS_Store", "e-junk");
     std::fs::remove_file(env.local_path(".DS_Store")).unwrap();
     env.set_remote_files(vec![remote_file("doc.txt", 3, "e-doc"), remote_file(".DS_Store", 4, "e-junk")]).await;
+    mock_info(&env.server, ".DS_Store", remote_file(".DS_Store", 4, "e-junk")).await;
     accept_writes(&env.server).await;
 
     env.full_sync().await.unwrap();
@@ -399,6 +400,78 @@ async fn a_rename_parked_offline_is_replayed_as_a_rename_on_reconnect() {
     let renames = requests(&env.server, "POST", "/api/v4/file/rename").await;
     assert_eq!(renames[0], json!({ "uri": uri("before.txt"), "new_name": "after.txt" }));
     assert!(deletes(&env.server).await.is_empty());
+}
+
+/// A full sync running while a rename waits in the queue (offline, say)
+/// must not also see it as a delete of the old name and a new file.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_full_sync_leaves_a_queued_rename_alone() {
+    let env = TestEnv::new().await;
+    env.write_local("after.txt", b"content");
+    env.track_synced("after.txt", "e-1");
+    env.inventory
+        .rename_path(env.local_path("after.txt").to_str().unwrap(), env.local_path("before.txt").to_str().unwrap())
+        .unwrap();
+    env.set_remote_files(vec![remote_file("before.txt", 7, "e-1")]).await;
+    accept_writes(&env.server).await;
+    let record = NewTaskRecord::new(
+        uuid::Uuid::new_v4().to_string(),
+        env.drive_id.clone(),
+        "move",
+        env.local_path("after.txt").to_string_lossy().to_string(),
+    )
+    .with_custom_state(json!({ "from": env.local_path("before.txt").to_string_lossy(), "offline_waiting": true }));
+    env.inventory.insert_task_if_not_exist(&record).unwrap();
+
+    env.full_sync().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert!(env.tasks_of_type("delete").is_empty(), "{:?}", env.tasks_of_type("delete"));
+    assert!(env.tasks_of_type("upload").is_empty(), "{:?}", env.tasks_of_type("upload"));
+    assert!(deletes(&env.server).await.is_empty());
+}
+
+/// Replayed at reconnection, then the app quits while the rename is still
+/// in flight: the next launch resumes it — still as a rename, so the task
+/// must still know its source after the reconnection replay.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replayed_rename_cut_off_by_quitting_is_resumed_as_a_rename_at_launch() {
+    let mut env = TestEnv::new().await;
+    env.write_local("after.txt", b"content");
+    env.track_synced("after.txt", "e-1");
+    env.inventory
+        .rename_path(env.local_path("after.txt").to_str().unwrap(), env.local_path("before.txt").to_str().unwrap())
+        .unwrap();
+    env.set_remote_files(vec![remote_file("before.txt", 7, "e-1")]).await;
+    mock_info(&env.server, "before.txt", remote_file("before.txt", 7, "e-1")).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v4/file/rename"))
+        .respond_with(ok(remote_file("after.txt", 7, "e-1")).set_delay(Duration::from_secs(2)))
+        .mount(&env.server)
+        .await;
+    let record = NewTaskRecord::new(
+        uuid::Uuid::new_v4().to_string(),
+        env.drive_id.clone(),
+        "move",
+        env.local_path("after.txt").to_string_lossy().to_string(),
+    )
+    .with_custom_state(json!({ "from": env.local_path("before.txt").to_string_lossy(), "offline_waiting": true }));
+    env.inventory.insert_task_if_not_exist(&record).unwrap();
+
+    env.mount.re_enqueue_offline_tasks().await.unwrap();
+    wait_for("the rename to be in flight", || async {
+        !requests(&env.server, "POST", "/api/v4/file/rename").await.is_empty()
+    })
+    .await;
+    env.mount.shutdown().await;
+    env.restart_mount().await;
+
+    wait_for("the rename to be sent again", || async {
+        requests(&env.server, "POST", "/api/v4/file/rename").await.len() == 2
+    })
+    .await;
+    let renames = requests(&env.server, "POST", "/api/v4/file/rename").await;
+    assert_eq!(renames[1], json!({ "uri": uri("before.txt"), "new_name": "after.txt" }));
 }
 
 // ---------------------------------------------------------------- live path
@@ -536,6 +609,31 @@ async fn renaming_a_folder_renames_it_once_on_the_server() {
     assert!(env.db_entry("Docs/a.txt").is_none());
 }
 
+/// The folder deleted here holds, on the server, a file added there since
+/// the last sync: deleting the folder would take it. Only the file this
+/// computer had goes; the other one comes down.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_live_folder_delete_never_takes_a_file_added_on_the_server_meanwhile() {
+    let (_t, env) = live_env(&[
+        ("Team/mine.txt", b"m", "e-m"),
+        ("k1.txt", b"1", "e-1"),
+        ("k2.txt", b"2", "e-2"),
+        ("k3.txt", b"3", "e-3"),
+    ])
+    .await;
+    env.server.reset().await;
+    mock_folder(&env.server, "Team", vec![remote_file("Team/mine.txt", 1, "e-m"), remote_file("Team/theirs.txt", 6, "e-t")]).await;
+    mock_info(&env.server, "Team", remote_folder("Team")).await;
+    accept_writes(&env.server).await;
+
+    std::fs::remove_dir_all(env.local_path("Team")).unwrap();
+
+    wait_for("the delete request", || async { !deletes(&env.server).await.is_empty() }).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(deleted_uris(&env.server).await, vec![uri("Team/mine.txt")]);
+    assert!(env.tasks_of_type("download").iter().any(|t| t.local_path.ends_with("Team/theirs.txt")));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn deleting_a_synced_folder_deletes_it_on_the_server() {
     let (_t, env) = live_env(&[
@@ -609,6 +707,55 @@ async fn the_sync_folder_disappearing_deletes_nothing_on_the_server() {
 
     std::fs::remove_dir_all(&env.sync_dir).unwrap();
     settle().await;
+
+    assert!(deletes(&env.server).await.is_empty());
+    assert!(env.db_entry("a.txt").is_some());
+}
+
+/// What the watcher reports once the sync folder is gone depends on the
+/// platform (macOS mostly reports the folder itself). Whatever it is, a
+/// deletion reported while the folder is unreachable deletes nothing: the
+/// batch goes in through the same command the watcher sends.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deletion_reported_while_the_sync_folder_is_gone_deletes_nothing() {
+    let (_t, env) = live_env(&[("a.txt", b"a", "e-a"), ("b.txt", b"b", "e-b")]).await;
+    env.set_remote_files(vec![]).await;
+    mock_info(&env.server, "a.txt", remote_file("a.txt", 1, "e-a")).await;
+    accept_writes(&env.server).await;
+
+    std::fs::remove_dir_all(&env.sync_dir).unwrap();
+    env.mount
+        .command_tx
+        .send(cloudreve_sync::drive::commands::MountCommand::LocalChanges {
+            changed: vec![],
+            deleted: vec![env.local_path("a.txt")],
+            renamed: vec![],
+        })
+        .unwrap();
+    settle().await;
+
+    assert!(env.tasks_of_type("delete").is_empty());
+    assert!(deletes(&env.server).await.is_empty());
+    assert!(env.db_entry("a.txt").is_some());
+}
+
+/// A delete queued while the folder was there, run once it is gone (the
+/// volume ejected meanwhile, replayed at the next launch): not sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_queued_delete_is_not_sent_once_the_sync_folder_is_gone() {
+    let env = TestEnv::new().await;
+    env.write_local("a.txt", b"a");
+    env.track_synced("a.txt", "e-a");
+    env.set_remote_files(vec![]).await;
+    mock_info(&env.server, "a.txt", remote_file("a.txt", 1, "e-a")).await;
+    accept_writes(&env.server).await;
+    std::fs::remove_dir_all(&env.sync_dir).unwrap();
+
+    env.mount.task_queue.enqueue(cloudreve_sync::tasks::TaskPayload::delete(env.local_path("a.txt"))).await.unwrap();
+    wait_for("the task to finish", || async {
+        env.tasks_of_type("delete").iter().all(|t| !t.status.is_active())
+    })
+    .await;
 
     assert!(deletes(&env.server).await.is_empty());
     assert!(env.db_entry("a.txt").is_some());

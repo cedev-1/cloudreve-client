@@ -527,6 +527,22 @@ mod tests {
         assert!(db.query_by_path("/s/myXdocs/c.txt").unwrap().is_some(), "a sibling was renamed too");
     }
 
+    /// Forgetting a deleted folder forgets its rows only: a look-alike
+    /// sibling losing its rows would see its files re-uploaded, or deleted
+    /// on the server after a later local delete went unnoticed.
+    #[test]
+    fn forgetting_a_folder_leaves_look_alike_siblings_alone() {
+        let (_dir, db) = test_db();
+        let drive = Uuid::new_v4();
+        db.upsert(&entry(drive, "/s/my_docs/a.txt", "e-a")).unwrap();
+        db.upsert(&entry(drive, "/s/myXdocs/c.txt", "e-c")).unwrap();
+
+        db.batch_delete_by_path(vec!["/s/my_docs"]).unwrap();
+
+        assert!(db.query_by_path("/s/my_docs/a.txt").unwrap().is_none());
+        assert!(db.query_by_path("/s/myXdocs/c.txt").unwrap().is_some(), "a sibling was forgotten too");
+    }
+
     /// The size of a drive, as the mass-deletion guard sees it: its files,
     /// not its folders, and not another drive's.
     #[test]
