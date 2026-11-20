@@ -130,10 +130,17 @@ impl RemoteOps<'_> {
         }
     }
 
-    async fn info(&self, uri: &CrUri) -> std::result::Result<FileResponse, ApiError> {
-        self.cr_client
+    /// What the server has at `uri`, `None` when it has nothing there.
+    async fn info(&self, uri: &CrUri) -> Result<Option<FileResponse>> {
+        match self
+            .cr_client
             .get_file_info(&GetFileInfoService { uri: Some(uri.to_string()), id: None, extended: None, folder_summary: None })
             .await
+        {
+            Ok(remote) => Ok(Some(remote)),
+            Err(e) if is_not_found(&e) => Ok(None),
+            Err(e) => Err(anyhow::Error::from(e).context("failed to get remote file info")),
+        }
     }
 
     /// Into the server's trash: neither `skip_soft_delete` nor `unlink`,
@@ -167,13 +174,9 @@ impl RemoteOps<'_> {
             return Ok(Vec::new());
         }
         let uri = self.uri(local)?;
-        let remote = match self.info(&uri).await {
-            Ok(remote) => remote,
-            Err(e) if is_not_found(&e) => {
-                self.forget(local);
-                return Ok(Vec::new());
-            }
-            Err(e) => return Err(anyhow::Error::from(e).context("failed to get remote file info")),
+        let Some(remote) = self.info(&uri).await? else {
+            self.forget(local);
+            return Ok(Vec::new());
         };
 
         if remote.file_type == file_type::FOLDER {
@@ -249,13 +252,9 @@ impl RemoteOps<'_> {
             return Ok(self.uploads_under(to).await);
         }
         let from_uri = self.uri(from)?;
-        let remote = match self.info(&from_uri).await {
-            Ok(remote) => remote,
-            Err(e) if is_not_found(&e) => {
-                self.forget(from);
-                return Ok(self.uploads_under(to).await);
-            }
-            Err(e) => return Err(anyhow::Error::from(e).context("failed to get remote file info")),
+        let Some(remote) = self.info(&from_uri).await? else {
+            self.forget(from);
+            return Ok(self.uploads_under(to).await);
         };
         if remote.file_type != file_type::FOLDER
             && let Some(row) = rows.iter().find(|r| Path::new(&r.local_path) == from)
