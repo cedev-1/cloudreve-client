@@ -840,7 +840,32 @@ impl Mount {
 
         match mode {
             SyncMode::LocalChanged => {
+                // A folder moved in is ONE watcher event, with none for the
+                // files inside: upload what it holds now, not at the next
+                // periodic full sync. (A folder the user merely touched
+                // expands too; its unchanged files stop at the inventory
+                // check below.)
+                let sync_root = self.config.read().await.sync_path.clone();
+                let mut expanded = Vec::with_capacity(local_paths.len());
                 for path in local_paths {
+                    if path.is_dir() {
+                        // The root itself would mean walking the whole drive
+                        // for any change in it: its children have events of
+                        // their own.
+                        if path == sync_root || self.is_ignored(&path).await {
+                            continue;
+                        }
+                        match crate::drive::sync::walk_local(path.clone()).await {
+                            Ok(files) => expanded.extend(files),
+                            Err(e) => {
+                                tracing::warn!(target: "drive::mounts", path = %path.display(), error = %format_args!("{e:#}"), "Failed to list a locally changed folder");
+                            }
+                        }
+                    } else {
+                        expanded.push(path);
+                    }
+                }
+                for path in expanded {
                     if !path.exists() || path.is_dir() {
                         continue;
                     }
