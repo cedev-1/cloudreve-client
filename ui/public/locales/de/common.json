@@ -22,6 +22,8 @@
       "onDemandHint": "Ihre Dateien erscheinen sofort im Ordner, belegen aber keinen Speicherplatz, bis Sie sie öffnen.",
       "onDemandDetails": "Zum ersten Öffnen einer Datei wird eine Internetverbindung benötigt; kürzlich geöffnete Dateien bleiben verfügbar.",
       "fixedNote": "Diese Auswahl kann später nicht geändert werden. Zum Wechseln entfernen Sie das Laufwerk und fügen es erneut hinzu.",
+      "beta": "Beta",
+      "betaWarning": "Beta: kann Fehler enthalten. Bewahren Sie eine Sicherung wichtiger Dateien auf.",
       "macNote": "Beim ersten Mal fragt macOS eventuell, ob Cloudreve auf Dateien eines Netzwerkvolumes zugreifen darf: Klicken Sie auf „Erlauben“.",
       "linuxNote": "Benötigt FUSE (das Paket „fuse3“, auf den meisten Linux-Systemen bereits installiert).",
       "learnMore": "Mehr erfahren"
@@ -145,7 +147,8 @@
       "mirror": "Alles herunterladen",
       "onDemand": "Dateien bei Bedarf",
       "mirrorHint": "Alle Dateien liegen auf diesem Computer",
-      "onDemandHint": "Dateien werden beim Öffnen geladen"
+      "onDemandHint": "Dateien werden beim Öffnen geladen",
+      "beta": "Beta"
     },
     "networkSettings": "Netzwerk",
     "heartbeatInterval": "Heartbeat-Intervall",

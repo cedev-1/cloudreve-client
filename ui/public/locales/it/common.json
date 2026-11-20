@@ -22,6 +22,8 @@
       "onDemandHint": "I tuoi file compaiono subito nella cartella ma non occupano spazio su disco finché non li apri.",
       "onDemandDetails": "Aprire un file la prima volta richiede una connessione internet; i file aperti di recente restano disponibili.",
       "fixedNote": "Questa scelta non può essere cambiata in seguito. Per cambiarla, rimuovi l'unità e aggiungila di nuovo.",
+      "beta": "Beta",
+      "betaWarning": "Beta: potrebbe contenere bug. Conserva un backup dei file importanti.",
       "macNote": "La prima volta macOS potrebbe chiedere se Cloudreve può accedere ai file di un volume di rete: fai clic su Consenti.",
       "linuxNote": "Richiede FUSE (il pacchetto \"fuse3\", già installato sulla maggior parte dei sistemi Linux).",
       "learnMore": "Scopri di più"
@@ -145,7 +147,8 @@
       "mirror": "Scarica tutto",
       "onDemand": "File su richiesta",
       "mirrorHint": "Tutti i file sono su questo computer",
-      "onDemandHint": "I file si scaricano quando li apri"
+      "onDemandHint": "I file si scaricano quando li apri",
+      "beta": "Beta"
     },
     "networkSettings": "Rete",
     "heartbeatInterval": "Intervallo heartbeat",

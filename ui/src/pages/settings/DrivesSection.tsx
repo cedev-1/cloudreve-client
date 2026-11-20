@@ -4,6 +4,7 @@ import {
   Button,
   Card,
   CardContent,
+  Chip,
   Dialog,
   DialogActions,
   DialogContent,
@@ -476,6 +477,15 @@ export default function DrivesSection() {
                           ? t("settings.driveMode.onDemandHint")
                           : t("settings.driveMode.mirrorHint")}
                       </Typography>
+                      {drive.mode === "on_demand" && (
+                        <Chip
+                          label={t("settings.driveMode.beta")}
+                          size="small"
+                          color="warning"
+                          variant="outlined"
+                          sx={{ height: 18, fontSize: 10 }}
+                        />
+                      )}
                     </Box>
 
                     {drive.mount_error && (

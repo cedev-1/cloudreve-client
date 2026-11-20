@@ -182,6 +182,22 @@ export default function DriveChips({
                       ? t("settings.driveMode.onDemand")
                       : t("settings.driveMode.mirror")}
                   </Box>
+                  {drive.mode === "on_demand" && (
+                    <Box
+                      component="span"
+                      sx={{
+                        fontSize: 10,
+                        lineHeight: 1.4,
+                        px: 0.5,
+                        borderRadius: 0.75,
+                        border: 1,
+                        borderColor: "warning.main",
+                        color: "warning.main",
+                      }}
+                    >
+                      {t("settings.driveMode.beta")}
+                    </Box>
+                  )}
                   {pendingCount > 0 && (
                     <Box
                       component="span"
