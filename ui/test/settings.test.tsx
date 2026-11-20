@@ -1,4 +1,4 @@
-import { screen, waitFor, within } from "@testing-library/react";
+import { act, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import {
   expiredDriveInfo,
@@ -42,6 +42,7 @@ const S = {
     invalidPatterns: "Invalid patterns: unclosed character class in \"[abc\"",
     launch: "Launch",
     autoStart: "Launch at startup",
+    fastPopupLaunch: "Fast popup launch",
     updates: "Updates",
     language: "Language",
     languageAuto: "System Default",
@@ -92,6 +93,7 @@ const S = {
     invalidPatterns: "Motifs invalides : unclosed character class in \"[abc\"",
     launch: "Lancement",
     autoStart: "Lancer au démarrage",
+    fastPopupLaunch: "Lancement rapide de la fenêtre popup",
     updates: "Mises à jour",
     language: "Langue",
     languageAuto: "Par défaut du système",
@@ -345,8 +347,38 @@ describe.each(LANGUAGES)("settings (%s)", (lng) => {
     expect(await screen.findByText(s.profileNoDrive)).toBeInTheDocument();
   });
 
+  it("leaves updates and autostart to the package manager in a package-managed build", async () => {
+    mockCommands({
+      get_drives_info: () => [],
+      get_auto_start_enabled: () => false,
+      get_general_settings: () => ({ ...generalSettings, package_managed: true }),
+    });
+    const { user } = await renderApp("/settings", lng);
+    await user.click(screen.getByRole("button", { name: s.general }));
+
+    // The rest of the page is there, the launch group keeps its other toggle.
+    for (const group of [s.launch, s.notifications, s.network, s.logging]) {
+      expect(await screen.findByText(group)).toBeInTheDocument();
+    }
+    expect(screen.getByText(s.fastPopupLaunch)).toBeInTheDocument();
+    // Both show while the settings load, then go.
+    await waitFor(() => expect(screen.queryByText(s.autoStart)).not.toBeInTheDocument());
+    expect(screen.queryByText(s.updates)).not.toBeInTheDocument();
+
+    const asked = callsTo("get_general_settings").length;
+    await user.click(screen.getByRole("button", { name: s.about }));
+    expect(await screen.findByText("v0.3.0")).toBeInTheDocument();
+    // The button is hidden until the settings answer: wait for that answer,
+    // or its absence would prove nothing.
+    await waitFor(() => expect(callsTo("get_general_settings").length).toBeGreaterThan(asked));
+    await act(async () => {});
+    expect(screen.queryByRole("button", { name: s.checkForUpdates })).not.toBeInTheDocument();
+    expect(screen.getByRole("link", { name: s.reportIssue })).toBeInTheDocument();
+    expect(updater.check).not.toHaveBeenCalled();
+  });
+
   it("checks for updates: up to date, failure, then an update to install", async () => {
-    mockCommands({ get_drives_info: () => [] });
+    mockCommands({ get_drives_info: () => [], get_general_settings: () => generalSettings });
     const { user } = await renderApp("/settings", lng);
     await user.click(screen.getByRole("button", { name: s.about }));
 
@@ -356,7 +388,7 @@ describe.each(LANGUAGES)("settings (%s)", (lng) => {
       "href",
       "https://github.com/cedev-1/cloudreve-client/issues"
     );
-    const check = screen.getByRole("button", { name: s.checkForUpdates });
+    const check = await screen.findByRole("button", { name: s.checkForUpdates });
 
     updater.check.mockResolvedValueOnce(null);
     await user.click(check);
