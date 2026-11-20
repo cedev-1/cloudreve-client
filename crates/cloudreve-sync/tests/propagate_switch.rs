@@ -210,6 +210,7 @@ async fn flipping_the_switch_applies_to_the_next_local_change_without_a_restart(
     std::fs::remove_file(env.local_path("first.txt")).unwrap();
     tokio::time::sleep(Duration::from_secs(6)).await;
     assert!(server_writes(&env.server).await.is_empty(), "switched off, yet the server was written to");
+    assert!(env.tasks_of_type("delete").is_empty(), "switched off, yet a server delete was queued");
 
     env.mount.set_propagate_deletes(true).await;
     std::fs::remove_file(env.local_path("second.txt")).unwrap();
