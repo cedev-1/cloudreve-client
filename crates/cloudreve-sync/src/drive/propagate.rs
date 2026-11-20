@@ -214,6 +214,18 @@ fn outermost(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
     out
 }
 
+/// The outermost folder above `path` (inside `root`, never `root`) that is
+/// gone locally, or `path` itself when its folder is still there.
+fn topmost_missing(root: &Path, path: &Path, exists: impl Fn(&Path) -> bool) -> PathBuf {
+    path.ancestors()
+        .skip(1)
+        .take_while(|a| *a != root && is_inside(root, a))
+        .filter(|a| !exists(a))
+        .last()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
 /// `a` and `b` are the same file: a case-only rename (`a.txt` → `A.txt`)
 /// on a case-insensitive volume, where the old name still "exists".
 fn same_file(a: &Path, b: &Path) -> bool {
@@ -354,6 +366,13 @@ impl Mount {
         let busy = busy_paths(self)?;
         let mut planned = Vec::new();
         let mut count = 0;
+        // A deleted folder's files can come in one batch and the folder in
+        // a later one: by the time the files' batch is handled, a folder
+        // gone here is deleted as one item, not left empty on the server.
+        let deletions = deletions
+            .into_iter()
+            .map(|p| topmost_missing(&sync_root, &p, |d| d.exists()))
+            .collect();
         for path in outermost(deletions) {
             if path == sync_root || ignore.is_match(&path) || path.exists() || is_busy(&busy, &path) {
                 continue;
@@ -467,6 +486,18 @@ mod tests {
         let units = deletion_units(&candidates, remote.iter(), &folders, |_| false, |f| !f.ends_with(".DS_Store"));
 
         assert_eq!(units, vec![p("Trip")]);
+    }
+
+    /// A file whose folder is gone stands for that folder — up to the
+    /// last folder gone, never the sync folder itself.
+    #[test]
+    fn a_file_in_a_vanished_folder_stands_for_the_folder() {
+        let present = [p("/s"), p("/s/Kept")];
+        let exists = |d: &Path| present.iter().any(|x| x == d);
+
+        assert_eq!(topmost_missing(Path::new("/s"), Path::new("/s/Gone/sub/b.txt"), exists), p("/s/Gone"));
+        assert_eq!(topmost_missing(Path::new("/s"), Path::new("/s/Kept/c.txt"), exists), p("/s/Kept/c.txt"));
+        assert_eq!(topmost_missing(Path::new("/s"), Path::new("/s/top.txt"), |_| false), p("/s/top.txt"));
     }
 
     #[test]

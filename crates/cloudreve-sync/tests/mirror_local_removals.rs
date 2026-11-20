@@ -714,6 +714,44 @@ async fn deleting_a_synced_folder_deletes_it_on_the_server() {
     wait_for("the rows to be forgotten", || async { env.db_entry("Old/deep/b.txt").is_none() }).await;
 }
 
+/// The watcher may report a deleted folder's files in one batch and the
+/// folder itself in a later one (seen on macOS CI). Deleting only the
+/// files would leave the folder, empty, on the server: once the folder is
+/// gone here, its files' batch already deletes the folder as one item.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_folder_whose_files_are_reported_before_it_is_deleted_as_one_folder() {
+    let (_t, env) = live_env(&[
+        ("Gone/a.txt", b"a", "e-a"),
+        ("Gone/sub/b.txt", b"b", "e-b"),
+        ("k1.txt", b"1", "e-1"),
+        ("k2.txt", b"2", "e-2"),
+        ("k3.txt", b"3", "e-3"),
+    ])
+    .await;
+    env.server.reset().await;
+    mock_folder(&env.server, "Gone", vec![remote_file("Gone/a.txt", 1, "e-a"), remote_folder("Gone/sub")]).await;
+    mock_folder(&env.server, "Gone/sub", vec![remote_file("Gone/sub/b.txt", 1, "e-b")]).await;
+    mock_info(&env.server, "Gone", remote_folder("Gone")).await;
+    mock_info(&env.server, "Gone/a.txt", remote_file("Gone/a.txt", 1, "e-a")).await;
+    mock_info(&env.server, "Gone/sub/b.txt", remote_file("Gone/sub/b.txt", 1, "e-b")).await;
+    accept_writes(&env.server).await;
+
+    std::fs::remove_dir_all(env.local_path("Gone")).unwrap();
+    // The files' batch, through the command the watcher sends.
+    env.mount
+        .command_tx
+        .send(cloudreve_sync::drive::commands::MountCommand::LocalChanges {
+            changed: vec![],
+            deleted: vec![env.local_path("Gone/a.txt"), env.local_path("Gone/sub/b.txt")],
+            renamed: vec![],
+        })
+        .unwrap();
+
+    wait_for("the delete request", || async { !deletes(&env.server).await.is_empty() }).await;
+    settle().await;
+    assert_eq!(deleted_uris(&env.server).await, vec![uri("Gone")]);
+}
+
 /// The server's newer version wins over a live delete too.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_live_delete_of_a_file_changed_on_the_server_brings_the_server_version_back() {
