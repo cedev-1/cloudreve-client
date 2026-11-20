@@ -259,6 +259,13 @@ impl<'a> DownloadTask<'a> {
                             "Failed to remove local file mirroring remote deletion"
                         );
                     } else {
+                        // Forgotten right away, well before the watcher's
+                        // event for this removal comes out of its debounce:
+                        // a removal with no inventory row is never sent to
+                        // the server as a local delete (`drive::propagate`).
+                        if let Err(e) = self.inventory.batch_delete_by_path(vec![local_path.to_str().unwrap_or_default()]) {
+                            warn!(target: "tasks::download", task_id = %self.task.task_id, error = %format_args!("{e:#}"), "Failed to forget a file deleted on the server");
+                        }
                         // A folder deleted on the server goes file by file
                         // (see `perform_sync`'s RemoteChanged arm): the last
                         // file out takes the folders it emptied with it.

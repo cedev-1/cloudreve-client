@@ -699,10 +699,10 @@ impl Mount {
                             return;
                         }
                         let grouped = group_fs_events(events);
-                        let _ = command_tx.send(MountCommand::Sync {
-                            local_paths: grouped.all_paths(),
-                            mode: crate::drive::sync::SyncMode::LocalChanged,
-                            user_initiated: false,
+                        let _ = command_tx.send(MountCommand::LocalChanges {
+                            changed: grouped.changed,
+                            deleted: grouped.deleted,
+                            renamed: grouped.renamed,
                         });
                     }
                     Err(errors) => {
@@ -747,6 +747,24 @@ impl Mount {
                     spawn(async move {
                         let _lock = mount.sync_lock.lock().await;
                         if let Err(e) = mount.perform_sync(local_paths, mode, user_initiated).await {
+                            tracing::error!(target: "drive::mounts", error = %format_args!("{e:#}"), "Sync failed");
+                        }
+                    });
+                }
+                MountCommand::LocalChanges { changed, deleted, renamed } => {
+                    spawn(async move {
+                        let _lock = mount.sync_lock.lock().await;
+                        if mount.is_paused() {
+                            return;
+                        }
+                        let uploads = match mount.propagate_local_removals(changed, deleted, renamed).await {
+                            Ok(uploads) => uploads,
+                            Err(e) => {
+                                tracing::error!(target: "drive::mounts", error = %format_args!("{e:#}"), "Failed to send local deletes and renames to the server");
+                                return;
+                            }
+                        };
+                        if let Err(e) = mount.perform_sync(uploads, crate::drive::sync::SyncMode::LocalChanged, false).await {
                             tracing::error!(target: "drive::mounts", error = %format_args!("{e:#}"), "Sync failed");
                         }
                     });
@@ -865,11 +883,17 @@ impl Mount {
                         expanded.push(path);
                     }
                 }
+                // A folder of the batch can hold a file a queued move is
+                // about to take there (see `propagate::moving_paths`).
+                let moving = crate::drive::propagate::moving_paths(self)?;
                 for path in expanded {
                     if !path.exists() || path.is_dir() {
                         continue;
                     }
                     if self.is_ignored(&path).await {
+                        continue;
+                    }
+                    if crate::drive::propagate::is_busy(&moving, &path) {
                         continue;
                     }
                     // Check file size against drive limit before uploading
@@ -1235,6 +1259,7 @@ impl Mount {
         let mut config = self.config.write().await;
         config.ignore_patterns = patterns;
         drop(config);
+        self.task_queue.set_ignore_matcher(new_matcher.clone());
         *self.ignore_matcher.write().await = new_matcher;
         Ok(())
     }

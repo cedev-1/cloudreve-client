@@ -3,6 +3,7 @@ use crate::drive::ignore::IgnoreMatcher;
 use crate::events::SummaryNotifier;
 use crate::inventory::{InventoryDb, NewTaskRecord, TaskRecord, TaskStatus, TaskUpdate};
 use crate::tasks::download::DownloadTask;
+use crate::tasks::remote_ops::RemoteOps;
 use crate::tasks::types::{TaskKind, TaskPayload, TaskProgress};
 use crate::tasks::upload::UploadTask;
 use anyhow::{Context, Result, anyhow};
@@ -33,7 +34,31 @@ impl Default for TaskQueueConfig {
 
 const MAX_NETWORK_RETRIES: u32 = 5;
 
-fn is_network_error(err: &anyhow::Error) -> bool {
+/// What a parked task keeps of its `custom_state` when it is replayed: all
+/// of it but the offline bookkeeping. Clearing the whole state used to be
+/// harmless (only that bookkeeping lived there); a `Move` task's source and
+/// a download's expected etag live there too, and a rename replayed without
+/// its source could only become an upload of a second copy.
+fn without_offline_flags(state: Option<&Value>) -> Option<Value> {
+    let mut state = state?.clone();
+    if let Some(map) = state.as_object_mut() {
+        map.remove("offline_waiting");
+        map.remove("network_retries");
+        if map.is_empty() {
+            return None;
+        }
+    }
+    Some(state)
+}
+
+/// Whether a replayed task touches an ignored path: its own, or the source
+/// of a move.
+fn task_is_ignored(record: &TaskRecord, ignore: &IgnoreMatcher) -> bool {
+    ignore.is_match(&record.local_path)
+        || crate::tasks::move_from_state(record.custom_state.as_ref()).is_some_and(|from| ignore.is_match(&from))
+}
+
+pub(crate) fn is_network_error(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         cause.downcast_ref::<reqwest::Error>().is_some()
             || cause.downcast_ref::<std::io::Error>().is_some_and(|e| {
@@ -70,6 +95,10 @@ pub struct TaskQueue {
     task_handles: DashMap<String, JoinHandle<()>>,
     /// Maps task_id to local_path for running tasks, used for path-based cancellation
     task_paths: DashMap<String, String>,
+    /// The drive's ignore rules, kept in step by `Mount::update_ignore_patterns`:
+    /// a move's follow-up uploads (`RemoteOps::move_to`) must skip junk files
+    /// like every other upload.
+    ignore: std::sync::RwLock<IgnoreMatcher>,
 }
 
 impl TaskQueue {
@@ -120,6 +149,7 @@ impl TaskQueue {
             notifier,
             task_handles: DashMap::new(),
             task_paths: DashMap::new(),
+            ignore: std::sync::RwLock::new(ignore.clone()),
         });
 
         queue.spawn_dispatcher(command_rx).await;
@@ -134,6 +164,11 @@ impl TaskQueue {
             );
         }
         queue
+    }
+
+    /// See the `ignore` field.
+    pub fn set_ignore_matcher(&self, matcher: IgnoreMatcher) {
+        *self.ignore.write().expect("TaskQueue ignore lock poisoned") = matcher;
     }
 
     pub fn max_concurrent(&self) -> usize {
@@ -331,7 +366,7 @@ impl TaskQueue {
                 continue;
             }
 
-            if ignore.is_match(&record.local_path) {
+            if task_is_ignored(&record, ignore) {
                 info!(
                     target: "tasks::queue",
                     drive = %self.drive_id,
@@ -369,7 +404,7 @@ impl TaskQueue {
             if let Err(err) = self.inventory.update_task(
                 &record.id,
                 TaskUpdate {
-                    custom_state: Some(None),
+                    custom_state: Some(without_offline_flags(record.custom_state.as_ref())),
                     ..Default::default()
                 },
             ) {
@@ -790,10 +825,16 @@ impl TaskQueue {
                             &task.task_id,
                             TaskUpdate {
                                 status: Some(TaskStatus::Pending),
-                                custom_state: Some(Some(serde_json::json!({
-                                    "network_retries": retry_count + 1,
-                                    "offline_waiting": true
-                                }))),
+                                // Merged, not replaced: a move's source
+                                // must survive being parked.
+                                custom_state: Some(Some({
+                                    let mut state = task.payload.custom_state.clone()
+                                        .filter(Value::is_object)
+                                        .unwrap_or_else(|| serde_json::json!({}));
+                                    state["network_retries"] = serde_json::json!(retry_count + 1);
+                                    state["offline_waiting"] = serde_json::json!(true);
+                                    state
+                                })),
                                 ..Default::default()
                             },
                         ) {
@@ -875,6 +916,27 @@ impl TaskQueue {
                 );
 
                 task_executor.execute().await?;
+            }
+            TaskKind::Delete | TaskKind::Move => {
+                let ops = RemoteOps {
+                    inventory: self.inventory.clone(),
+                    cr_client: self.cr_client.clone(),
+                    drive_id: self.drive_id.as_str(),
+                    sync_path: self.sync_path.clone(),
+                    remote_base: self.remote_base.clone(),
+                    ignore: self.ignore.read().expect("TaskQueue ignore lock poisoned").clone(),
+                    max_file_size_mb: self.max_file_size_mb,
+                };
+                let follow_ups = match task.payload.kind {
+                    TaskKind::Delete => ops.delete(&task.payload.local_path).await?,
+                    _ => {
+                        let from = task.payload.move_from().context("move task without a source")?;
+                        ops.move_to(&from, &task.payload.local_path).await?
+                    }
+                };
+                for follow_up in follow_ups {
+                    self.enqueue(follow_up).await?;
+                }
             }
         }
 
@@ -961,7 +1023,7 @@ impl TaskQueue {
 
         let mut resumed = 0usize;
         for record in records {
-            if ignore.is_match(&record.local_path) {
+            if task_is_ignored(&record, ignore) {
                 info!(
                     target: "tasks::queue",
                     drive = %self.drive_id,

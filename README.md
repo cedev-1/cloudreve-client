@@ -37,6 +37,14 @@ The choice is made when you add the drive and cannot be changed afterwards. To s
 - **Finder tags and other file metadata** (macOS) and file-manager view settings are kept on this computer only and are forgotten when the app quits.
 - **Removing the drive** empties the folder on this computer; your files stay in the cloud. If some changes are not uploaded yet, the app warns you first.
 
+### Deleting and renaming in a "Download everything" drive
+
+- **Deleting** a file or folder deletes it from your cloud too, into the Cloudreve trash: restore it from the web interface if it was a mistake. Deleted while the app was closed or offline, it is deleted at the next sync.
+- **Renaming or moving** a file or folder inside the drive renames or moves it in your cloud (no second copy under the new name). A rename made while the app was closed is applied as a delete of the old name plus an upload of the new one; the old version stays in the trash.
+- **Changed elsewhere first**: if a file you deleted here was changed on the server since it was last synced, the server's version wins: it is downloaded back instead of deleted.
+- **Many files at once**: deleting 200 files or more at once, or more than half of the drive, looks like an accident. Nothing is deleted from your cloud and you get a notification; if it was intended, delete them on the web interface.
+- Nothing is deleted from your cloud while the drive is paused (deletions made meanwhile are sent when it resumes), nor when the sync folder itself is missing (an unplugged disk, a folder deleted or moved away). Ignored files (system junk, your ignore patterns) never cause a deletion.
+
 ### Requirements
 
 - **macOS**: nothing to install. The drive is served by the app itself and mounted with the system's network file system support. The first time, macOS may ask whether Cloudreve can access files on a network volume: click **Allow**.

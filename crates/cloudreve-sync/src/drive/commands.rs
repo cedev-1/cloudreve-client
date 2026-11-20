@@ -22,6 +22,14 @@ pub enum MountCommand {
         mode: SyncMode,
         user_initiated: bool,
     },
+    /// One fs watcher batch: changes to upload, and the deletes and
+    /// renames to send to the server (see `drive::propagate`). One command,
+    /// so a rename is planned before the uploads of the same batch.
+    LocalChanges {
+        changed: Vec<PathBuf>,
+        deleted: Vec<PathBuf>,
+        renamed: Vec<(PathBuf, PathBuf)>,
+    },
     /// Trigger a full bidirectional sync
     FullSync,
     /// Update credentials after a refresh

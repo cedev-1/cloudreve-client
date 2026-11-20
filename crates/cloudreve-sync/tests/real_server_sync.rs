@@ -21,7 +21,7 @@ use cloudreve_vfs::tree::NodeId;
 use cloudreve_vfs::vfs::Vfs;
 use real_server::{eventually, pattern};
 use real_server_app::{
-    App, MIB, Opts, run, wait_local, wait_local_gone, wait_remote, write,
+    App, MIB, Opts, run, wait_local, wait_local_gone, wait_remote, wait_remote_gone, write,
 };
 
 // ------------------------------------------------------------ full mirror
@@ -108,22 +108,231 @@ fn local_changes_in_a_mirror_drive_reach_the_server() {
             f.write_all(b" + appended").unwrap();
         }
         wait_remote(&app.remote, "new.txt", b"modified locally + appended").await;
-        // A mirror drive never deletes on the server what was removed locally
-        // (`full_sync`'s "deleted locally" arm, inherited from the Windows
-        // client): a rename or move uploads the new name, and what was removed
-        // must at least never come back locally — the server's own events for
-        // our earlier uploads arrive seconds later and must not resurrect it.
+        // Renamed, moved and deleted seconds after being written: the old
+        // names leave the server too (see `drive::propagate`), and nothing
+        // removed comes back locally — the server's own events for our
+        // earlier uploads arrive seconds later and must not resurrect it.
         std::fs::rename(app.local("new.txt"), app.local("renamed.txt")).unwrap();
         wait_remote(&app.remote, "renamed.txt", b"modified locally + appended").await;
+        wait_remote_gone(&app.remote, "new.txt").await;
         std::fs::rename(app.local("renamed.txt"), app.local("deep/moved.txt")).unwrap();
         wait_remote(&app.remote, "deep/moved.txt", b"modified locally + appended").await;
+        wait_remote_gone(&app.remote, "renamed.txt").await;
         std::fs::remove_dir_all(app.local("deep/er")).unwrap();
         std::fs::remove_file(app.local("big.bin")).unwrap();
-        tokio::time::sleep(Duration::from_secs(12)).await;
+        wait_remote_gone(&app.remote, "deep/er").await;
+        wait_remote_gone(&app.remote, "big.bin").await;
+        tokio::time::sleep(Duration::from_secs(8)).await;
         for gone in ["new.txt", "renamed.txt", "deep/er", "big.bin"] {
             assert!(!app.local(gone).exists(), "{gone} came back locally");
         }
         assert_eq!(app.remote.read("deep/moved.txt").await.unwrap(), b"modified locally + appended");
+        app.cleanup().await;
+    })
+}
+
+/// macOS reports a rename of a file created in the last ~30 s as a new
+/// file (see `drive::propagate`); files a user renames have usually been
+/// there for longer.
+const OLD_ENOUGH: Duration = Duration::from_secs(32);
+
+/// Longer than the fs watcher's 2 s debounce.
+const SETTLE: Duration = Duration::from_secs(4);
+
+/// The server's id for `rel`: the same id after a change means the server
+/// renamed or moved its file, not that a copy was uploaded.
+async fn remote_id(app: &App, rel: &str) -> String {
+    app.remote.info(rel).await.unwrap_or_else(|| panic!("{rel} is not on the server"))["id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn deleting_in_a_mirror_drive_moves_files_and_folders_to_the_server_trash() {
+    run(async {
+        let Some(app) = App::add("mirror-delete", Opts::default(), |r| async move {
+            r.put("doc-del.txt", b"doc").await;
+            r.put("Folder-del/a.txt", b"a").await;
+            r.put("Folder-del/sub/b.txt", b"b").await;
+            r.put("keep.txt", b"keep").await;
+        })
+        .await
+        else {
+            return;
+        };
+        wait_local(&app, "doc-del.txt", b"doc").await;
+        wait_local(&app, "Folder-del/sub/b.txt", b"b").await;
+        wait_local(&app, "keep.txt", b"keep").await;
+        // A file created and removed within the watcher's 2 s window is
+        // dropped by its debouncer (it came and went); the next full sync
+        // would catch it. Deleting a file just downloaded is not this test.
+        tokio::time::sleep(SETTLE).await;
+
+        std::fs::remove_file(app.local("doc-del.txt")).unwrap();
+        wait_remote_gone(&app.remote, "doc-del.txt").await;
+        std::fs::remove_dir_all(app.local("Folder-del")).unwrap();
+        wait_remote_gone(&app.remote, "Folder-del").await;
+
+        let trashed = app.remote.trashed().await;
+        assert!(trashed.contains(&app.remote.uri("doc-del.txt")), "not in the trash: {trashed:?}");
+        assert!(trashed.contains(&app.remote.uri("Folder-del")), "the folder must be trashed as one item: {trashed:?}");
+        assert!(!trashed.contains(&app.remote.uri("Folder-del/a.txt")), "{trashed:?}");
+        assert_eq!(app.remote.read("keep.txt").await.unwrap(), b"keep");
+        app.cleanup().await;
+    })
+}
+
+#[test]
+fn renaming_and_moving_in_a_mirror_drive_renames_and_moves_on_the_server() {
+    run(async {
+        let Some(app) = App::add("mirror-rename", Opts::default(), |r| async move {
+            r.put("old.txt", b"old").await;
+            r.put("Docs/a.txt", b"a").await;
+            r.put("Docs/sub/b.txt", b"b").await;
+            r.mkdir("dst").await;
+            r.put("x.txt", b"x").await;
+        })
+        .await
+        else {
+            return;
+        };
+        wait_local(&app, "old.txt", b"old").await;
+        wait_local(&app, "Docs/sub/b.txt", b"b").await;
+        tokio::time::sleep(OLD_ENOUGH).await;
+        let file_id = remote_id(&app, "old.txt").await;
+        let folder_id = remote_id(&app, "Docs").await;
+
+        std::fs::rename(app.local("old.txt"), app.local("new.txt")).unwrap();
+        wait_remote_gone(&app.remote, "old.txt").await;
+        assert_eq!(remote_id(&app, "new.txt").await, file_id, "renamed by a new upload, not a rename");
+
+        std::fs::rename(app.local("Docs"), app.local("Papers")).unwrap();
+        wait_remote_gone(&app.remote, "Docs").await;
+        assert_eq!(remote_id(&app, "Papers").await, folder_id, "folder renamed by a re-upload");
+        assert_eq!(app.remote.read("Papers/sub/b.txt").await.unwrap(), b"b");
+
+        // `new.txt` only just got its name: same ~30 s rule on macOS.
+        tokio::time::sleep(OLD_ENOUGH).await;
+        // An empty server folder is not mirrored: the user makes one here.
+        std::fs::create_dir_all(app.local("dst")).unwrap();
+        // The new folder's own watcher batch first, as when a person
+        // makes a folder then drags a file in (a move in the same batch
+        // races the folder's scan on Linux).
+        tokio::time::sleep(SETTLE).await;
+        std::fs::rename(app.local("new.txt"), app.local("dst/new.txt")).unwrap();
+        wait_remote_gone(&app.remote, "new.txt").await;
+        assert_eq!(remote_id(&app, "dst/new.txt").await, file_id, "moved by a new upload, not a move");
+
+        // Moved and renamed at once, into a folder the server does not have.
+        std::fs::create_dir_all(app.local("Archive/2026")).unwrap();
+        tokio::time::sleep(SETTLE).await;
+        std::fs::rename(app.local("Papers/a.txt"), app.local("Archive/2026/renamed-a.txt")).unwrap();
+        wait_remote(&app.remote, "Archive/2026/renamed-a.txt", b"a").await;
+        wait_remote_gone(&app.remote, "Papers/a.txt").await;
+
+        let trashed = app.remote.trashed().await;
+        for old in ["old.txt", "Docs", "new.txt", "Papers/a.txt"] {
+            assert!(!trashed.contains(&app.remote.uri(old)), "{old} was deleted, not renamed: {trashed:?}");
+        }
+        app.cleanup().await;
+    })
+}
+
+#[test]
+fn a_mirror_delete_and_rename_made_offline_reach_the_server_on_reconnect() {
+    run(async {
+        let Some(app) = App::add("mirror-offline-delete", Opts { proxied: true, ..Opts::default() }, |r| async move {
+            r.put("off.txt", b"off").await;
+            r.put("ren.txt", b"ren").await;
+            r.put("keep.txt", b"keep").await;
+        })
+        .await
+        else {
+            return;
+        };
+        wait_local(&app, "off.txt", b"off").await;
+        wait_local(&app, "ren.txt", b"ren").await;
+        tokio::time::sleep(OLD_ENOUGH).await;
+        let id = remote_id(&app, "ren.txt").await;
+
+        app.proxy().set_down(true);
+        std::fs::remove_file(app.local("off.txt")).unwrap();
+        std::fs::rename(app.local("ren.txt"), app.local("ren2.txt")).unwrap();
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert!(app.remote.info("off.txt").await.is_some(), "deleted while the server was unreachable?");
+        assert!(app.remote.info("ren.txt").await.is_some());
+
+        app.proxy().set_down(false);
+        wait_remote_gone(&app.remote, "off.txt").await;
+        wait_remote_gone(&app.remote, "ren.txt").await;
+        assert_eq!(remote_id(&app, "ren2.txt").await, id, "the parked rename became an upload");
+        assert!(app.remote.trashed().await.contains(&app.remote.uri("off.txt")));
+        app.cleanup().await;
+    })
+}
+
+#[test]
+fn a_mirror_file_deleted_while_paused_is_deleted_on_resume_unless_the_server_changed_it() {
+    run(async {
+        let Some(app) = App::add("mirror-paused-delete", Opts::default(), |r| async move {
+            r.put("plain.txt", b"plain").await;
+            r.put("edited.txt", b"v1").await;
+            r.put("keep.txt", b"keep").await;
+        })
+        .await
+        else {
+            return;
+        };
+        wait_local(&app, "plain.txt", b"plain").await;
+        wait_local(&app, "edited.txt", b"v1").await;
+
+        app.manager.pause_drive(&app.id).await.unwrap();
+        std::fs::remove_file(app.local("plain.txt")).unwrap();
+        std::fs::remove_file(app.local("edited.txt")).unwrap();
+        // Someone else edits it meanwhile: their edit wins over the delete.
+        app.remote.put("edited.txt", b"v2, edited on the web").await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(app.remote.info("plain.txt").await.is_some(), "a paused drive deleted on the server");
+        app.manager.resume_drive(&app.id).await.unwrap();
+
+        wait_remote_gone(&app.remote, "plain.txt").await;
+        wait_local(&app, "edited.txt", b"v2, edited on the web").await;
+        assert_eq!(app.remote.read("edited.txt").await.unwrap(), b"v2, edited on the web");
+        app.cleanup().await;
+    })
+}
+
+#[test]
+fn deleting_most_of_a_mirror_drive_at_once_deletes_nothing_on_the_server() {
+    run(async {
+        let Some(app) = App::add("mirror-mass-delete", Opts::default(), |r| async move {
+            for batch in (0..30).collect::<Vec<usize>>().chunks(10) {
+                let mut set = tokio::task::JoinSet::new();
+                for i in batch {
+                    let r = r.clone_handle();
+                    let i = *i;
+                    set.spawn(async move { r.put(&format!("bulk/f-{i:02}.txt"), b"bulk").await });
+                }
+                while set.join_next().await.is_some() {}
+            }
+            r.put("keep-1.txt", b"1").await;
+            r.put("keep-2.txt", b"2").await;
+        })
+        .await
+        else {
+            return;
+        };
+        wait_local(&app, "bulk/f-29.txt", b"bulk").await;
+        wait_local(&app, "bulk/f-00.txt", b"bulk").await;
+        wait_local(&app, "keep-2.txt", b"2").await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        std::fs::remove_dir_all(app.local("bulk")).unwrap();
+        tokio::time::sleep(Duration::from_secs(10)).await;
+
+        assert_eq!(app.remote.list("bulk").await.len(), 30, "a mass deletion reached the server");
+        assert!(!app.local("bulk").exists(), "held back is not downloaded back");
         app.cleanup().await;
     })
 }
