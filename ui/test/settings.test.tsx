@@ -1,4 +1,4 @@
-import { act, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import {
   expiredDriveInfo,
@@ -22,6 +22,7 @@ const S = {
     credentialExpired: "Credential Expired",
     mirrorLine: "Download everything · All files are kept on this computer",
     onDemandLine: "Files on demand · Files download when you open them",
+    beta: "Beta",
     storage: "Storage",
     retry: "Retry",
     reauthorize: "Reauthorize",
@@ -73,6 +74,7 @@ const S = {
     credentialExpired: "Identifiants expirés",
     mirrorLine: "Tout télécharger · Tous les fichiers sont gardés sur cet ordinateur",
     onDemandLine: "Fichiers à la demande · Les fichiers se téléchargent à l'ouverture",
+    beta: "Bêta",
     storage: "Stockage",
     retry: "Réessayer",
     reauthorize: "Réautoriser",
@@ -148,6 +150,7 @@ describe.each(LANGUAGES)("settings (%s)", (lng) => {
     const photos = card("Photos");
     expect(within(photos).getByText(s.active)).toBeInTheDocument();
     expect(within(photos).getByText(s.mirrorLine)).toBeInTheDocument();
+    expect(within(photos).queryByText(s.beta)).not.toBeInTheDocument();
     expect(within(photos).getByText(s.storage)).toBeInTheDocument();
     expect(within(photos).getByText("2.0 GB / 10.0 GB (20.0%)")).toBeInTheDocument();
     expect(within(photos).getByRole("progressbar")).toHaveAttribute("aria-valuenow", "20");
@@ -161,6 +164,7 @@ describe.each(LANGUAGES)("settings (%s)", (lng) => {
     const work = card("Work");
     expect(within(work).getByText(s.mountFailed)).toBeInTheDocument();
     expect(within(work).getByText(s.onDemandLine)).toBeInTheDocument();
+    expect(within(work).getByText(s.beta)).toBeInTheDocument();
     const alert = within(work).getByRole("alert");
     expect(alert).toHaveTextContent(MOUNT_ERROR);
     expect(within(work).queryByRole("button", { name: s.ignorePatterns })).not.toBeInTheDocument();
@@ -291,6 +295,7 @@ describe.each(LANGUAGES)("settings (%s)", (lng) => {
       get_auto_start_enabled: () => true,
       get_general_settings: () => generalSettings,
       set_auto_start: (args) => args!.enabled,
+      set_heartbeat_interval: () => null,
     });
     const { user } = await renderApp("/settings", lng);
     await user.click(screen.getByRole("button", { name: s.general }));
@@ -303,8 +308,13 @@ describe.each(LANGUAGES)("settings (%s)", (lng) => {
     expect(screen.getByRole("button", { name: s.openFolder })).toBeInTheDocument();
     const heartbeat = screen.getByRole("spinbutton");
     expect(heartbeat).toHaveValue(15);
-    expect(heartbeat).toHaveAttribute("min", "5");
+    expect(heartbeat).toHaveAttribute("min", "10");
     expect(heartbeat).toHaveAttribute("max", "120");
+    // The app clamps the interval to 10-120 s (AppConfig::set_heartbeat_interval_secs):
+    // a 7 shows and saves as 10, not a value the app would not keep.
+    fireEvent.change(heartbeat, { target: { value: "7" } });
+    await waitFor(() => expect(heartbeat).toHaveValue(10));
+    expect(callsTo("set_heartbeat_interval")).toEqual([{ secs: 10 }]);
     // Language "auto" (null in the config), log level, kept log files.
     const selects = screen.getAllByRole("combobox");
     expect(selects.map((el) => el.textContent)).toEqual([s.languageAuto, "Info", "5"]);
