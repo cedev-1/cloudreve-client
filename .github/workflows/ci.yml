@@ -2,7 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # feat/vfs-on-demand: its PR conflicts with main, and GitHub runs no
+    # pull_request workflow for a PR it cannot merge.
+    branches: [main, feat/vfs-on-demand]
     paths:
       - 'crates/**'
       - 'src-tauri/**'
