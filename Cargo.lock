@@ -850,6 +850,7 @@ dependencies = [
  "cloudreve-api",
  "cloudreve-uploader",
  "fuser",
+ "indexmap 2.14.2",
  "libc",
  "nfs3_server",
  "reqwest 0.12.28",

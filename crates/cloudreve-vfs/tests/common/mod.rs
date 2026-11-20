@@ -19,6 +19,7 @@ use cloudreve_api::models::explorer::{
 };
 use cloudreve_api::models::user::Token;
 use cloudreve_api::{Client, ClientConfig};
+use indexmap::IndexMap;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -47,7 +48,12 @@ pub fn uri_of(name: &str) -> String {
 
 /// Files to serve for a listing, keyed by the full remote directory uri
 /// (e.g. `REMOTE_BASE` for the root, `"{REMOTE_BASE}/photos"` for a subdir).
-type FilesState = Arc<Mutex<HashMap<String, Vec<Value>>>>;
+type FilesState = Arc<Mutex<HashMap<String, Listing>>>;
+/// One directory's entries, keyed by name, in listing order. Keyed so that
+/// finding, replacing or removing one entry (every upload, `file/info`)
+/// costs the same in a folder of ten files or of thousands: a scan of the
+/// folder per upload made the mock itself quadratic in a big-folder copy.
+type Listing = IndexMap<String, Value>;
 /// `Arc` so a ranged GET of a big file clones a pointer, not the whole file.
 type ContentStore = Arc<Mutex<HashMap<String, Arc<Vec<u8>>>>>;
 type RequestLog = Arc<Mutex<HashMap<String, Vec<Option<String>>>>>;
@@ -92,6 +98,8 @@ pub struct VfsTestEnv {
     bytes_served: BytesServedLog,
     download_request_count: Arc<AtomicUsize>,
     list_requests: Arc<AtomicUsize>,
+    /// `GET /api/v4/file/info` requests served — see `info_request_count`.
+    info_requests: Arc<AtomicUsize>,
     /// Per-directory-uri artificial delay on the listing endpoint — see
     /// `slow_down_listing`.
     listing_delays: DownloadDelays,
@@ -163,6 +171,7 @@ impl VfsTestEnv {
         let bytes_served: BytesServedLog = Arc::new(Mutex::new(HashMap::new()));
         let download_request_count = Arc::new(AtomicUsize::new(0));
         let list_requests = Arc::new(AtomicUsize::new(0));
+        let info_requests = Arc::new(AtomicUsize::new(0));
         let listing_delays: DownloadDelays = Arc::new(Mutex::new(HashMap::new()));
         let upload_chunks: UploadChunksStore = Arc::new(Mutex::new(HashMap::new()));
         let latest_session_for_name: LatestSessionForName = Arc::new(Mutex::new(HashMap::new()));
@@ -210,7 +219,8 @@ impl VfsTestEnv {
                         .find(|(k, _)| k == "uri")
                         .map(|(_, v)| v.into_owned())
                         .unwrap_or_default();
-                    let dir_files = files.lock().unwrap().get(&uri).cloned().unwrap_or_default();
+                    let dir_files: Vec<Value> =
+                        files.lock().unwrap().get(&uri).map(|l| l.values().cloned().collect()).unwrap_or_default();
                     let delay = listing_delays.lock().unwrap().get(&uri).copied().unwrap_or_default();
                     ResponseTemplate::new(200).set_delay(delay).set_body_json(json!({
                         "code": 0,
@@ -225,6 +235,50 @@ impl VfsTestEnv {
                             },
                         },
                     }))
+                })
+                .mount(&server)
+                .await;
+        }
+
+        // File-info endpoint: `GET /api/v4/file/info?uri=…` answers with the
+        // one entry the listing of the uri's folder holds under that name —
+        // the same `files` state the listing mock serves, so a test that
+        // changes a listing (`set_remote_etag`, `list_uploaded_files`)
+        // changes what this reports too. A missing entry is the real
+        // server's 40016 ("Path not exist"), with a 200 status like every
+        // Cloudreve API error.
+        {
+            let files = files.clone();
+            let info_requests = info_requests.clone();
+            Mock::given(method("GET"))
+                .and(path("/api/v4/file/info"))
+                .respond_with(move |req: &Request| {
+                    info_requests.fetch_add(1, Ordering::SeqCst);
+                    let uri = req
+                        .url
+                        .query_pairs()
+                        .find(|(k, _)| k == "uri")
+                        .map(|(_, v)| v.into_owned())
+                        .unwrap_or_default();
+                    let entry = uri.rsplit_once('/').and_then(|(dir, name)| {
+                        files
+                            .lock()
+                            .unwrap()
+                            .get(dir)?
+                            .get(name)
+                            .cloned()
+                    });
+                    match entry {
+                        Some(entry) => ResponseTemplate::new(200).set_body_json(json!({
+                            "code": 0,
+                            "msg": "",
+                            "data": entry,
+                        })),
+                        None => ResponseTemplate::new(200).set_body_json(json!({
+                            "code": 40016,
+                            "msg": "Path not exist",
+                        })),
+                    }
                 })
                 .mount(&server)
                 .await;
@@ -383,6 +437,7 @@ impl VfsTestEnv {
             bytes_served,
             download_request_count,
             list_requests,
+            info_requests,
             listing_delays,
             upload_chunks,
             latest_session_for_name,
@@ -452,7 +507,7 @@ impl VfsTestEnv {
                         .unwrap()
                         .entry(parent_uri.to_string())
                         .or_default()
-                        .push(entry.clone());
+                        .insert(name.to_string(), entry.clone());
                     ResponseTemplate::new(200)
                         .set_body_json(json!({ "code": 0, "msg": "", "data": entry }))
                 })
@@ -530,7 +585,7 @@ impl VfsTestEnv {
                     if let Some(children) = files.remove(&request.uri) {
                         files.insert(new_path.clone(), children);
                     }
-                    files.entry(parent_uri.to_string()).or_default().push(entry.clone());
+                    files.entry(parent_uri.to_string()).or_default().insert(request.new_name.clone(), entry.clone());
                     ResponseTemplate::new(200)
                         .set_delay(delay)
                         .set_body_json(json!({ "code": 0, "msg": "", "data": entry }))
@@ -581,7 +636,7 @@ impl VfsTestEnv {
                         if let Some(children) = files.remove(uri) {
                             files.insert(new_path.clone(), children);
                         }
-                        files.entry(request.dst.clone()).or_default().push(entry);
+                        files.entry(request.dst.clone()).or_default().insert(name, entry);
                     }
                     ResponseTemplate::new(200).set_body_json(json!({ "code": 0, "msg": "" }))
                 })
@@ -899,7 +954,7 @@ impl VfsTestEnv {
     pub async fn set_remote_etag(&self, name: &str, etag: &str) {
         let mut files = self.files.lock().unwrap();
         for dir_files in files.values_mut() {
-            for file in dir_files.iter_mut() {
+            for file in dir_files.values_mut() {
                 if file.get("name").and_then(Value::as_str) == Some(name) {
                     file["primary_entity"] = json!(etag);
                 }
@@ -913,7 +968,7 @@ impl VfsTestEnv {
         self.files
             .lock()
             .unwrap()
-            .insert(REMOTE_BASE.to_string(), files);
+            .insert(REMOTE_BASE.to_string(), listing(files));
     }
 
     /// Configure the mock listing endpoint to return these files for
@@ -923,7 +978,7 @@ impl VfsTestEnv {
         self.files
             .lock()
             .unwrap()
-            .insert(format!("{REMOTE_BASE}/{subdir}"), files);
+            .insert(format!("{REMOTE_BASE}/{subdir}"), listing(files));
     }
 
     /// Adds one more file to the root listing (accumulating, unlike
@@ -936,7 +991,7 @@ impl VfsTestEnv {
             files
                 .entry(REMOTE_BASE.to_string())
                 .or_default()
-                .push(remote_file(name, content.len() as i64, etag));
+                .insert(name.to_string(), remote_file(name, content.len() as i64, etag));
         }
         self.serve_file_content(name, &content).await;
     }
@@ -950,6 +1005,11 @@ impl VfsTestEnv {
     /// Total number of `GET /api/v4/file` (listing) requests served so far.
     pub fn list_request_count(&self) -> usize {
         self.list_requests.load(Ordering::SeqCst)
+    }
+
+    /// Total number of `GET /api/v4/file/info` requests served so far.
+    pub fn info_request_count(&self) -> usize {
+        self.info_requests.load(Ordering::SeqCst)
     }
 
     /// Register file content behind the mocked download flow: both the
@@ -1165,44 +1225,68 @@ impl VfsTestEnv {
     }
 }
 
-/// Whether any directory listing registered so far already holds an entry
-/// at exactly `target_path` — the read-only counterpart of
-/// `remove_entry_by_path`, used by the upload-session mock's `ObjectExisted`
-/// simulation (see `expect_uploads`'s doc).
+/// A [`Listing`] of `files`, in their order, keyed by their `name`.
+fn listing(files: Vec<Value>) -> Listing {
+    files
+        .into_iter()
+        .map(|f| (f.get("name").and_then(Value::as_str).unwrap_or_default().to_string(), f))
+        .collect()
+}
+
+/// The entry `target_path` names — the one under its last segment in the
+/// listing of the folder before it — if that entry's `path` is exactly
+/// `target_path`.
+fn entry_at<'a>(files: &'a HashMap<String, Listing>, target_path: &str) -> Option<&'a Value> {
+    let (dir, name) = target_path.rsplit_once('/')?;
+    files
+        .get(dir)?
+        .get(name)
+        .filter(|f| f.get("path").and_then(Value::as_str) == Some(target_path))
+}
+
 /// `list_uploaded_files`: puts the file an upload session created at `uri`
 /// into its folder's listing, the session id as its new etag.
-fn list_upload(files: &mut HashMap<String, Vec<Value>>, uri: &str, size: i64, session_id: &str) {
+fn list_upload(files: &mut HashMap<String, Listing>, uri: &str, size: i64, session_id: &str) {
     let Some((dir, name)) = uri.rsplit_once('/') else { return };
-    let list = files.entry(dir.to_string()).or_default();
-    list.retain(|f| f.get("path").and_then(Value::as_str) != Some(uri));
-    list.push(json!({
-        "type": 0,
-        "id": format!("file-{name}"),
-        "name": name,
-        "created_at": "2026-01-01T00:00:00Z",
-        "updated_at": "2026-01-02T00:00:00Z",
-        "size": size,
-        "path": uri,
-        "primary_entity": session_id,
-    }));
+    files.entry(dir.to_string()).or_default().insert(
+        name.to_string(),
+        json!({
+            "type": 0,
+            "id": format!("file-{name}"),
+            "name": name,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-02T00:00:00Z",
+            "size": size,
+            "path": uri,
+            "primary_entity": session_id,
+        }),
+    );
 }
 
-fn path_exists_in_files(files: &HashMap<String, Vec<Value>>, target_path: &str) -> bool {
-    files
-        .values()
-        .any(|list| list.iter().any(|f| f.get("path").and_then(Value::as_str) == Some(target_path)))
+/// Whether the listing of `target_path`'s folder already holds an entry at
+/// exactly that path — the read-only counterpart of `remove_entry_by_path`,
+/// used by the upload-session mock's `ObjectExisted` simulation (see
+/// `expect_uploads`'s doc) and the rename/move collision checks.
+fn path_exists_in_files(files: &HashMap<String, Listing>, target_path: &str) -> bool {
+    entry_at(files, target_path).is_some()
 }
 
-/// Removes and returns the first entry whose `path` field equals
-/// `target_path`, scanning every directory listing registered so far —
-/// namespace-op mocks use this to find an entry regardless of which
-/// directory's listing currently holds it.
-fn remove_entry_by_path(files: &mut HashMap<String, Vec<Value>>, target_path: &str) -> Option<Value> {
+/// Removes and returns the entry whose `path` field equals `target_path`:
+/// looked up in its own folder's listing first, then in every directory
+/// listing registered so far — a fixture built with `remote_file` lists a
+/// nested file under a root-level `path`, and namespace-op mocks must still
+/// find it.
+fn remove_entry_by_path(files: &mut HashMap<String, Listing>, target_path: &str) -> Option<Value> {
+    if let Some((dir, name)) = target_path.rsplit_once('/') {
+        if entry_at(files, target_path).is_some() {
+            return files.get_mut(dir)?.shift_remove(name);
+        }
+    }
     for list in files.values_mut() {
         if let Some(idx) =
-            list.iter().position(|f| f.get("path").and_then(Value::as_str) == Some(target_path))
+            list.values().position(|f| f.get("path").and_then(Value::as_str) == Some(target_path))
         {
-            return Some(list.remove(idx));
+            return list.shift_remove_index(idx).map(|(_, f)| f);
         }
     }
     None

@@ -12,9 +12,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use cloudreve_api::api::explorer::ExplorerApiExt;
+use cloudreve_api::api::explorer::{ExplorerApi, ExplorerApiExt};
 use cloudreve_api::models::common::ListAllRes;
-use cloudreve_api::models::explorer::{file_type, ListResponse};
+use cloudreve_api::models::explorer::{file_type, GetFileInfoService, ListResponse};
 use tokio::sync::RwLock;
 
 /// How long a directory listing is trusted before `readdir` will hit the
@@ -769,10 +769,9 @@ impl VfsTree {
             .collect()
     }
 
-    /// Forces a fresh listing of `remote_path`'s parent directory and
-    /// returns the server's current full attributes for it — `None` if the
-    /// parent directory isn't known to the tree yet, or if the entry no
-    /// longer exists there (deleted remotely since the caller's own last
+    /// Asks the server for `remote_path`'s current full attributes — `None`
+    /// if the parent directory isn't known to the tree yet, or if the entry
+    /// no longer exists there (deleted remotely since the caller's own last
     /// look). Deliberately works from a bare remote path alone, no
     /// `NodeId`: the write-back queue (Task 8) only ever holds paths —
     /// `DraftStore` never allocates or tracks node ids. Phase 4 task 3
@@ -782,35 +781,81 @@ impl VfsTree {
     /// directory it must not) doesn't have to re-derive the same
     /// parent-lookup dance a second time.
     ///
-    /// Only the parent's listing is expired — the entry itself is NOT
-    /// marked stale the way `invalidate_path` would. This is a question
-    /// the write-back asks about a draft it holds (before an upload, after
+    /// One `file/info` request for that one entry, never a listing of its
+    /// parent: the write-back asks this before and after every upload, and
+    /// re-listing the folder each time made copying n files into it cost n
+    /// listings of up to n entries (2000 photos: 2000 listings of a
+    /// 2000-entry folder, ten pages each on a real server). The answer
+    /// updates the node the tree knows at that path, if any, by the same
+    /// rules a listing applies (see `ensure_listed`).
+    ///
+    /// The parent's listing is left alone, and the entry is NOT marked
+    /// stale the way `invalidate_path` would. This is a question the
+    /// write-back asks about a draft it holds (before an upload, after
     /// one), and a stale mark would let any listing that lacks the file
     /// drop its node: a listing fetched before the upload landed (Finder,
     /// a LOOKUP past the TTL) applied after this call, or a server still
     /// catching up. The kernel keeps writing a just-copied file by its
     /// fileid after its empty first draft uploaded, so each of its later
-    /// WRITE/SETATTRs then failed with ENOENT. A server entry missing from
-    /// the fresh listing is still pruned as a ghost; a remote delete of a
-    /// local-only one still comes through `invalidate_path` (SSE).
+    /// WRITE/SETATTRs then failed with ENOENT. A remote delete still comes
+    /// through `invalidate_path` (SSE) or the next listing.
     pub async fn refresh_attrs(&self, remote_path: &str) -> Result<Option<NodeAttr>> {
         let Some((parent_path, name)) = remote_path.rsplit_once('/') else {
             return Ok(None);
         };
-        let parent_id = {
-            let mut inner = self.inner.write().await;
-            let parent_id = inner
-                .attrs
-                .iter()
-                .find(|(_, attr)| attr.is_dir && attr.remote_path == parent_path)
-                .map(|(id, _)| *id);
-            if let Some(dir_id) = parent_id {
-                inner.listed_at.remove(&dir_id);
-            }
-            parent_id
+        let parent_known = self
+            .inner
+            .read()
+            .await
+            .attrs
+            .values()
+            .any(|attr| attr.is_dir && attr.remote_path == parent_path);
+        if !parent_known {
+            return Ok(None);
+        }
+        let request = GetFileInfoService {
+            uri: Some(remote_path.to_string()),
+            id: None,
+            extended: None,
+            folder_summary: None,
         };
-        let Some(parent_id) = parent_id else { return Ok(None) };
-        Ok(self.lookup(parent_id, name).await?.map(|(_, attr)| attr))
+        let f = match self.client.get_file_info(&request).await {
+            Ok(f) => f,
+            // 40016 "Path not exist" is the server's answer for a missing
+            // entry; a bare 404 may come from a proxy in front of it.
+            Err(cloudreve_api::ApiError::ApiError { code: 40016 | 404, .. }) => return Ok(None),
+            Err(err) => return Err(err).context("failed to fetch remote file info"),
+        };
+        let mut attr = NodeAttr {
+            name: f.name,
+            remote_path: f.path,
+            size: f.size.max(0) as u64,
+            mtime_secs: parse_rfc3339(&f.updated_at),
+            mtime_nsecs: 0,
+            is_dir: f.file_type == file_type::FOLDER,
+            etag: f.primary_entity.unwrap_or_default(),
+        };
+
+        let mut inner = self.inner.write().await;
+        let node = inner
+            .attrs
+            .iter()
+            .find(|(_, attr)| attr.is_dir && attr.remote_path == parent_path)
+            .and_then(|(parent, _)| inner.known_children.named(*parent, name).first().copied());
+        if let Some(old) = node.and_then(|id| inner.attrs.get_mut(&id)) {
+            if !attr.is_dir && !old.is_dir && !attr.etag.is_empty() && old.etag == attr.etag {
+                attr.size = old.size;
+                attr.mtime_secs = old.mtime_secs;
+            }
+            if attr.is_dir && old.is_dir && (old.mtime_secs, old.mtime_nsecs) > (attr.mtime_secs, 0) {
+                attr.mtime_secs = old.mtime_secs;
+                attr.mtime_nsecs = old.mtime_nsecs;
+            }
+            // The node stays under the name the tree keys it by.
+            attr.name = old.name.clone();
+            *old = attr.clone();
+        }
+        Ok(Some(attr))
     }
 
     /// Write-back (NFS hardening): a draft of `remote_path` was just

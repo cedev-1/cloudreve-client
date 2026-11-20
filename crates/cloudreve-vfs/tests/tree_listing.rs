@@ -235,3 +235,55 @@ async fn junk_the_server_lists_never_enters_the_tree() {
     assert_eq!(names, vec!["a.txt".to_string()]);
     assert!(tree.lookup(tree.root(), ".DS_Store").await.unwrap().is_none());
 }
+
+/// The write-back asks for one file's current version before and after
+/// every upload: the answer must reach the node the kernel holds, and cost
+/// one file lookup, never a re-listing of its whole folder.
+#[tokio::test]
+async fn refreshing_one_file_updates_its_node_without_relisting_the_folder() {
+    let env = VfsTestEnv::new().await;
+    env.set_remote_files(vec![remote_file("report.pdf", 10_240, "e1"), remote_file("notes.txt", 300, "e7")]).await;
+    let tree = VfsTree::new(env.client(), common::REMOTE_BASE.into());
+    let (node, _) = tree.lookup(tree.root(), "report.pdf").await.unwrap().unwrap();
+    let listings = env.list_request_count();
+
+    // Edited on another computer since.
+    env.set_remote_files(vec![remote_file("report.pdf", 20_480, "e2"), remote_file("notes.txt", 300, "e7")]).await;
+    let fresh = tree.refresh_attrs(&common::uri_of("report.pdf")).await.unwrap().expect("still on the server");
+
+    assert_eq!((fresh.etag.as_str(), fresh.size), ("e2", 20_480));
+    let attr = tree.getattr(node).await.unwrap().unwrap();
+    assert_eq!((attr.etag.as_str(), attr.size), ("e2", 20_480));
+    assert_eq!(env.list_request_count(), listings, "the folder was re-listed");
+    assert_eq!(env.info_request_count(), 1);
+}
+
+/// The same version as the tree already knows keeps the size it reported:
+/// sizes only move when the content does (see `VfsTree::record_upload`).
+#[tokio::test]
+async fn refreshing_a_file_at_the_same_version_keeps_the_size_already_reported() {
+    let env = VfsTestEnv::new().await;
+    env.set_remote_files(vec![remote_file("IMG_0750.jpg", 0, "e1")]).await;
+    let tree = VfsTree::new(env.client(), common::REMOTE_BASE.into());
+    let (node, _) = tree.lookup(tree.root(), "IMG_0750.jpg").await.unwrap().unwrap();
+    tree.record_upload(&common::uri_of("IMG_0750.jpg"), 2_400_000, 1_780_000_000, "e1").await;
+
+    tree.refresh_attrs(&common::uri_of("IMG_0750.jpg")).await.unwrap().unwrap();
+
+    assert_eq!(tree.getattr(node).await.unwrap().unwrap().size, 2_400_000);
+}
+
+/// A file deleted on the server is reported gone, not as a failure: the
+/// write-back tells the two apart (adopt, conflict-check, retry).
+#[tokio::test]
+async fn refreshing_a_file_deleted_on_the_server_reports_it_gone() {
+    let env = VfsTestEnv::new().await;
+    env.set_remote_files(vec![remote_file("draft.docx", 5_000, "e1")]).await;
+    let tree = VfsTree::new(env.client(), common::REMOTE_BASE.into());
+    tree.readdir(tree.root()).await.unwrap();
+    env.set_remote_files(vec![]).await;
+
+    let refreshed = tree.refresh_attrs(&common::uri_of("draft.docx")).await;
+
+    assert!(matches!(refreshed, Ok(None)), "expected Ok(None), got {refreshed:?}");
+}
