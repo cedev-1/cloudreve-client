@@ -71,7 +71,16 @@ pub fn run<F: std::future::Future<Output = ()> + Send + 'static>(body: F) {
     let rt = &shared().rt;
     if let Err(e) = rt.handle().block_on(rt.spawn(body)) {
         if e.is_panic() {
-            std::panic::resume_unwind(e.into_panic());
+            // Re-panicked HERE, with its message: the runtime's worker
+            // threads print into whichever test's capture they inherited,
+            // so the original message would land in another test's output.
+            let payload = e.into_panic();
+            let msg = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_else(|| "non-string panic".to_string());
+            panic!("{msg}");
         }
         panic!("test body cancelled: {e}");
     }
