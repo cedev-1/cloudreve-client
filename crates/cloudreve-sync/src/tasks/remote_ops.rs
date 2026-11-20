@@ -153,6 +153,10 @@ impl RemoteOps<'_> {
     pub async fn delete(&self, local: &Path) -> Result<Vec<TaskPayload>> {
         self.check_root()?;
         self.check_inside(local)?;
+        if self.ignore.is_match(local) {
+            // Junk never causes a server delete, however it was queued.
+            return Ok(Vec::new());
+        }
         if local.exists() {
             info!(target: "tasks::remote_ops", path = %local.display(), "Not deleting on the server: the file is back");
             return Ok(Vec::new());
