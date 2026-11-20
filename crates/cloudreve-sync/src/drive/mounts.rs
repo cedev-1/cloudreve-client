@@ -667,13 +667,30 @@ impl Mount {
     async fn start_fs_watcher(&self, sync_path: &PathBuf) -> Result<()> {
         let command_tx = self.command_tx.clone();
         let event_blocker = self.event_blocker.clone();
+        // FSEvents reports the resolved path of a change (`/private/var/…`
+        // for a folder configured as `/var/…`, or wherever a symlinked sync
+        // folder really lives). Everything downstream — remote uris, the
+        // inventory, the event blocker — is keyed by the configured path, so
+        // an event left resolved matched none of them and its upload failed
+        // with "Path is not under root". Put the configured prefix back.
+        let configured = sync_path.clone();
+        let resolved = std::fs::canonicalize(sync_path).ok().filter(|r| r != sync_path);
 
         let watcher = new_debouncer(
             Duration::from_secs(2),
             None,
             move |result: DebounceEventResult| {
                 match result {
-                    Ok(events) => {
+                    Ok(mut events) => {
+                        if let Some(resolved) = &resolved {
+                            for event in &mut events {
+                                for path in &mut event.event.paths {
+                                    if let Ok(rest) = path.strip_prefix(resolved) {
+                                        *path = configured.join(rest);
+                                    }
+                                }
+                            }
+                        }
                         let events: Vec<_> = events
                             .into_iter()
                             .filter(|e| !event_blocker.should_block(&e.kind, e.paths.first().unwrap_or(&PathBuf::new())))
