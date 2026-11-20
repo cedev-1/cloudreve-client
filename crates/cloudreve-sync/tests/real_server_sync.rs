@@ -118,6 +118,9 @@ fn local_changes_in_a_mirror_drive_reach_the_server() {
         std::fs::rename(app.local("renamed.txt"), app.local("deep/moved.txt")).unwrap();
         wait_remote(&app.remote, "deep/moved.txt", b"modified locally + appended").await;
         wait_remote_gone(&app.remote, "renamed.txt").await;
+        // Same macOS ~30 s "created" rule as for renames (`OLD_ENOUGH`):
+        // deleted sooner, they only leave the server at the next full sync.
+        tokio::time::sleep(OLD_ENOUGH).await;
         std::fs::remove_dir_all(app.local("deep/er")).unwrap();
         std::fs::remove_file(app.local("big.bin")).unwrap();
         wait_remote_gone(&app.remote, "deep/er").await;
