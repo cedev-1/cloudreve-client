@@ -84,6 +84,9 @@ write -> draft (Editing) --close--> Pending --2 s debounce--> Uploading
   etag. If someone else changed the file, the draft is uploaded as a
   *conflicted copy* next to it (`ConflictSaved` event, notification). Nothing
   is ever overwritten.
+- That check, and reading the new etag after an upload, ask the server about
+  the one file (`GET /file/info`), never re-list its folder: copying n files
+  into a folder would otherwise cost n listings of up to n entries.
 - Failed uploads (3 attempts) are parked and retried on their own after 30 s,
   then with a doubling delay capped at 10 min, and on every server reconnect.
 - Deleting a file whose upload is running lets the upload finish, then deletes
