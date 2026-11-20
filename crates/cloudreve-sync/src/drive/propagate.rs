@@ -39,8 +39,9 @@
 //! upload of the new one: a new untracked file next to a tracked file that
 //! is gone is swept for right away (`vanished_files_in`), so the server
 //! never keeps both names. A file that appears and is deleted within the
-//! watcher's 2 s window (deleted right after it was downloaded) is dropped
-//! by its debouncer as a file that came and went; a folder made and a file
+//! watcher's 2 s window (deleted right after it was downloaded) — on macOS
+//! within ~30 s, for the same FSEvents reason — is dropped by the debouncer
+//! as a file that came and went; a folder made and a file
 //! moved into it in that same window can race (on Linux, the new folder
 //! is not watched yet). Both are left to the next full sync (at most five
 //! minutes): a delete, or a delete plus an upload — never a lost file.

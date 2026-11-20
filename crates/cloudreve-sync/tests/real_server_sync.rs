@@ -164,10 +164,11 @@ fn deleting_in_a_mirror_drive_moves_files_and_folders_to_the_server_trash() {
         wait_local(&app, "doc-del.txt", b"doc").await;
         wait_local(&app, "Folder-del/sub/b.txt", b"b").await;
         wait_local(&app, "keep.txt", b"keep").await;
-        // A file created and removed within the watcher's 2 s window is
-        // dropped by its debouncer (it came and went); the next full sync
-        // would catch it. Deleting a file just downloaded is not this test.
-        tokio::time::sleep(SETTLE).await;
+        // A file created and removed within the watcher's 2 s window — on
+        // macOS, within ~30 s, as FSEvents keeps reporting it "created" — is
+        // dropped by the debouncer as one that came and went; the next full
+        // sync catches it. Deleting a file just downloaded is not this test.
+        tokio::time::sleep(OLD_ENOUGH).await;
 
         std::fs::remove_file(app.local("doc-del.txt")).unwrap();
         wait_remote_gone(&app.remote, "doc-del.txt").await;
@@ -202,7 +203,7 @@ fn a_mirror_drive_switched_off_keeps_the_server_untouched_until_switched_on() {
         wait_local(&app, "kept.txt", b"kept").await;
         wait_local(&app, "old-name.txt", b"renamed").await;
         wait_local(&app, "later.txt", b"later").await;
-        tokio::time::sleep(SETTLE).await;
+        tokio::time::sleep(OLD_ENOUGH).await;
 
         std::fs::remove_file(app.local("kept.txt")).unwrap();
         std::fs::rename(app.local("old-name.txt"), app.local("new-name.txt")).unwrap();
