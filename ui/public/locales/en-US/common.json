@@ -22,6 +22,8 @@
       "onDemandHint": "Your files show up in the folder right away but use no disk space until you open them.",
       "onDemandDetails": "Opening a file for the first time needs an internet connection; files you opened recently stay available.",
       "fixedNote": "This choice can't be changed later. To switch, remove the drive and add it again.",
+      "beta": "Beta",
+      "betaWarning": "Beta: may have bugs. Keep a backup of important files.",
       "macNote": "The first time, macOS may ask whether Cloudreve can access files on a network volume: click Allow.",
       "linuxNote": "Needs FUSE (the \"fuse3\" package, already installed on most Linux systems).",
       "learnMore": "Learn more"
@@ -151,7 +153,8 @@
       "mirror": "Download everything",
       "onDemand": "Files on demand",
       "mirrorHint": "All files are kept on this computer",
-      "onDemandHint": "Files download when you open them"
+      "onDemandHint": "Files download when you open them",
+      "beta": "Beta"
     },
     "networkSettings": "Network",
     "heartbeatInterval": "Heartbeat interval",

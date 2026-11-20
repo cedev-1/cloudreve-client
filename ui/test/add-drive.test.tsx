@@ -19,6 +19,8 @@ const S = {
     modeTitle: "How should your files be kept on this computer?",
     mirror: "Download everything",
     onDemand: "Files on demand",
+    beta: "Beta",
+    betaWarning: "Beta: may have bugs. Keep a backup of important files.",
     mirrorHint: "Every file is copied to this computer and kept in sync.",
     onDemandHint: "Your files show up in the folder right away but use no disk space until you open them.",
     learnMore: "Learn more",
@@ -53,6 +55,8 @@ const S = {
     modeTitle: "Comment garder vos fichiers sur cet ordinateur ?",
     mirror: "Tout télécharger",
     onDemand: "Fichiers à la demande",
+    beta: "Bêta",
+    betaWarning: "Bêta : peut contenir des bugs. Gardez une sauvegarde de vos fichiers importants.",
     mirrorHint: "Chaque fichier est copié sur cet ordinateur et tenu à jour.",
     onDemandHint:
       "Vos fichiers apparaissent tout de suite dans le dossier mais n'occupent aucun espace disque tant que vous ne les ouvrez pas.",
@@ -137,13 +141,17 @@ describe.each(LANGUAGES)("add drive (%s)", (lng) => {
     expect(screen.getByLabelText(s.name, { exact: false })).toHaveValue("My Cloud");
     expect(screen.getByText(s.modeTitle)).toBeInTheDocument();
     const mirror = screen.getByRole("button", { name: s.mirror });
-    const onDemand = screen.getByRole("button", { name: s.onDemand });
+    const onDemand = screen.getByRole("button", { name: `${s.onDemand} ${s.beta}` });
     expect(mirror).toHaveAttribute("aria-pressed", "true");
     expect(screen.getByText(s.mirrorHint)).toBeInTheDocument();
+    // Only on-demand is marked Beta, and its warning shows once it is picked.
+    expect(within(mirror).queryByText(s.beta)).not.toBeInTheDocument();
+    expect(screen.queryByText(s.betaWarning)).not.toBeInTheDocument();
 
     await user.click(onDemand);
     expect(onDemand).toHaveAttribute("aria-pressed", "true");
     expect(screen.getByText(s.onDemandHint)).toBeInTheDocument();
+    expect(screen.getByText(s.betaWarning)).toBeInTheDocument();
 
     // (i): the details stay folded until asked for.
     const info = screen.getByRole("button", { name: s.learnMore });
@@ -207,7 +215,7 @@ describe.each(LANGUAGES)("add drive (%s)", (lng) => {
     dialog.open.mockResolvedValueOnce("/home/alice/Cloud");
     os.platform = "linux";
     const { user } = await reachFinalStep(lng);
-    await user.click(screen.getByRole("button", { name: s.onDemand }));
+    await user.click(screen.getByRole("button", { name: `${s.onDemand} ${s.beta}` }));
     await user.click(screen.getByRole("button", { name: s.learnMore }));
     expect(screen.getByText(s.linuxNote)).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: s.browse }));

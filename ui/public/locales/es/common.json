@@ -22,6 +22,8 @@
       "onDemandHint": "Tus archivos aparecen en la carpeta al instante, pero no ocupan espacio en disco hasta que los abres.",
       "onDemandDetails": "Abrir un archivo por primera vez requiere conexión a internet; los archivos abiertos recientemente siguen disponibles.",
       "fixedNote": "Esta opción no se puede cambiar después. Para cambiarla, quita la unidad y vuelve a añadirla.",
+      "beta": "Beta",
+      "betaWarning": "Beta: puede tener errores. Guarda una copia de seguridad de tus archivos importantes.",
       "macNote": "La primera vez, macOS puede preguntar si Cloudreve puede acceder a archivos de un volumen de red: pulsa Permitir.",
       "linuxNote": "Requiere FUSE (el paquete \"fuse3\", ya instalado en la mayoría de sistemas Linux).",
       "learnMore": "Más información"
@@ -145,7 +147,8 @@
       "mirror": "Descargar todo",
       "onDemand": "Archivos bajo demanda",
       "mirrorHint": "Todos los archivos se guardan en este equipo",
-      "onDemandHint": "Los archivos se descargan al abrirlos"
+      "onDemandHint": "Los archivos se descargan al abrirlos",
+      "beta": "Beta"
     },
     "networkSettings": "Red",
     "heartbeatInterval": "Intervalo de heartbeat",

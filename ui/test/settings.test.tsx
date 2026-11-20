@@ -1,4 +1,4 @@
-import { screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import {
   expiredDriveInfo,
@@ -22,6 +22,7 @@ const S = {
     credentialExpired: "Credential Expired",
     mirrorLine: "Download everything · All files are kept on this computer",
     onDemandLine: "Files on demand · Files download when you open them",
+    beta: "Beta",
     storage: "Storage",
     retry: "Retry",
     reauthorize: "Reauthorize",
@@ -42,6 +43,7 @@ const S = {
     invalidPatterns: "Invalid patterns: unclosed character class in \"[abc\"",
     launch: "Launch",
     autoStart: "Launch at startup",
+    fastPopupLaunch: "Fast popup launch",
     updates: "Updates",
     language: "Language",
     languageAuto: "System Default",
@@ -72,6 +74,7 @@ const S = {
     credentialExpired: "Identifiants expirés",
     mirrorLine: "Tout télécharger · Tous les fichiers sont gardés sur cet ordinateur",
     onDemandLine: "Fichiers à la demande · Les fichiers se téléchargent à l'ouverture",
+    beta: "Bêta",
     storage: "Stockage",
     retry: "Réessayer",
     reauthorize: "Réautoriser",
@@ -92,6 +95,7 @@ const S = {
     invalidPatterns: "Motifs invalides : unclosed character class in \"[abc\"",
     launch: "Lancement",
     autoStart: "Lancer au démarrage",
+    fastPopupLaunch: "Lancement rapide de la fenêtre popup",
     updates: "Mises à jour",
     language: "Langue",
     languageAuto: "Par défaut du système",
@@ -146,6 +150,7 @@ describe.each(LANGUAGES)("settings (%s)", (lng) => {
     const photos = card("Photos");
     expect(within(photos).getByText(s.active)).toBeInTheDocument();
     expect(within(photos).getByText(s.mirrorLine)).toBeInTheDocument();
+    expect(within(photos).queryByText(s.beta)).not.toBeInTheDocument();
     expect(within(photos).getByText(s.storage)).toBeInTheDocument();
     expect(within(photos).getByText("2.0 GB / 10.0 GB (20.0%)")).toBeInTheDocument();
     expect(within(photos).getByRole("progressbar")).toHaveAttribute("aria-valuenow", "20");
@@ -159,6 +164,7 @@ describe.each(LANGUAGES)("settings (%s)", (lng) => {
     const work = card("Work");
     expect(within(work).getByText(s.mountFailed)).toBeInTheDocument();
     expect(within(work).getByText(s.onDemandLine)).toBeInTheDocument();
+    expect(within(work).getByText(s.beta)).toBeInTheDocument();
     const alert = within(work).getByRole("alert");
     expect(alert).toHaveTextContent(MOUNT_ERROR);
     expect(within(work).queryByRole("button", { name: s.ignorePatterns })).not.toBeInTheDocument();
@@ -289,6 +295,7 @@ describe.each(LANGUAGES)("settings (%s)", (lng) => {
       get_auto_start_enabled: () => true,
       get_general_settings: () => generalSettings,
       set_auto_start: (args) => args!.enabled,
+      set_heartbeat_interval: () => null,
     });
     const { user } = await renderApp("/settings", lng);
     await user.click(screen.getByRole("button", { name: s.general }));
@@ -301,8 +308,13 @@ describe.each(LANGUAGES)("settings (%s)", (lng) => {
     expect(screen.getByRole("button", { name: s.openFolder })).toBeInTheDocument();
     const heartbeat = screen.getByRole("spinbutton");
     expect(heartbeat).toHaveValue(15);
-    expect(heartbeat).toHaveAttribute("min", "5");
+    expect(heartbeat).toHaveAttribute("min", "10");
     expect(heartbeat).toHaveAttribute("max", "120");
+    // The app clamps the interval to 10-120 s (AppConfig::set_heartbeat_interval_secs):
+    // a 7 shows and saves as 10, not a value the app would not keep.
+    fireEvent.change(heartbeat, { target: { value: "7" } });
+    await waitFor(() => expect(heartbeat).toHaveValue(10));
+    expect(callsTo("set_heartbeat_interval")).toEqual([{ secs: 10 }]);
     // Language "auto" (null in the config), log level, kept log files.
     const selects = screen.getAllByRole("combobox");
     expect(selects.map((el) => el.textContent)).toEqual([s.languageAuto, "Info", "5"]);
@@ -345,8 +357,38 @@ describe.each(LANGUAGES)("settings (%s)", (lng) => {
     expect(await screen.findByText(s.profileNoDrive)).toBeInTheDocument();
   });
 
+  it("leaves updates and autostart to the package manager in a package-managed build", async () => {
+    mockCommands({
+      get_drives_info: () => [],
+      get_auto_start_enabled: () => false,
+      get_general_settings: () => ({ ...generalSettings, package_managed: true }),
+    });
+    const { user } = await renderApp("/settings", lng);
+    await user.click(screen.getByRole("button", { name: s.general }));
+
+    // The rest of the page is there, the launch group keeps its other toggle.
+    for (const group of [s.launch, s.notifications, s.network, s.logging]) {
+      expect(await screen.findByText(group)).toBeInTheDocument();
+    }
+    expect(screen.getByText(s.fastPopupLaunch)).toBeInTheDocument();
+    // Both show while the settings load, then go.
+    await waitFor(() => expect(screen.queryByText(s.autoStart)).not.toBeInTheDocument());
+    expect(screen.queryByText(s.updates)).not.toBeInTheDocument();
+
+    const asked = callsTo("get_general_settings").length;
+    await user.click(screen.getByRole("button", { name: s.about }));
+    expect(await screen.findByText("v0.3.0")).toBeInTheDocument();
+    // The button is hidden until the settings answer: wait for that answer,
+    // or its absence would prove nothing.
+    await waitFor(() => expect(callsTo("get_general_settings").length).toBeGreaterThan(asked));
+    await act(async () => {});
+    expect(screen.queryByRole("button", { name: s.checkForUpdates })).not.toBeInTheDocument();
+    expect(screen.getByRole("link", { name: s.reportIssue })).toBeInTheDocument();
+    expect(updater.check).not.toHaveBeenCalled();
+  });
+
   it("checks for updates: up to date, failure, then an update to install", async () => {
-    mockCommands({ get_drives_info: () => [] });
+    mockCommands({ get_drives_info: () => [], get_general_settings: () => generalSettings });
     const { user } = await renderApp("/settings", lng);
     await user.click(screen.getByRole("button", { name: s.about }));
 
@@ -356,7 +398,7 @@ describe.each(LANGUAGES)("settings (%s)", (lng) => {
       "href",
       "https://github.com/cedev-1/cloudreve-client/issues"
     );
-    const check = screen.getByRole("button", { name: s.checkForUpdates });
+    const check = await screen.findByRole("button", { name: s.checkForUpdates });
 
     updater.check.mockResolvedValueOnce(null);
     await user.click(check);

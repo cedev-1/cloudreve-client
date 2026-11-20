@@ -1,6 +1,7 @@
 [package]
 name = "cloudreve-sync"
 version.workspace = true
+license.workspace = true
 edition = "2024"
 
 [dependencies]

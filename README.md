@@ -7,14 +7,21 @@
 
 See [cloudreve-client](https://aur.archlinux.org/packages/cloudreve-client) (Maintainer [Loooooooooong](https://github.com/Loong-OvO))
 
+#### Nix
+
+Flake with a package, home-manager, NixOS and nix-darwin modules: see [docs/nix.md](docs/nix.md).
+
 Desktop sync client for [Cloudreve](https://cloudreve.org) - fork from [cloudreve windows client](https://github.com/cloudreve/desktop).
 
-## Files on demand
+## Files on demand (Beta)
+
+> [!CAUTION]
+> Files on demand is in **Beta**: it may have bugs, use it at your own risk and keep a backup of important files.
 
 When you add a drive, you choose how its files are kept on your computer:
 
 - **Download everything** — every file is copied to your computer and kept in sync. Files open without internet, but use as much disk space as your cloud.
-- **Files on demand** — all your files and folders show up in the drive folder right away, but they use no disk space until you open them. Opening a file downloads it; files you opened recently stay on your computer, so they open instantly next time.
+- **Files on demand** (Beta) — all your files and folders show up in the drive folder right away, but they use no disk space until you open them. Opening a file downloads it; files you opened recently stay on your computer, so they open instantly next time.
 
 The choice is made when you add the drive and cannot be changed afterwards. To switch, remove the drive and add it again (your files stay in the cloud).
 
@@ -69,3 +76,7 @@ For developers: see [docs/vfs-architecture.md](docs/vfs-architecture.md).
 
 > [!WARNING]
 > Cloudreve server version **4.16.1** has a bug where OAuth scope enforcement blocks desktop clients from accessing `/user/me` and other user endpoints ([details](https://github.com/cloudreve/cloudreve/issues/3471)). Please upgrade to **4.17.0**.
+
+## License
+
+MIT, see [LICENSE](LICENSE). This project is a fork of [cloudreve/desktop](https://github.com/cloudreve/desktop) (MIT, Copyright (c) 2025 Cloudreve).

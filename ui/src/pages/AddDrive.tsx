@@ -1,4 +1,4 @@
-import { Alert, Box, Button, CircularProgress, Collapse, Container, IconButton, InputAdornment, Snackbar, ToggleButton, ToggleButtonGroup, Tooltip, Typography } from "@mui/material";
+import { Alert, Box, Button, Chip, CircularProgress, Collapse, Container, IconButton, InputAdornment, Snackbar, ToggleButton, ToggleButtonGroup, Tooltip, Typography } from "@mui/material";
 import CloseIcon from "@mui/icons-material/Close";
 import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -546,7 +546,15 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
                           {t("addDrive.modeChoice.mirror")}
                         </ToggleButton>
                         <ToggleButton value="on_demand">
-                          {t("addDrive.modeChoice.onDemand")}
+                          {t("addDrive.modeChoice.onDemand")}{" "}
+                          <Chip
+                            component="span"
+                            label={t("addDrive.modeChoice.beta")}
+                            size="small"
+                            color="warning"
+                            variant="outlined"
+                            sx={{ ml: 0.75, height: 18, fontSize: 10, cursor: "inherit" }}
+                          />
                         </ToggleButton>
                       </ToggleButtonGroup>
                       <Box sx={{ mt: 0.75, display: "flex", alignItems: "flex-start", gap: 0.5 }}>
@@ -570,6 +578,15 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
                           </IconButton>
                         </Tooltip>
                       </Box>
+                      {driveMode === "on_demand" && (
+                        <Typography
+                          variant="caption"
+                          color="warning.main"
+                          sx={{ mt: 0.5, display: "block" }}
+                        >
+                          {t("addDrive.modeChoice.betaWarning")}
+                        </Typography>
+                      )}
                       <Collapse in={modeDetailsOpen}>
                         <Typography
                           variant="caption"

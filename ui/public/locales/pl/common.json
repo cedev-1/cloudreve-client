@@ -22,6 +22,8 @@
       "onDemandHint": "Pliki od razu pojawiają się w folderze, ale nie zajmują miejsca na dysku, dopóki ich nie otworzysz.",
       "onDemandDetails": "Pierwsze otwarcie pliku wymaga połączenia z internetem; ostatnio otwierane pliki pozostają dostępne.",
       "fixedNote": "Tego wyboru nie można później zmienić. Aby go zmienić, usuń dysk i dodaj go ponownie.",
+      "beta": "Beta",
+      "betaWarning": "Beta: może zawierać błędy. Zachowaj kopię zapasową ważnych plików.",
       "macNote": "Za pierwszym razem macOS może zapytać, czy Cloudreve może uzyskać dostęp do plików na woluminie sieciowym: kliknij Zezwól.",
       "linuxNote": "Wymaga FUSE (pakietu „fuse3”, zainstalowanego w większości systemów Linux).",
       "learnMore": "Więcej informacji"
@@ -145,7 +147,8 @@
       "mirror": "Pobierz wszystko",
       "onDemand": "Pliki na żądanie",
       "mirrorHint": "Wszystkie pliki są na tym komputerze",
-      "onDemandHint": "Pliki pobierają się przy otwarciu"
+      "onDemandHint": "Pliki pobierają się przy otwarciu",
+      "beta": "Beta"
     },
     "networkSettings": "Sieć",
     "heartbeatInterval": "Interwał heartbeat",

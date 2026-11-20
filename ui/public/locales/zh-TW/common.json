@@ -22,6 +22,8 @@
       "onDemandHint": "檔案會立即顯示在資料夾中，但在開啟之前不佔用磁碟空間。",
       "onDemandDetails": "首次開啟檔案需要連網；最近開啟過的檔案仍可使用。",
       "fixedNote": "此選擇之後無法變更。如需切換，請移除該雲端硬碟後重新新增。",
+      "beta": "測試版",
+      "betaWarning": "測試版：可能存在問題。請備份重要檔案。",
       "macNote": "首次使用時，macOS 可能會詢問是否允許 Cloudreve 取用網路卷宗上的檔案：請點選「允許」。",
       "linuxNote": "需要 FUSE（「fuse3」套件，大多數 Linux 系統已預裝）。",
       "learnMore": "了解更多"
@@ -145,7 +147,8 @@
       "mirror": "全部下載",
       "onDemand": "隨選檔案",
       "mirrorHint": "所有檔案都保存在這台電腦上",
-      "onDemandHint": "開啟時才下載檔案"
+      "onDemandHint": "開啟時才下載檔案",
+      "beta": "測試版"
     },
     "networkSettings": "網路",
     "heartbeatInterval": "心跳間隔",

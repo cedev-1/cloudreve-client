@@ -12,6 +12,7 @@ const S = {
     newDrive: "New Drive",
     mirror: "Download everything",
     onDemand: "Files on demand",
+    beta: "Beta",
     conflicts: "Conflicts",
     syncing: "Syncing",
     recent: "Recent",
@@ -42,6 +43,7 @@ const S = {
     newDrive: "Nouveau disque",
     mirror: "Tout télécharger",
     onDemand: "Fichiers à la demande",
+    beta: "Bêta",
     conflicts: "Conflits",
     syncing: "Synchronisation",
     recent: "Récent",
@@ -77,7 +79,8 @@ describe.each(LANGUAGES)("popup (%s)", (lng) => {
     const { user } = await renderApp("/popup", lng);
 
     expect(await screen.findByText("beach.jpg")).toBeInTheDocument();
-    // Drive chips: one per drive, with its mode and pending uploads.
+    // Drive chips: one per drive, with its mode (on-demand marked Beta) and
+    // pending uploads.
     const chips = screen
       .getAllByRole("button")
       .filter((b) => b.classList.contains("MuiChip-root"))
@@ -85,7 +88,7 @@ describe.each(LANGUAGES)("popup (%s)", (lng) => {
     expect(chips).toEqual([
       s.all,
       photosDrive.name + s.mirror,
-      workDrive.name + s.onDemand + "3",
+      workDrive.name + s.onDemand + s.beta + "3",
       s.newDrive,
     ]);
     expect(screen.getByTitle(s.pendingUploads)).toHaveTextContent("3");

@@ -194,6 +194,8 @@ export const generalSettings = {
   heartbeat_interval: 15,
   check_updates_on_startup: true,
   auto_install_updates: false,
+  // A release build; package-managed builds (Nix...) set it, see packaging.rs.
+  package_managed: false,
 };
 
 export const userProfile = {

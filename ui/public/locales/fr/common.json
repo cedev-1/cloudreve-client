@@ -22,6 +22,8 @@
       "onDemandHint": "Vos fichiers apparaissent tout de suite dans le dossier mais n'occupent aucun espace disque tant que vous ne les ouvrez pas.",
       "onDemandDetails": "Ouvrir un fichier pour la première fois demande une connexion internet ; les fichiers ouverts récemment restent disponibles.",
       "fixedNote": "Ce choix ne peut pas être modifié ensuite. Pour changer, supprimez le disque puis ajoutez-le à nouveau.",
+      "beta": "Bêta",
+      "betaWarning": "Bêta : peut contenir des bugs. Gardez une sauvegarde de vos fichiers importants.",
       "macNote": "La première fois, macOS peut demander si Cloudreve peut accéder aux fichiers d'un volume réseau : cliquez sur Autoriser.",
       "linuxNote": "Nécessite FUSE (le paquet « fuse3 », déjà installé sur la plupart des systèmes Linux).",
       "learnMore": "En savoir plus"
@@ -151,7 +153,8 @@
       "mirror": "Tout télécharger",
       "onDemand": "Fichiers à la demande",
       "mirrorHint": "Tous les fichiers sont gardés sur cet ordinateur",
-      "onDemandHint": "Les fichiers se téléchargent à l'ouverture"
+      "onDemandHint": "Les fichiers se téléchargent à l'ouverture",
+      "beta": "Bêta"
     },
     "networkSettings": "Réseau",
     "heartbeatInterval": "Intervalle de heartbeat",
