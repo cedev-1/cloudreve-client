@@ -2,7 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # feat/vfs-on-demand: its PR conflicts with main, and GitHub runs no
+    # pull_request workflow for a PR it cannot merge.
+    branches: [main, feat/vfs-on-demand]
     paths:
       - 'crates/**'
       - 'src-tauri/**'
@@ -11,6 +13,7 @@ on:
       - 'ui/**'
       - 'locales/**'
       - '.github/workflows/ci.yml'
+      - 'scripts/e2e-server.sh'
   pull_request:
     paths:
       - 'crates/**'
@@ -20,6 +23,7 @@ on:
       - 'ui/**'
       - 'locales/**'
       - '.github/workflows/ci.yml'
+      - 'scripts/e2e-server.sh'
 
 jobs:
   frontend:
@@ -172,6 +176,64 @@ jobs:
             echo "::error::a test wrote into ~/.cloudreve (see app_dir::app_data_root)"
             exit 1
           fi
+
+  e2e:
+    # Every other Rust suite talks to wiremock, whose answers are our own
+    # reading of the API. These run the sync engine and the on-demand drive
+    # (mounted through NFS on macOS, FUSE on Linux) against the official
+    # Cloudreve release, pinned in scripts/e2e-server.sh.
+    name: Real-server e2e (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2.9.1
+        with:
+          workspaces: '. -> target'
+          key: e2e
+
+      - name: Install FUSE
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3
+          test -e /dev/fuse
+
+      - name: Start Cloudreve
+        run: scripts/e2e-server.sh "$RUNNER_TEMP/cloudreve" >> "$GITHUB_ENV"
+
+      - name: Build the e2e suites
+        run: cargo test -p cloudreve-vfs -p cloudreve-sync --no-run
+
+      - name: Vfs facade against the server
+        run: cargo test -p cloudreve-vfs --test real_server_vfs
+
+      # One test at a time: Cloudreve 4.19.1 on SQLite deadlocks for good
+      # when an event subscription is resumed while another request writes
+      # (the event hub queries the database under its global lock), and
+      # parallel drives resubscribing while other tests write hit that
+      # within a minute.
+      - name: Drives against the server (mirror and on-demand)
+        run: cargo test -p cloudreve-sync --test real_server_sync -- --test-threads=1
+
+      - name: Drives mounted through the OS against the server
+        env:
+          CLOUDREVE_E2E_MOUNT: '1'
+        run: cargo test -p cloudreve-sync --test real_server_mounted -- --test-threads=1
+
+      - name: Server log
+        if: failure()
+        run: tail -n 200 "$RUNNER_TEMP/cloudreve/server.log"
 
   finder-sync-macos:
     # The Cloudreve glyph on the drive folders' Finder sidebar rows: the

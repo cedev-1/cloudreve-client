@@ -871,7 +871,6 @@ impl TaskQueue {
                     self.remote_base.clone(),
                     Arc::clone(&self.progress),
                     Arc::clone(&self.notifier),
-                    self.event_blocker.clone(),
                     self.max_file_size_mb,
                 );
 

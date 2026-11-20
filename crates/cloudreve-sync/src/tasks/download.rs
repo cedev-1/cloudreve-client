@@ -14,14 +14,13 @@ use anyhow::{Context, Result};
 use cloudreve_api::{Client, api::ExplorerApi, models::explorer::FileURLService};
 use dashmap::DashMap;
 use futures::StreamExt;
-use notify_debouncer_full::notify::event::{CreateKind, EventKind, ModifyKind};
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::{
-    drive::{event_blocker::EventBlocker, utils::{is_inside, local_path_to_cr_uri}},
+    drive::utils::{is_inside, local_path_to_cr_uri},
     events::SummaryNotifier,
     inventory::{local_mtime_secs, ConflictState, FileMetadata, InventoryDb, MetadataEntry},
     tasks::queue::QueuedTask,
@@ -148,7 +147,6 @@ pub struct DownloadTask<'a> {
     cancel_token: CancellationToken,
     progress_map: Arc<DashMap<String, TaskProgress>>,
     notifier: Arc<SummaryNotifier>,
-    event_blocker: EventBlocker,
     max_file_size_mb: u64,
 }
 
@@ -162,7 +160,6 @@ impl<'a> DownloadTask<'a> {
         remote_base: String,
         progress_map: Arc<DashMap<String, TaskProgress>>,
         notifier: Arc<SummaryNotifier>,
-        event_blocker: EventBlocker,
         max_file_size_mb: u64,
     ) -> Self {
         Self {
@@ -177,7 +174,6 @@ impl<'a> DownloadTask<'a> {
             cancel_token: CancellationToken::new(),
             progress_map,
             notifier,
-            event_blocker,
             max_file_size_mb,
         }
     }
@@ -243,7 +239,17 @@ impl<'a> DownloadTask<'a> {
                     code = code,
                     "Remote file no longer exists, removing local file"
                 );
-                if local_path.exists() && !local_path.is_dir() {
+                // Only what the server had and this computer did not change
+                // since: a file added here and not uploaded yet, or edited
+                // here after the last sync, exists nowhere else — the
+                // server deleting its folder is no reason to destroy it.
+                let synced_copy = self
+                    .inventory_meta
+                    .as_ref()
+                    .is_some_and(|meta| !meta.is_locally_modified(&local_path));
+                if local_path.exists() && !local_path.is_dir() && !synced_copy {
+                    info!(target: "tasks::download", task_id = %self.task.task_id, path = %local_path.display(), "Keeping a local file the server never had in this state");
+                } else if local_path.exists() && !local_path.is_dir() {
                     if let Err(e) = std::fs::remove_file(&local_path) {
                         warn!(
                             target: "tasks::download",
@@ -252,6 +258,18 @@ impl<'a> DownloadTask<'a> {
                             error = %format_args!("{e:#}"),
                             "Failed to remove local file mirroring remote deletion"
                         );
+                    } else {
+                        // A folder deleted on the server goes file by file
+                        // (see `perform_sync`'s RemoteChanged arm): the last
+                        // file out takes the folders it emptied with it.
+                        // `remove_dir` only ever removes an empty folder.
+                        let mut dir = local_path.parent();
+                        while let Some(d) = dir {
+                            if d == self.sync_path || !is_inside(&self.sync_path, d) || std::fs::remove_dir(d).is_err() {
+                                break;
+                            }
+                            dir = d.parent();
+                        }
                     }
                 }
                 return Ok(());
@@ -382,12 +400,12 @@ impl<'a> DownloadTask<'a> {
         match result {
             Ok(()) => {
                 reporter.on_progress(&tracker.create_update());
-                // Block FS events the rename will generate so we don't re-upload the file.
-                // macOS FSEvents can emit an unpredictable number of Create/Modify events
-                // per rename, so we use a time-based block (5 s) instead of a fixed count.
-                let block_duration = Duration::from_secs(5);
-                self.event_blocker.register_for_duration(&EventKind::Create(CreateKind::Any), local_path.clone(), block_duration);
-                self.event_blocker.register_for_duration(&EventKind::Modify(ModifyKind::Any), local_path.clone(), block_duration);
+                // No event blocking here: the watcher's events for this write
+                // reach `perform_sync`, whose inventory check (recorded just
+                // below, long before the watcher's 2 s debounce) recognises
+                // the file as just downloaded. The time-based block this
+                // used also dropped a user's save made within its 5 s, which
+                // then waited for the periodic full sync.
                 // Atomic move temp → final path
                 std::fs::rename(&temp_path, &local_path).context("failed to move downloaded file")?;
                 info!(target: "tasks::download", task_id = %self.task.task_id, path = %local_path.display(), "Download complete");

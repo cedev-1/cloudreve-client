@@ -667,13 +667,30 @@ impl Mount {
     async fn start_fs_watcher(&self, sync_path: &PathBuf) -> Result<()> {
         let command_tx = self.command_tx.clone();
         let event_blocker = self.event_blocker.clone();
+        // FSEvents reports the resolved path of a change (`/private/var/…`
+        // for a folder configured as `/var/…`, or wherever a symlinked sync
+        // folder really lives). Everything downstream — remote uris, the
+        // inventory, the event blocker — is keyed by the configured path, so
+        // an event left resolved matched none of them and its upload failed
+        // with "Path is not under root". Put the configured prefix back.
+        let configured = sync_path.clone();
+        let resolved = std::fs::canonicalize(sync_path).ok().filter(|r| r != sync_path);
 
         let watcher = new_debouncer(
             Duration::from_secs(2),
             None,
             move |result: DebounceEventResult| {
                 match result {
-                    Ok(events) => {
+                    Ok(mut events) => {
+                        if let Some(resolved) = &resolved {
+                            for event in &mut events {
+                                for path in &mut event.event.paths {
+                                    if let Ok(rest) = path.strip_prefix(resolved) {
+                                        *path = configured.join(rest);
+                                    }
+                                }
+                            }
+                        }
                         let events: Vec<_> = events
                             .into_iter()
                             .filter(|e| !event_blocker.should_block(&e.kind, e.paths.first().unwrap_or(&PathBuf::new())))
@@ -823,7 +840,32 @@ impl Mount {
 
         match mode {
             SyncMode::LocalChanged => {
+                // A folder moved in is ONE watcher event, with none for the
+                // files inside: upload what it holds now, not at the next
+                // periodic full sync. (A folder the user merely touched
+                // expands too; its unchanged files stop at the inventory
+                // check below.)
+                let sync_root = self.config.read().await.sync_path.clone();
+                let mut expanded = Vec::with_capacity(local_paths.len());
                 for path in local_paths {
+                    if path.is_dir() {
+                        // The root itself would mean walking the whole drive
+                        // for any change in it: its children have events of
+                        // their own.
+                        if path == sync_root || self.is_ignored(&path).await {
+                            continue;
+                        }
+                        match crate::drive::sync::walk_local(path.clone()).await {
+                            Ok(files) => expanded.extend(files),
+                            Err(e) => {
+                                tracing::warn!(target: "drive::mounts", path = %path.display(), error = %format_args!("{e:#}"), "Failed to list a locally changed folder");
+                            }
+                        }
+                    } else {
+                        expanded.push(path);
+                    }
+                }
+                for path in expanded {
                     if !path.exists() || path.is_dir() {
                         continue;
                     }
@@ -862,8 +904,27 @@ impl Mount {
                 }
             }
             SyncMode::RemoteChanged => {
+                // The server sends one event for a folder, never one per
+                // file in it. A folder that changed (deleted, renamed away)
+                // is checked file by file: each download asks the server
+                // about its own path, and removes the local copy when the
+                // server no longer has it. Skipping folders left a folder
+                // deleted on the web on this computer for good.
+                let mut expanded = Vec::with_capacity(local_paths.len());
                 for path in local_paths {
-                    if path.is_dir() || self.is_ignored(&path).await {
+                    if path.is_dir() {
+                        match crate::drive::sync::walk_local(path.clone()).await {
+                            Ok(files) => expanded.extend(files),
+                            Err(e) => {
+                                tracing::warn!(target: "drive::mounts", path = %path.display(), error = %format_args!("{e:#}"), "Failed to list a remotely changed folder");
+                            }
+                        }
+                    } else {
+                        expanded.push(path);
+                    }
+                }
+                for path in expanded {
+                    if self.is_ignored(&path).await {
                         continue;
                     }
                     tracing::debug!(target: "drive::mounts", path = %path.display(), "Enqueuing download for remote change");

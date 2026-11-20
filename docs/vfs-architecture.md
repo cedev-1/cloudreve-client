@@ -165,6 +165,23 @@ which fires FSEvents/kqueue (macOS) or inotify (Linux) in the file manager.
 | `tests/mounted_linux.rs`, `mounted_linux_desktop.rs` | real FUSE mount: read/write, EBUSY, refresh, desktop trash, office locks, gedit-style save, `renameat2` no-replace, free space, slow download vs browsing, a real SIGKILL crash | Linux CI |
 | `cloudreve-sync` (`on_demand_*.rs`, `manager` unit tests) | app wiring: mount seam, failure at launch kept + retry, status counts, SSE | everywhere |
 | `cloudreve-desktop --lib` | the Tauri command boundary and JSON shapes the UI reads | everywhere |
+| `cloudreve-vfs/tests/real_server_vfs.rs`, `cloudreve-sync/tests/real_server_{sync,restart,mounted}.rs` | the same against the official Cloudreve release instead of wiremock: listings past the page size, Unicode, 110 MiB ranged reads, every write and namespace op, 2000-file copies, conflicts, quota, offline (a TCP proxy cut), relaunch, SSE latency, mirror and on-demand drives added through `DriveManager`, mounted for real in `_mounted` | CI job `e2e` (macOS and Linux); locally with a server |
+
+The real-server suites skip unless `CLOUDREVE_E2E_URL` is set. Start a pinned
+server and export what it prints (`_mounted` also needs `CLOUDREVE_E2E_MOUNT=1`):
+
+```sh
+scripts/e2e-server.sh /tmp/cloudreve-e2e        # prints CLOUDREVE_E2E_URL=...
+export CLOUDREVE_E2E_URL=http://127.0.0.1:5212
+cargo test -p cloudreve-vfs --test real_server_vfs
+cargo test -p cloudreve-sync --test real_server_sync --test real_server_restart -- --test-threads=1
+```
+
+The drives get OAuth tokens through the desktop client's own authorization
+code + PKCE flow (consent granted through the web app's API); the checks of
+what the server holds use raw HTTP, never `cloudreve-api`. One test at a
+time for the `cloudreve-sync` suites: Cloudreve 4.19.1 on SQLite deadlocks
+when an event subscription is resumed while another request writes.
 
 Running the Linux mounted suites on a Mac: Docker with FUSE,
 
