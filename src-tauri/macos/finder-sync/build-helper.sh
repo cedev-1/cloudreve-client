@@ -47,6 +47,15 @@ cp "$root/src-tauri/icons/icon.icns" "$app/Contents/Resources/icon.icns"
 # One binary, two roles: it runs the extension only from inside the .appex.
 cp "$bin" "$appex/Contents/MacOS/CloudreveFinderSync"
 cp "$bin" "$app/Contents/MacOS/CloudreveSidebar"
+
+# The Nix package (nix/package.nix) has no Apple codesign in its build, and
+# its fixup strips the binaries afterwards, which would drop the signatures
+# made here: it signs the helper itself, the same way, once fixup is done.
+if [ -n "${CLOUDREVE_HELPER_UNSIGNED:-}" ]; then
+	echo "build-helper.sh: built $app ($version), left unsigned"
+	exit 0
+fi
+
 # codesign rejects FinderInfo / resource fork "detritus" on copied files.
 xattr -cr "$app"
 

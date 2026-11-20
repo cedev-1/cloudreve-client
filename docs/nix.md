@@ -185,7 +185,7 @@ applies and the setting stays editable in the UI.
 | `fast_popup_launch` | bool | `true` | Keep the tray popup alive for faster opening. |
 | `heartbeat_interval_secs` | int, 10-120 | `15` | Seconds between server connectivity checks. |
 | `log_to_file` | bool | `true` | Write logs to `~/.cloudreve/logs`. |
-| `log_level` | `"trace"` ... `"error"` | `"debug"` | Log verbosity. |
+| `log_level` | `"trace"` ... `"error"` | `"info"` | Log verbosity. |
 | `log_max_files` | positive int | `5` | Rotated log files kept. |
 
 Any other key is written as-is (freeform), for settings added to the app later. The app drops keys
@@ -259,13 +259,23 @@ finishes.
     -f "$HOME/Applications/Home Manager Apps/Cloudreve.app"
   ```
 
-## On-demand drives (Linux)
+## On-demand drives (Beta)
 
 On-demand drives (files downloaded when opened, not mirrored) mount through FUSE on Linux and need
-a setuid `fusermount3`. The NixOS module enables `programs.fuse` for that (`fuse = true`). On other
-distributions install your distribution's `fuse3` package. The package's own `fusermount3` is
-only a last-resort fallback at the end of `PATH`, since it can't be setuid. macOS needs nothing
-extra.
+a setuid `fusermount3` (and `/dev/fuse`). The NixOS module enables `programs.fuse` for that
+(`fuse = true`). On other distributions install your distribution's `fuse3` package.
+
+The app runs the first `fusermount3` in its `PATH`. The package wrapper appends
+`/run/wrappers/bin` (where NixOS puts the setuid copy), so the app finds it even when started from
+a session or service whose `PATH` lacks that directory. The package's own `fusermount3` comes last,
+as a fallback: it can't be setuid, so mounting with it fails.
+
+macOS needs nothing extra: on-demand drives are served by a local NFS server inside the app and
+mounted with the system's `/sbin/mount_nfs`.
+
+On macOS the package also carries the Finder Sync extension that shows the Cloudreve glyph on the
+drive folders' sidebar rows (`Contents/Helpers/CloudreveSidebar.app`), ad-hoc signed with
+`rcodesign` like the release build signs it with `codesign`.
 
 ## Intel Macs
 

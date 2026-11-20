@@ -64,7 +64,7 @@ pub struct AppConfig {
     pub log_max_files: usize,
     /// Language/locale setting (e.g., "en-US", "zh-CN"). None means use system default.
     pub language: Option<String>,
-    /// Heartbeat interval in seconds for checking server connectivity (5-120)
+    /// Heartbeat interval in seconds for checking server connectivity (10-120)
     pub heartbeat_interval_secs: u64,
     /// Whether to automatically check for updates on startup
     pub check_updates_on_startup: bool,
@@ -478,6 +478,15 @@ mod tests {
         config.log_level = LogLevel::Debug;
         let saved = serde_json::to_string(&config).unwrap();
         assert_eq!(load(&saved).log_level, LogLevel::Debug);
+    }
+
+    /// The Nix modules merge a managed `log_level` into config.json together
+    /// with `defaults_version: 1` (nix/merge-config.sh), so a debug picked in
+    /// Nix is not taken for the old default.
+    #[test]
+    fn debug_managed_by_the_nix_modules_is_kept() {
+        let config = load(r#"{"language": "de", "log_level": "debug", "defaults_version": 1}"#);
+        assert_eq!(config.log_level, LogLevel::Debug);
     }
 
     #[test]

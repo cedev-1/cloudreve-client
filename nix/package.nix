@@ -7,7 +7,7 @@
   fetchYarnDeps,
   yarnConfigHook,
   yarnBuildHook,
-  nodejs,
+  nodejs_24,
   cargo-tauri,
   pkg-config,
   jq,
@@ -23,6 +23,7 @@
   desktop-file-utils,
   fuse3,
   sqlite,
+  rcodesign,
 }:
 
 let
@@ -46,13 +47,14 @@ let
 
     yarnOfflineCache = fetchYarnDeps {
       yarnLock = ../ui/yarn.lock;
-      hash = "sha256-vSFZ11utsn9RgCpM9TnGDYq7Ar/xTmB597v4Mefntx0=";
+      hash = "sha256-PuhfeofESj5nhfUC+JteBu61eODeOxCZn0eV688qTuY=";
     };
 
     nativeBuildInputs = [
       yarnConfigHook
       yarnBuildHook
-      nodejs
+      # CI runs Node 24; vite 8 and vitest 5 refuse Node 20.
+      nodejs_24
     ];
 
     installPhase = ''
@@ -76,6 +78,8 @@ rustPlatform.buildRustPackage (finalAttrs: {
       ../crates
       ../src-tauri
       ../locales
+      # [patch.crates-io] nfs3_server (Cargo.toml)
+      ../vendor
     ];
   };
 
@@ -100,12 +104,31 @@ rustPlatform.buildRustPackage (finalAttrs: {
       | .version = $v
     ' src-tauri/tauri.conf.json > tauri.conf.json.new
     mv tauri.conf.json.new src-tauri/tauri.conf.json
+  ''
+  + lib.optionalString stdenv.hostPlatform.isDarwin ''
+    # The Finder Sync helper (Contents/Helpers/CloudreveSidebar.app, built by
+    # build-helper.sh): Tauri runs the command from a directory where the
+    # relative path does not resolve, so give it an absolute one. No
+    # signingIdentity: Tauri would call Apple's codesign, absent here; the
+    # helper is signed in postFixup instead and the main binary keeps the
+    # linker's ad-hoc signature, as before the helper existed.
+    jq --arg cmd "sh $PWD/src-tauri/macos/finder-sync/build-helper.sh" '
+        .build.beforeBundleCommand = $cmd
+      | del(.bundle.macOS.signingIdentity)
+    ' src-tauri/tauri.macos.conf.json > tauri.macos.conf.json.new
+    mv tauri.macos.conf.json.new src-tauri/tauri.macos.conf.json
   '';
 
   # Read at compile time by src-tauri/src/packaging.rs: no update checks, no
   # autostart toggle (the modules own autostart), and on Linux no runtime
   # registration of the cloudreve:// handler (the .desktop entry declares it).
-  env.CLOUDREVE_PACKAGE_MANAGED = "1";
+  env = {
+    CLOUDREVE_PACKAGE_MANAGED = "1";
+  }
+  // lib.optionalAttrs stdenv.hostPlatform.isDarwin {
+    # build-helper.sh leaves the Finder Sync helper unsigned (see postFixup).
+    CLOUDREVE_HELPER_UNSIGNED = "1";
+  };
 
   nativeBuildInputs = [
     cargo-tauri.hook
@@ -113,7 +136,10 @@ rustPlatform.buildRustPackage (finalAttrs: {
     jq
   ]
   ++ lib.optionals stdenv.hostPlatform.isLinux [ wrapGAppsHook3 ]
-  ++ lib.optionals stdenv.hostPlatform.isDarwin [ makeWrapper ];
+  ++ lib.optionals stdenv.hostPlatform.isDarwin [
+    makeWrapper
+    rcodesign
+  ];
 
   # nixpkgs' cargo setup sets LIBSQLITE3_SYS_USE_PKG_CONFIG, overriding the
   # crate's `bundled` feature: link the nixpkgs sqlite instead.
@@ -144,9 +170,12 @@ rustPlatform.buildRustPackage (finalAttrs: {
           desktop-file-utils
         ]
       }"
-      # On-demand drives mount through FUSE and need fusermount3. It only works
-      # setuid, so the system's copy (NixOS: /run/wrappers/bin, enabled by
-      # programs.fuse / the NixOS module) must come first: this is a fallback.
+      # On-demand drives mount through FUSE: fuser runs the first `fusermount3`
+      # found in PATH, and it only works setuid. The system's copy comes first;
+      # then the NixOS setuid wrapper (programs.fuse / the NixOS module), which
+      # a session or service PATH may lack; the unprivileged nixpkgs copy last
+      # (it fails to mount, but with fusermount3's own error message).
+      --suffix PATH : /run/wrappers/bin
       --suffix PATH : "${lib.getBin fuse3}/bin"
     )
   '';
@@ -175,6 +204,21 @@ rustPlatform.buildRustPackage (finalAttrs: {
         "Exec=cloudreve-desktop" "Exec=cloudreve-desktop %u"
       grep -qx 'Exec=cloudreve-desktop %u' "$desktopFile"
     '';
+
+  # The Finder Sync extension (sidebar glyph) only loads ad-hoc signed with
+  # its sandbox entitlements, the helper around it signed too: what
+  # build-helper.sh does with Apple's codesign, here with rcodesign, after
+  # fixup has stripped (and so re-signed without entitlements) the binaries.
+  # Inside out; `--exclude '**'` keeps the extension's signature when the
+  # helper is signed, like codesign without --deep.
+  postFixup = lib.optionalString stdenv.hostPlatform.isDarwin ''
+    helper="$out/Applications/Cloudreve.app/Contents/Helpers/CloudreveSidebar.app"
+    appex="$helper/Contents/PlugIns/CloudreveFinderSync.appex"
+    [ -d "$appex" ] || { echo "Finder Sync extension missing: $appex" >&2; exit 1; }
+    rcodesign sign --code-signature-flags runtime \
+      --entitlements-xml-file ${../src-tauri/macos/finder-sync/Extension.entitlements} "$appex"
+    rcodesign sign --code-signature-flags runtime --exclude '**' "$helper"
+  '';
 
   passthru = {
     inherit ui merge-config;

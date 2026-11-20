@@ -40,7 +40,16 @@ if [ -e "$target" ]; then
   fi
 fi
 
-merged=$(jq --slurpfile managed "$managed" '. * $managed[0]' <<<"$current")
+# A managed log_level also marks the app's one-time debug -> info migration
+# (migrate_defaults, crates/cloudreve-sync/src/config.rs) as done: it runs on
+# files without defaults_version and would take a debug set here for the
+# old default. Never lowered, so later migrations still run once.
+merged=$(jq --slurpfile managed "$managed" '
+  . * $managed[0]
+  | if $managed[0] | has("log_level")
+    then .defaults_version = ([.defaults_version // 0, 1] | max)
+    else . end
+' <<<"$current")
 
 if [ -e "$target" ] && jq -e --argjson merged "$merged" '. == $merged' "$target" >/dev/null; then
   exit 0

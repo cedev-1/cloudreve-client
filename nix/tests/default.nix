@@ -126,7 +126,7 @@ in
         cloudreve-client-merge-config managed.json
         cfg=$HOME/.cloudreve/config.json
         [ "$(jq -r .language "$cfg")" = fr ] || fail "language not written to a new config"
-        [ "$(jq -r 'keys | join(",")' "$cfg")" = "language,log_level" ] || fail "new config has extra keys: $(cat "$cfg")"
+        [ "$(jq -r 'keys | join(",")' "$cfg")" = "defaults_version,language,log_level" ] || fail "new config has extra keys: $(cat "$cfg")"
         [ "$(stat -c %a "$cfg")" = 600 ] || fail "config mode is $(stat -c %a "$cfg"), expected 600"
         [ "$(stat -c %a "$HOME/.cloudreve")" = 700 ] || fail "config dir mode is $(stat -c %a "$HOME/.cloudreve")"
 
@@ -154,6 +154,23 @@ in
         echo '{"language":null}' > managed-null.json
         cloudreve-client-merge-config managed-null.json "$cfg"
         [ "$(jq -c .language "$cfg")" = null ] || fail "language null not written"
+
+        # 6. a managed log level survives the app's one-time debug -> info
+        #    migration (migrate_defaults in crates/cloudreve-sync/src/config.rs
+        #    runs on files without defaults_version), without undoing a later one
+        echo '{"log_level":"debug"}' > managed-debug.json
+        echo '{"language":"de","log_level":"info"}' > "$cfg"
+        cloudreve-client-merge-config managed-debug.json "$cfg"
+        jq -e '.log_level == "debug" and .defaults_version == 1' "$cfg" \
+          || fail "managed debug left to the migration: $(cat "$cfg")"
+        echo '{"log_level":"info","defaults_version":3}' > "$cfg"
+        cloudreve-client-merge-config managed-debug.json "$cfg"
+        jq -e '.log_level == "debug" and .defaults_version == 3' "$cfg" \
+          || fail "defaults_version went backwards: $(cat "$cfg")"
+        echo '{"language":"de"}' > "$cfg"
+        cloudreve-client-merge-config managed-null.json "$cfg"
+        jq -e 'has("defaults_version") | not' "$cfg" \
+          || fail "defaults_version written without a managed log level: $(cat "$cfg")"
 
         touch $out
       '';
@@ -280,6 +297,30 @@ in
   );
 }
 // lib.optionalAttrs isLinux {
+  # fuser runs the first `fusermount3` in PATH and only a setuid one can
+  # mount. The real wrapper, run with a PATH that lacks the NixOS wrappers
+  # (a session or service started without them): the system's PATH must still
+  # come first, then /run/wrappers/bin, and the unprivileged copy last.
+  fusermount-lookup =
+    pkgs.runCommand "cloudreve-client-fusermount-lookup" { }
+      ''
+        set -euo pipefail
+        fail() { echo "FAIL: $*" >&2; exit 1; }
+        wrapper=${package}/bin/cloudreve-desktop
+        grep -q '^exec ' "$wrapper" || fail "$wrapper is not a shell wrapper"
+        # Same wrapper, printing the PATH it would hand to the app.
+        sed -E 's|^exec .*|printf "%s\\n" "$PATH"|' "$wrapper" > probe
+        path=$(PATH=/system/bin ${pkgs.bash}/bin/bash probe)
+        echo "PATH seen by the app: $path"
+        pos() { printf '%s\n' "$path" | tr ':' '\n' | grep -n -x -m1 -- "$1" | cut -d: -f1; }
+        sys=$(pos /system/bin); wrappers=$(pos /run/wrappers/bin)
+        store=$(pos '${lib.getBin pkgs.fuse3}/bin')
+        [ -n "$sys" ] && [ -n "$wrappers" ] && [ -n "$store" ] || fail "missing PATH entries"
+        [ "$sys" -lt "$wrappers" ] || fail "/run/wrappers/bin shadows the system PATH"
+        [ "$wrappers" -lt "$store" ] || fail "the unprivileged fusermount3 shadows the setuid wrapper"
+        touch $out
+      '';
+
   nixos-module =
     let
       nixos =
