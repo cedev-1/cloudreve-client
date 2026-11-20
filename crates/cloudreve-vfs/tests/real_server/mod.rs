@@ -490,6 +490,26 @@ impl Remote {
         unwrap_envelope("delete", resp).await;
     }
 
+    /// Where each item in the user's trash was deleted from (its
+    /// `sys:restore_uri`), across every test folder of this user.
+    pub async fn trashed(&self) -> Vec<String> {
+        let resp = self
+            .http
+            .get(format!("{}?uri={}&page_size=2000", self.api("/file"), enc("cloudreve://trash")))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .expect("trash list request");
+        let data = unwrap_envelope("trash list", resp).await;
+        data["files"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|f| f["metadata"]["sys:restore_uri"].as_str().map(str::to_string))
+            .collect()
+    }
+
     /// Best-effort removal of the whole test folder.
     pub async fn cleanup(&self) {
         let _ = self
