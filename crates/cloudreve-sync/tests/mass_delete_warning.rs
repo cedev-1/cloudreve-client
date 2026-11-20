@@ -19,6 +19,7 @@ async fn a_held_mass_deletion_tells_the_user_once() {
     cloudreve_sync::utils::toast::init_os_notifier(tx);
 
     let env = TestEnv::new().await;
+    env.mount.set_propagate_deletes(true).await;
     let mut remote = Vec::new();
     for i in 0..40 {
         let rel = format!("f{i:02}.txt");

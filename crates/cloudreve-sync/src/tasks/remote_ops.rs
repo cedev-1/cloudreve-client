@@ -45,6 +45,10 @@ pub(crate) struct RemoteOps<'a> {
     pub remote_base: String,
     pub ignore: IgnoreMatcher,
     pub max_file_size_mb: u64,
+    /// The drive's "delete and rename in the cloud too" switch, as it is
+    /// now: off, a delete or move queued earlier does what a drive without
+    /// the switch does (forget the old path, upload the new one).
+    pub propagate: bool,
 }
 
 /// The server no longer has the path (Cloudreve's "object not found", or
@@ -168,6 +172,10 @@ impl RemoteOps<'_> {
             info!(target: "tasks::remote_ops", path = %local.display(), "Not deleting on the server: the file is back");
             return Ok(Vec::new());
         }
+        if !self.propagate {
+            self.forget(local);
+            return Ok(Vec::new());
+        }
         let rows = self.tracked_files_under(local)?;
         if rows.is_empty() {
             // Never synced from here: not this computer's to delete.
@@ -241,6 +249,12 @@ impl RemoteOps<'_> {
         self.check_inside(to)?;
         if from.exists() && !same_file(from, to) {
             // The old name came back: `to` is new content.
+            return Ok(self.uploads_under(to).await);
+        }
+        if !self.propagate {
+            if !from.exists() {
+                self.forget(from);
+            }
             return Ok(self.uploads_under(to).await);
         }
         if !to.exists() {

@@ -122,6 +122,15 @@ async fn settle() {
     tokio::time::sleep(Duration::from_secs(6)).await;
 }
 
+/// A drive with "delete and rename in the cloud too" on — what a drive
+/// added since that switch exists gets by default (`propagate_switch.rs`
+/// covers it off).
+async fn propagating() -> TestEnv {
+    let env = TestEnv::new().await;
+    env.mount.set_propagate_deletes(true).await;
+    env
+}
+
 fn uri(rel: &str) -> String {
     format!("{REMOTE_BASE}/{rel}")
 }
@@ -133,7 +142,7 @@ fn uri(rel: &str) -> String {
 /// forgets it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_file_deleted_while_offline_goes_to_the_server_trash_at_the_next_sync() {
-    let env = TestEnv::new().await;
+    let env = propagating().await;
     env.write_local("keep.txt", b"keep");
     env.track_synced("keep.txt", "etag-keep");
     env.write_local("important.zip", b"data");
@@ -160,7 +169,7 @@ async fn a_file_deleted_while_offline_goes_to_the_server_trash_at_the_next_sync(
 /// nothing is deleted.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_server_edit_made_after_the_last_sync_wins_over_a_local_delete() {
-    let env = TestEnv::new().await;
+    let env = propagating().await;
     env.write_local("plan.docx", b"v1");
     env.track_synced("plan.docx", "etag-v1");
     std::fs::remove_file(env.local_path("plan.docx")).unwrap();
@@ -180,7 +189,7 @@ async fn a_server_edit_made_after_the_last_sync_wins_over_a_local_delete() {
 /// user restores it in one click — and no empty folder is left behind.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_folder_deleted_while_offline_is_deleted_as_one_folder() {
-    let env = TestEnv::new().await;
+    let env = propagating().await;
     env.write_local("Photos/a.jpg", b"aaaa");
     env.write_local("Photos/2024/b.jpg", b"bbbbb");
     env.write_local("notes.txt", b"notes");
@@ -213,7 +222,7 @@ async fn a_folder_deleted_while_offline_is_deleted_as_one_folder() {
 /// computer had is deleted; the new file comes down.
 #[tokio::test(flavor = "multi_thread")]
 async fn deleting_a_folder_never_takes_a_file_this_computer_never_had() {
-    let env = TestEnv::new().await;
+    let env = propagating().await;
     env.write_local("Shared/old.txt", b"old");
     env.write_local("other.txt", b"x");
     env.track_synced("Shared/old.txt", "e-old");
@@ -241,7 +250,7 @@ async fn deleting_a_folder_never_takes_a_file_this_computer_never_had() {
 /// next syncs keep holding them back.
 #[tokio::test(flavor = "multi_thread")]
 async fn most_of_a_drive_deleted_at_once_is_held_back() {
-    let env = TestEnv::new().await;
+    let env = propagating().await;
     let mut remote = Vec::new();
     for i in 0..40 {
         let rel = format!("f{i:02}.txt");
@@ -273,7 +282,7 @@ async fn most_of_a_drive_deleted_at_once_is_held_back() {
 /// from half of it.
 #[tokio::test(flavor = "multi_thread")]
 async fn hundreds_of_files_deleted_at_once_are_held_back_even_in_a_big_drive() {
-    let env = TestEnv::new().await;
+    let env = propagating().await;
     let mut remote = Vec::new();
     for i in 0..1000 {
         let rel = format!("f{i:04}.txt");
@@ -297,7 +306,7 @@ async fn hundreds_of_files_deleted_at_once_are_held_back_even_in_a_big_drive() {
 /// An ordinary cleanup in a drive of that size goes through.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_few_files_deleted_in_a_big_drive_are_deleted() {
-    let env = TestEnv::new().await;
+    let env = propagating().await;
     let mut remote = Vec::new();
     for i in 0..300 {
         let rel = format!("f{i:03}.txt");
@@ -325,7 +334,7 @@ async fn a_few_files_deleted_in_a_big_drive_are_deleted() {
 /// no reason to touch the server.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_ignored_file_deleted_locally_is_never_deleted_on_the_server() {
-    let env = TestEnv::new().await;
+    let env = propagating().await;
     env.write_local("doc.txt", b"doc");
     env.track_synced("doc.txt", "e-doc");
     // A row left by an older version without ignore rules.
@@ -345,7 +354,7 @@ async fn an_ignored_file_deleted_locally_is_never_deleted_on_the_server() {
 /// A delete still queued when the app quit is sent at the next launch.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_delete_left_queued_at_quit_is_sent_at_the_next_launch() {
-    let mut env = TestEnv::new().await;
+    let mut env = propagating().await;
     env.write_local("gone.txt", b"gone");
     env.track_synced("gone.txt", "e-gone");
     std::fs::remove_file(env.local_path("gone.txt")).unwrap();
@@ -369,7 +378,7 @@ async fn a_delete_left_queued_at_quit_is_sent_at_the_next_launch() {
 /// reconnection renames on the server instead of losing the old name.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rename_parked_offline_is_replayed_as_a_rename_on_reconnect() {
-    let env = TestEnv::new().await;
+    let env = propagating().await;
     env.write_local("after.txt", b"content");
     env.track_synced("after.txt", "e-1");
     env.inventory
@@ -406,7 +415,7 @@ async fn a_rename_parked_offline_is_replayed_as_a_rename_on_reconnect() {
 /// must not also see it as a delete of the old name and a new file.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_full_sync_leaves_a_queued_rename_alone() {
-    let env = TestEnv::new().await;
+    let env = propagating().await;
     env.write_local("after.txt", b"content");
     env.track_synced("after.txt", "e-1");
     env.inventory
@@ -436,7 +445,7 @@ async fn a_full_sync_leaves_a_queued_rename_alone() {
 /// must still know its source after the reconnection replay.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_replayed_rename_cut_off_by_quitting_is_resumed_as_a_rename_at_launch() {
-    let mut env = TestEnv::new().await;
+    let mut env = propagating().await;
     env.write_local("after.txt", b"content");
     env.track_synced("after.txt", "e-1");
     env.inventory
@@ -499,6 +508,7 @@ async fn live_env_aged(files: &[(&str, &[u8], &str)], age: Duration) -> (tempfil
     }
     tokio::time::sleep(age).await;
     let env = TestEnv::started_on(sync, DriveMode::FullMirror).await;
+    env.mount.set_propagate_deletes(true).await;
     for (rel, _, etag) in files {
         env.track_synced(rel, etag);
     }
@@ -791,7 +801,7 @@ async fn a_deletion_reported_while_the_sync_folder_is_gone_deletes_nothing() {
 /// volume ejected meanwhile, replayed at the next launch): not sent.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_queued_delete_is_not_sent_once_the_sync_folder_is_gone() {
-    let env = TestEnv::new().await;
+    let env = propagating().await;
     env.write_local("a.txt", b"a");
     env.track_synced("a.txt", "e-a");
     env.set_remote_files(vec![]).await;

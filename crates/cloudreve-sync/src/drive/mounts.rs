@@ -84,6 +84,15 @@ pub struct DriveConfig {
     #[serde(default)]
     pub sidebar: SidebarSettings,
 
+    /// Mirror drives: whether a local delete or rename is sent to the
+    /// server (see `drive::propagate`). Declared before `extra` like
+    /// `mode`. A drive saved before this existed has no such key and loads
+    /// with it off, so an upgrade never starts deleting on the server; a
+    /// drive added since gets the user's choice (on by default, in the add
+    /// drive window). Ignored for an on-demand drive.
+    #[serde(default)]
+    pub propagate_deletes: bool,
+
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
 }
@@ -331,6 +340,7 @@ impl Mount {
             summary_notifier,
             &ignore_matcher,
             resume_on_start,
+            config.propagate_deletes,
         ).await;
         let id = config.id.clone();
 
@@ -1262,6 +1272,20 @@ impl Mount {
         self.task_queue.set_ignore_matcher(new_matcher.clone());
         *self.ignore_matcher.write().await = new_matcher;
         Ok(())
+    }
+
+    /// Whether local deletes and renames go to the server (see
+    /// `DriveConfig::propagate_deletes`).
+    pub async fn propagates_deletes(&self) -> bool {
+        self.config.read().await.propagate_deletes
+    }
+
+    /// The "delete and rename in the cloud too" switch, applied live. The
+    /// caller persists the config.
+    pub async fn set_propagate_deletes(&self, enabled: bool) {
+        self.config.write().await.propagate_deletes = enabled;
+        self.task_queue.set_propagate_deletes(enabled);
+        tracing::info!(target: "drive::mounts", id = %self.id, enabled, "Delete and rename propagation switched");
     }
 
     /// Check if this mount is currently paused.

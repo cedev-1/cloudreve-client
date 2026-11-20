@@ -253,6 +253,13 @@ impl Mount {
         deleted: Vec<PathBuf>,
         renamed: Vec<(PathBuf, PathBuf)>,
     ) -> Result<Vec<PathBuf>> {
+        if !self.propagates_deletes().await {
+            // Switched off: the server is never written to for a removal;
+            // a renamed file is uploaded under its new name.
+            let mut uploads = changed;
+            uploads.extend(renamed.into_iter().map(|(_, to)| to));
+            return Ok(uploads);
+        }
         let sync_root = self.get_sync_path().await;
         if !sync_root.is_dir() {
             tracing::warn!(

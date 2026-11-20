@@ -99,6 +99,11 @@ pub struct TaskQueue {
     /// a move's follow-up uploads (`RemoteOps::move_to`) must skip junk files
     /// like every other upload.
     ignore: std::sync::RwLock<IgnoreMatcher>,
+    /// The drive's "delete and rename in the cloud too" switch, kept in step
+    /// by `Mount::set_propagate_deletes`. Read by every delete or move when
+    /// it runs, so one queued while it was on, then replayed after it was
+    /// turned off (reconnection, next launch), touches nothing.
+    propagate_deletes: AtomicBool,
 }
 
 impl TaskQueue {
@@ -123,6 +128,7 @@ impl TaskQueue {
         notifier: Arc<SummaryNotifier>,
         ignore: &IgnoreMatcher,
         resume_on_start: bool,
+        propagate_deletes: bool,
     ) -> Arc<Self> {
         let drive_id = drive_id.into();
         let max_concurrent = config.max_concurrent.max(1);
@@ -150,6 +156,7 @@ impl TaskQueue {
             task_handles: DashMap::new(),
             task_paths: DashMap::new(),
             ignore: std::sync::RwLock::new(ignore.clone()),
+            propagate_deletes: AtomicBool::new(propagate_deletes),
         });
 
         queue.spawn_dispatcher(command_rx).await;
@@ -167,6 +174,33 @@ impl TaskQueue {
     }
 
     /// See the `ignore` field.
+    /// See the `propagate_deletes` field. Turning it off also drops the
+    /// deletes and moves still queued: they would only be skipped when
+    /// they run, and the next full sync handles those paths the old way.
+    pub fn set_propagate_deletes(&self, enabled: bool) {
+        self.propagate_deletes.store(enabled, Ordering::SeqCst);
+        if enabled {
+            return;
+        }
+        let active = match self.inventory.list_tasks(Some(&self.drive_id), Some(&[TaskStatus::Pending, TaskStatus::Running])) {
+            Ok(active) => active,
+            Err(err) => {
+                warn!(target: "tasks::queue", drive = %self.drive_id, error = %format_args!("{err:#}"), "Failed to list queued deletes and moves");
+                return;
+            }
+        };
+        for task in active {
+            if !matches!(TaskKind::from_str(&task.task_type), Some(TaskKind::Delete | TaskKind::Move)) {
+                continue;
+            }
+            let update = TaskUpdate { status: Some(TaskStatus::Cancelled), ..Default::default() };
+            if let Err(err) = self.inventory.update_task(&task.id, update) {
+                warn!(target: "tasks::queue", drive = %self.drive_id, task_id = %task.id, error = %format_args!("{err:#}"), "Failed to drop a queued delete or move");
+            }
+        }
+        self.notifier.notify();
+    }
+
     pub fn set_ignore_matcher(&self, matcher: IgnoreMatcher) {
         *self.ignore.write().expect("TaskQueue ignore lock poisoned") = matcher;
     }
@@ -926,6 +960,7 @@ impl TaskQueue {
                     remote_base: self.remote_base.clone(),
                     ignore: self.ignore.read().expect("TaskQueue ignore lock poisoned").clone(),
                     max_file_size_mb: self.max_file_size_mb,
+                    propagate: self.propagate_deletes.load(Ordering::SeqCst),
                 };
                 let follow_ups = match task.payload.kind {
                     TaskKind::Delete => ops.delete(&task.payload.local_path).await?,

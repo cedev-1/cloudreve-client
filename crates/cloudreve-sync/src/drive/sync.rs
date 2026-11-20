@@ -266,6 +266,9 @@ pub async fn full_sync(mount: &Mount, local_root: &PathBuf, remote_path: &str) -
     // Paths a queued delete or move is about to act on: planning anything
     // else for them now would turn a rename into a delete plus an upload.
     let busy = propagate::busy_paths(mount)?;
+    // The drive's "delete and rename in the cloud too" switch, read once
+    // for the whole merge.
+    let propagate_deletes = mount.propagates_deletes().await;
     // Files deleted locally whose server copy is still the synced one.
     let mut delete_candidates: Vec<PathBuf> = Vec::new();
 
@@ -313,6 +316,15 @@ pub async fn full_sync(mount: &Mount, local_root: &PathBuf, remote_path: &str) -
             // Deleted locally (still on server) → delete it there too, unless
             // the server changed it since: its change wins, it comes back.
             (true, false, true) => {
+                if !propagate_deletes {
+                    // Switched off: forget it, don't re-download, don't
+                    // touch the server.
+                    mount
+                        .inventory
+                        .batch_delete_by_path(vec![&path_str])
+                        .context("Failed to forget locally-deleted file in inventory")?;
+                    continue;
+                }
                 if let (Some(db_entry), Some(rf)) = (db_map.get(rel), remote_map.get(rel)) {
                     let remote_etag = rf.primary_entity.clone().unwrap_or_default();
                     let unchanged = db_entry.conflict_state.is_none()
