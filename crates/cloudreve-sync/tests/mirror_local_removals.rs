@@ -587,10 +587,16 @@ async fn moving_a_file_into_another_folder_moves_it_on_the_server() {
     assert!(env.db_entry("Archive/a.txt").is_some());
 }
 
-/// Into a folder made just for it: the new folder's own event must not
-/// upload the file the move is taking there — on a real server, that
-/// upload locks the destination and the move is refused (found by the
-/// real-server suite).
+/// Into a folder made just for it, in the same watcher batch: the new
+/// folder's own event must not upload the file the move is taking there —
+/// on a real server, that upload locks the destination and the move is
+/// refused (found by the real-server suite).
+///
+/// macOS only: Linux starts watching a new folder only once inotify has
+/// reported it, so a move into it within microseconds is seen as the file
+/// leaving (a delete plus an upload — still safe). A move made later, in
+/// its own batch, is covered on both by the next test.
+#[cfg(target_os = "macos")]
 #[tokio::test(flavor = "multi_thread")]
 async fn moving_a_file_into_a_new_folder_is_one_move_and_no_upload() {
     let (_t, env) = live_env_aged(&[("a.txt", b"aaa", "e-a"), ("k.txt", b"k", "e-k")], OLD_ENOUGH).await;
@@ -605,6 +611,28 @@ async fn moving_a_file_into_a_new_folder_is_one_move_and_no_upload() {
     settle().await;
     assert!(requests(&env.server, "PUT", "/api/v4/file/upload").await.is_empty(), "the moved file was also uploaded");
     assert_eq!(requests(&env.server, "POST", "/api/v4/file/move").await[0]["dst"], json!(uri("New")));
+}
+
+/// A folder made first, a file moved into it a moment later: a move into
+/// a folder the server does not have yet (created there first).
+#[tokio::test(flavor = "multi_thread")]
+async fn moving_a_file_into_a_folder_made_a_moment_before_is_one_move() {
+    let (_t, env) = live_env_aged(&[("b.txt", b"bbb", "e-b"), ("k.txt", b"k", "e-k")], OLD_ENOUGH).await;
+    env.set_remote_files(vec![]).await;
+    mock_info(&env.server, "b.txt", remote_file("b.txt", 3, "e-b")).await;
+    accept_writes(&env.server).await;
+
+    std::fs::create_dir_all(env.local_path("Later")).unwrap();
+    settle().await;
+    std::fs::rename(env.local_path("b.txt"), env.local_path("Later/b.txt")).unwrap();
+
+    wait_for("the move request", || async { !requests(&env.server, "POST", "/api/v4/file/move").await.is_empty() }).await;
+    settle().await;
+    let created = requests(&env.server, "POST", "/api/v4/file/create").await;
+    assert!(created.iter().any(|c| c["uri"] == json!(uri("Later")) && c["type"] == json!("folder")), "{created:?}");
+    assert_eq!(requests(&env.server, "POST", "/api/v4/file/move").await[0]["dst"], json!(uri("Later")));
+    assert!(requests(&env.server, "PUT", "/api/v4/file/upload").await.is_empty());
+    assert!(deletes(&env.server).await.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]

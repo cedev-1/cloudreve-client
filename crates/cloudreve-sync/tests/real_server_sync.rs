@@ -136,6 +136,9 @@ fn local_changes_in_a_mirror_drive_reach_the_server() {
 /// there for longer.
 const OLD_ENOUGH: Duration = Duration::from_secs(32);
 
+/// Longer than the fs watcher's 2 s debounce.
+const SETTLE: Duration = Duration::from_secs(4);
+
 /// The server's id for `rel`: the same id after a change means the server
 /// renamed or moved its file, not that a copy was uploaded.
 async fn remote_id(app: &App, rel: &str) -> String {
@@ -161,6 +164,10 @@ fn deleting_in_a_mirror_drive_moves_files_and_folders_to_the_server_trash() {
         wait_local(&app, "doc-del.txt", b"doc").await;
         wait_local(&app, "Folder-del/sub/b.txt", b"b").await;
         wait_local(&app, "keep.txt", b"keep").await;
+        // A file created and removed within the watcher's 2 s window is
+        // dropped by its debouncer (it came and went); the next full sync
+        // would catch it. Deleting a file just downloaded is not this test.
+        tokio::time::sleep(SETTLE).await;
 
         std::fs::remove_file(app.local("doc-del.txt")).unwrap();
         wait_remote_gone(&app.remote, "doc-del.txt").await;
@@ -209,12 +216,17 @@ fn renaming_and_moving_in_a_mirror_drive_renames_and_moves_on_the_server() {
         tokio::time::sleep(OLD_ENOUGH).await;
         // An empty server folder is not mirrored: the user makes one here.
         std::fs::create_dir_all(app.local("dst")).unwrap();
+        // The new folder's own watcher batch first, as when a person
+        // makes a folder then drags a file in (a move in the same batch
+        // races the folder's scan on Linux).
+        tokio::time::sleep(SETTLE).await;
         std::fs::rename(app.local("new.txt"), app.local("dst/new.txt")).unwrap();
         wait_remote_gone(&app.remote, "new.txt").await;
         assert_eq!(remote_id(&app, "dst/new.txt").await, file_id, "moved by a new upload, not a move");
 
         // Moved and renamed at once, into a folder the server does not have.
         std::fs::create_dir_all(app.local("Archive/2026")).unwrap();
+        tokio::time::sleep(SETTLE).await;
         std::fs::rename(app.local("Papers/a.txt"), app.local("Archive/2026/renamed-a.txt")).unwrap();
         wait_remote(&app.remote, "Archive/2026/renamed-a.txt", b"a").await;
         wait_remote_gone(&app.remote, "Papers/a.txt").await;
