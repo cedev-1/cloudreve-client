@@ -97,6 +97,16 @@ pub struct AddDriveArgs {
     /// behavior unchanged.
     #[serde(default)]
     pub mode: DriveMode,
+    /// Mirror drives: send local deletes and renames to the server. On
+    /// when absent: a new drive gets what users expect from a sync client
+    /// (the add-drive window shows the switch, on). Existing drives never
+    /// come through here.
+    #[serde(default = "default_true")]
+    pub propagate_deletes: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Builds the `DriveConfig` for a brand-new drive from the command's args.
@@ -125,6 +135,8 @@ fn build_drive_config(
         mode: config.mode,
         // On by default, not added yet: `Mount::start` adds it.
         sidebar: Default::default(),
+        // Meaningless for an on-demand drive: never stored on there.
+        propagate_deletes: config.mode == DriveMode::FullMirror && config.propagate_deletes,
         extra: Default::default(),
     }
 }
@@ -230,6 +242,27 @@ pub async fn set_drive_max_file_size(
 ) -> CommandResult<()> {
     let app_state = state.get().ok_or_else(|| "App not yet initialized".to_string())?;
     app_state.drive_manager.set_drive_max_file_size(&drive_id, max_mb).await.map_err(|e| e.to_string())
+}
+
+/// The "delete and rename in the cloud too" switch of a mirror drive.
+#[tauri::command]
+pub async fn get_drive_propagate_deletes(
+    state: State<'_, AppStateHandle>,
+    drive_id: String,
+) -> CommandResult<bool> {
+    let app_state = state.get().ok_or_else(|| "App not yet initialized".to_string())?;
+    app_state.drive_manager.get_drive_propagate_deletes(&drive_id).await.map_err(|e| e.to_string())
+}
+
+/// Applied at once, no restart, and persisted.
+#[tauri::command]
+pub async fn set_drive_propagate_deletes(
+    state: State<'_, AppStateHandle>,
+    drive_id: String,
+    enabled: bool,
+) -> CommandResult<()> {
+    let app_state = state.get().ok_or_else(|| "App not yet initialized".to_string())?;
+    app_state.drive_manager.set_drive_propagate_deletes(&drive_id, enabled).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -770,6 +803,47 @@ mod tests {
         // Every new drive shows in the sidebar until the user says otherwise.
         assert!(mirror_config.sidebar.enabled && !mirror_config.sidebar.added);
         assert!(on_demand_config.sidebar.enabled && !on_demand_config.sidebar.added);
+    }
+
+    fn add_args(extra: &str) -> AddDriveArgs {
+        serde_json::from_str(&format!(
+            r#"{{
+                "site_url": "https://example.com",
+                "access_token": "at",
+                "refresh_token": "rt",
+                "access_token_expires": 3600,
+                "refresh_token_expires": 3600,
+                "drive_name": "My Drive",
+                "remote_path": "/",
+                "local_path": "/tmp/drive",
+                "user_id": "u1"{extra}
+            }}"#
+        ))
+        .expect("valid AddDriveArgs JSON")
+    }
+
+    fn some_credentials() -> Credentials {
+        Credentials {
+            access_token: Some("at".into()),
+            refresh_token: "rt".into(),
+            access_expires: Some("2030-01-01T00:00:00Z".into()),
+            refresh_expires: "2030-01-01T00:00:00Z".into(),
+        }
+    }
+
+    /// A new mirror drive sends local deletes and renames to the server
+    /// unless the user switched it off in the add-drive window; an
+    /// on-demand drive has no such switch (its volume always does), so it
+    /// never stores it on. Existing drives are covered in `cloudreve-sync`
+    /// (`propagate_switch.rs`): a saved drive without the key loads off.
+    #[test]
+    fn a_new_mirror_drive_propagates_deletes_unless_switched_off_in_the_add_window() {
+        let build = |args| build_drive_config("d".into(), "s".into(), args, some_credentials());
+
+        assert!(build(add_args("")).propagate_deletes, "a caller that does not say must get the default: on");
+        assert!(build(add_args(r#", "propagate_deletes": true"#)).propagate_deletes);
+        assert!(!build(add_args(r#", "propagate_deletes": false"#)).propagate_deletes);
+        assert!(!build(add_args(r#", "mode": "on_demand", "propagate_deletes": true"#)).propagate_deletes);
     }
 
     /// The Settings dialog displays whatever this command returns, and nothing

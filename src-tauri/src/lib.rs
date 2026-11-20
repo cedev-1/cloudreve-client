@@ -362,6 +362,8 @@ pub fn run() {
             commands::set_ignore_patterns,
             commands::get_drive_max_file_size,
             commands::set_drive_max_file_size,
+            commands::get_drive_propagate_deletes,
+            commands::set_drive_propagate_deletes,
             commands::get_drive_sidebar,
             commands::set_drive_sidebar,
             commands::get_sync_status,

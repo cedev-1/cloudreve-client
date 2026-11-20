@@ -647,6 +647,24 @@ impl DriveManager {
         self.persist().await
     }
 
+    /// A mirror drive's "delete and rename in the cloud too" switch.
+    pub async fn get_drive_propagate_deletes(&self, id: &str) -> Result<bool> {
+        let mount = self.get_drive(id).await.ok_or_else(|| anyhow::anyhow!("Drive not found: {}", id))?;
+        Ok(mount.propagates_deletes().await)
+    }
+
+    /// Flips that switch, live (the next local change already follows it),
+    /// and persists it. Refused for an on-demand drive: its volume always
+    /// sends deletes and renames, there is nothing to switch.
+    pub async fn set_drive_propagate_deletes(&self, id: &str, enabled: bool) -> Result<()> {
+        let mount = self.get_drive(id).await.ok_or_else(|| anyhow::anyhow!("Drive not found: {}", id))?;
+        if mount.get_config().await.mode == DriveMode::OnDemand {
+            anyhow::bail!("Drive {id} is on demand: deletes and renames always reach the server");
+        }
+        mount.set_propagate_deletes(enabled).await;
+        self.persist().await
+    }
+
     /// Whether the drive's folder shows in the file manager sidebar (the
     /// drive settings toggle).
     pub async fn get_drive_sidebar(&self, id: &str) -> Result<bool> {
@@ -1803,6 +1821,42 @@ mod tests {
                 let _ = std::fs::remove_dir_all(dir);
             }
         }
+    }
+
+    /// The Settings switch behind `set_drive_propagate_deletes`: applied to
+    /// the running drive at once, written to `drives.json` for the next
+    /// launch, and refused for an on-demand drive (nothing to switch there).
+    #[tokio::test]
+    async fn the_delete_propagation_switch_applies_live_and_is_saved() {
+        let (manager, _sidebar, drives, _tmp) = launch_with(|tmp| {
+            let sync_path = tmp.join("Mirror");
+            std::fs::create_dir_all(&sync_path).unwrap();
+            let mirror = DriveConfig {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: "Mirror".to_string(),
+                instance_url: "http://127.0.0.1:9".to_string(),
+                remote_path: "cloudreve://my".to_string(),
+                sync_path,
+                sse_client_id: uuid::Uuid::new_v4().to_string(),
+                mode: DriveMode::FullMirror,
+                ..Default::default()
+            };
+            vec![mirror, on_demand_drive(tmp, "Lazy", false)]
+        })
+        .await;
+        let (mirror, lazy) = (&drives[0].id, &drives[1].id);
+        assert!(!manager.get_drive_propagate_deletes(mirror).await.unwrap());
+
+        manager.set_drive_propagate_deletes(mirror, true).await.expect("switch on");
+
+        let mount = manager.get_drive(mirror).await.unwrap();
+        assert!(mount.propagates_deletes().await, "not applied to the running drive");
+        let saved: super::DriveState =
+            serde_json::from_str(&std::fs::read_to_string(manager.get_config_file()).unwrap()).unwrap();
+        assert!(saved.drives.iter().find(|d| &d.id == mirror).unwrap().propagate_deletes, "not saved");
+        assert!(manager.set_drive_propagate_deletes(lazy, true).await.is_err());
+        assert!(!manager.get_drive_propagate_deletes(lazy).await.unwrap());
+        cleanup(manager, &drives).await;
     }
 
     /// Two drives syncing the same folder, or one inside the other, would
