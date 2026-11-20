@@ -403,6 +403,25 @@ in
   };
 }
 // lib.optionalAttrs isDarwin {
+  # PlugInKit ignores a Finder Sync extension that is not signed with its
+  # sandbox entitlements (release.yml checks the same on the dmg). Here the
+  # signature is made in postFixup: a later fixup step re-signing the binary
+  # would drop the entitlements without failing the build.
+  finder-sync-signature =
+    pkgs.runCommand "cloudreve-client-finder-sync-signature" { nativeBuildInputs = [ pkgs.rcodesign ]; }
+      ''
+        set -euo pipefail
+        fail() { echo "FAIL: $*" >&2; exit 1; }
+        appex=${package}/Applications/Cloudreve.app/Contents/Helpers/CloudreveSidebar.app/Contents/PlugIns/CloudreveFinderSync.appex
+        [ -d "$appex" ] || fail "no Finder Sync extension in the bundle"
+        info=$(rcodesign print-signature-info "$appex")
+        grep -q '<key>com.apple.security.app-sandbox</key>' <<<"$info" \
+          || fail "extension signed without its sandbox entitlement: $info"
+        grep -q 'CodeSignatureFlags(ADHOC | RUNTIME)' <<<"$info" \
+          || fail "extension not ad-hoc signed with the hardened runtime: $info"
+        touch $out
+      '';
+
   darwin-module =
     let
       darwin =
