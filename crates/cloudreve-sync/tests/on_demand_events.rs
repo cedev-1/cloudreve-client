@@ -78,6 +78,35 @@ async fn mount_listing_mock(server: &MockServer) -> (Files, Hits) {
         })
         .mount(server)
         .await;
+    // The on-demand write-back reads one file's current etag (conflict
+    // check, after an upload) from `file/info`, answered from the same
+    // listings; a missing entry is the real server's 40016.
+    let files_captured = files.clone();
+    Mock::given(method("GET"))
+        .and(path("/api/v4/file/info"))
+        .respond_with(move |req: &Request| {
+            let uri = req
+                .url
+                .query_pairs()
+                .find(|(k, _)| k == "uri")
+                .map(|(_, v)| v.into_owned())
+                .unwrap_or_default();
+            let entry = uri.rsplit_once('/').and_then(|(dir, name)| {
+                files_captured
+                    .lock()
+                    .unwrap()
+                    .get(dir)?
+                    .iter()
+                    .find(|f| f.get("name").and_then(Value::as_str) == Some(name))
+                    .cloned()
+            });
+            match entry {
+                Some(entry) => ResponseTemplate::new(200).set_body_json(json!({ "code": 0, "msg": "", "data": entry })),
+                None => ResponseTemplate::new(200).set_body_json(json!({ "code": 40016, "msg": "Path not exist" })),
+            }
+        })
+        .mount(server)
+        .await;
     (files, hits)
 }
 
