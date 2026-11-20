@@ -488,16 +488,6 @@ async fn a_replayed_rename_cut_off_by_quitting_is_resumed_as_a_rename_at_launch(
 /// A mirror drive started on its own folder, watcher and command
 /// processor running, with `files` already synced.
 async fn live_env(files: &[(&str, &[u8], &str)]) -> (tempfile::TempDir, TestEnv) {
-    live_env_aged(files, Duration::ZERO).await
-}
-
-/// macOS reports a rename of a file created in the last ~30 s as a
-/// creation of the new name only (see `drive::propagate`): files that
-/// existed long before, as in real use, need that long before the watcher
-/// starts for their rename to be seen as one.
-const OLD_ENOUGH: Duration = Duration::from_secs(32);
-
-async fn live_env_aged(files: &[(&str, &[u8], &str)], age: Duration) -> (tempfile::TempDir, TestEnv) {
     let outer = tempfile::TempDir::new().unwrap();
     let sync = std::fs::canonicalize(outer.path()).unwrap().join("Cloudreve");
     std::fs::create_dir_all(&sync).unwrap();
@@ -506,7 +496,6 @@ async fn live_env_aged(files: &[(&str, &[u8], &str)], age: Duration) -> (tempfil
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(p, data).unwrap();
     }
-    tokio::time::sleep(age).await;
     let env = TestEnv::started_on(sync, DriveMode::FullMirror).await;
     env.mount.set_propagate_deletes(true).await;
     for (rel, _, etag) in files {
@@ -533,7 +522,7 @@ async fn deleting_a_synced_file_deletes_it_on_the_server() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn renaming_a_synced_file_renames_it_on_the_server_without_a_second_copy() {
-    let (_t, env) = live_env_aged(&[("draft.txt", b"text", "e-d"), ("keep.txt", b"k", "e-k")], OLD_ENOUGH).await;
+    let (_t, env) = live_env(&[("draft.txt", b"text", "e-d"), ("keep.txt", b"k", "e-k")]).await;
     env.set_remote_files(vec![]).await;
     mock_info(&env.server, "draft.txt", remote_file("draft.txt", 4, "e-d")).await;
     accept_writes(&env.server).await;
@@ -554,10 +543,10 @@ async fn renaming_a_synced_file_renames_it_on_the_server_without_a_second_copy()
 }
 
 /// A file renamed seconds after it was synced ("Untitled" saved, then
-/// named): whatever the watcher makes of it, the server must not keep the
-/// old name next to the new one.
+/// named): a rename on the server, like any other. On macOS FSEvents still
+/// flags the file "created" then (see `drive::fs_watch`).
 #[tokio::test(flavor = "multi_thread")]
-async fn renaming_a_file_just_synced_leaves_no_second_copy_on_the_server() {
+async fn renaming_a_file_just_synced_is_a_rename_on_the_server() {
     let (_t, env) = live_env(&[("Untitled.txt", b"notes", "e-u"), ("keep.txt", b"k", "e-k")]).await;
     env.set_remote_files(vec![]).await;
     mock_info(&env.server, "Untitled.txt", remote_file("Untitled.txt", 5, "e-u")).await;
@@ -565,20 +554,39 @@ async fn renaming_a_file_just_synced_leaves_no_second_copy_on_the_server() {
 
     std::fs::rename(env.local_path("Untitled.txt"), env.local_path("Meeting notes.txt")).unwrap();
 
-    wait_for("the old name to leave the server", || async {
-        let renamed = requests(&env.server, "POST", "/api/v4/file/rename")
-            .await
-            .iter()
-            .any(|r| r["uri"] == json!(uri("Untitled.txt")));
-        renamed || deleted_uris(&env.server).await.contains(&uri("Untitled.txt"))
+    wait_for("the rename request", || async {
+        !requests(&env.server, "POST", "/api/v4/file/rename").await.is_empty()
     })
     .await;
+    settle().await;
+    let renames = requests(&env.server, "POST", "/api/v4/file/rename").await;
+    assert_eq!(renames, vec![json!({ "uri": uri("Untitled.txt"), "new_name": "Meeting notes.txt" })]);
+    assert!(deletes(&env.server).await.is_empty(), "renamed by a delete and an upload");
+    assert!(requests(&env.server, "PUT", "/api/v4/file/upload").await.is_empty());
     assert!(env.db_entry("Untitled.txt").is_none());
+}
+
+/// Deleted seconds after it was synced: deleted on the server at once, not
+/// at the next full sync.
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_a_file_just_written_deletes_it_on_the_server_at_once() {
+    let (_t, env) = live_env(&[("keep.txt", b"k", "e-k"), ("keep2.txt", b"k", "e-k2")]).await;
+    env.set_remote_files(vec![]).await;
+    mock_info(&env.server, "fresh.txt", remote_file("fresh.txt", 5, "e-f")).await;
+    accept_writes(&env.server).await;
+    // Written while the watcher runs, as a download lands.
+    env.write_local("fresh.txt", b"fresh");
+    env.track_synced("fresh.txt", "e-f");
+    settle().await;
+
+    std::fs::remove_file(env.local_path("fresh.txt")).unwrap();
+
+    wait_for("the delete request", || async { deleted_uris(&env.server).await == vec![uri("fresh.txt")] }).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn moving_a_file_into_another_folder_moves_it_on_the_server() {
-    let (_t, env) = live_env_aged(&[("a.txt", b"aaa", "e-a"), ("Archive/old.txt", b"o", "e-o")], OLD_ENOUGH).await;
+    let (_t, env) = live_env(&[("a.txt", b"aaa", "e-a"), ("Archive/old.txt", b"o", "e-o")]).await;
     env.set_remote_files(vec![]).await;
     mock_info(&env.server, "a.txt", remote_file("a.txt", 3, "e-a")).await;
     accept_writes(&env.server).await;
@@ -609,7 +617,7 @@ async fn moving_a_file_into_another_folder_moves_it_on_the_server() {
 #[cfg(target_os = "macos")]
 #[tokio::test(flavor = "multi_thread")]
 async fn moving_a_file_into_a_new_folder_is_one_move_and_no_upload() {
-    let (_t, env) = live_env_aged(&[("a.txt", b"aaa", "e-a"), ("k.txt", b"k", "e-k")], OLD_ENOUGH).await;
+    let (_t, env) = live_env(&[("a.txt", b"aaa", "e-a"), ("k.txt", b"k", "e-k")]).await;
     env.set_remote_files(vec![]).await;
     mock_info(&env.server, "a.txt", remote_file("a.txt", 3, "e-a")).await;
     accept_writes(&env.server).await;
@@ -627,7 +635,7 @@ async fn moving_a_file_into_a_new_folder_is_one_move_and_no_upload() {
 /// a folder the server does not have yet (created there first).
 #[tokio::test(flavor = "multi_thread")]
 async fn moving_a_file_into_a_folder_made_a_moment_before_is_one_move() {
-    let (_t, env) = live_env_aged(&[("b.txt", b"bbb", "e-b"), ("k.txt", b"k", "e-k")], OLD_ENOUGH).await;
+    let (_t, env) = live_env(&[("b.txt", b"bbb", "e-b"), ("k.txt", b"k", "e-k")]).await;
     env.set_remote_files(vec![]).await;
     mock_info(&env.server, "b.txt", remote_file("b.txt", 3, "e-b")).await;
     accept_writes(&env.server).await;
@@ -647,7 +655,7 @@ async fn moving_a_file_into_a_folder_made_a_moment_before_is_one_move() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn renaming_a_folder_renames_it_once_on_the_server() {
-    let (_t, env) = live_env_aged(&[("Docs/a.txt", b"a", "e-a"), ("Docs/sub/b.txt", b"b", "e-b"), ("x.txt", b"x", "e-x")], OLD_ENOUGH).await;
+    let (_t, env) = live_env(&[("Docs/a.txt", b"a", "e-a"), ("Docs/sub/b.txt", b"b", "e-b"), ("x.txt", b"x", "e-x")]).await;
     env.set_remote_files(vec![]).await;
     mock_info(&env.server, "Docs", remote_folder("Docs")).await;
     accept_writes(&env.server).await;
@@ -750,6 +758,29 @@ async fn a_folder_whose_files_are_reported_before_it_is_deleted_as_one_folder() 
     wait_for("the delete request", || async { !deletes(&env.server).await.is_empty() }).await;
     settle().await;
     assert_eq!(deleted_uris(&env.server).await, vec![uri("Gone")]);
+}
+
+/// A temporary file that came and went (an app's scratch file, never
+/// synced) is now reported as a removal (see `drive::fs_watch`): it must
+/// never cost a server call.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_temporary_file_that_came_and_went_never_reaches_the_server() {
+    let (_t, env) = live_env(&[("doc.txt", b"d", "e-d")]).await;
+    env.server.reset().await;
+    accept_writes(&env.server).await;
+
+    env.mount
+        .command_tx
+        .send(cloudreve_sync::drive::commands::MountCommand::LocalChanges {
+            changed: vec![],
+            deleted: vec![env.local_path("doc.txt.sb-1a2b3c"), env.local_path(".~lock.doc.txt#")],
+            renamed: vec![],
+        })
+        .unwrap();
+    settle().await;
+
+    assert!(env.server.received_requests().await.unwrap().is_empty(), "a server call for a file never synced");
+    assert!(env.tasks_of_type("delete").is_empty());
 }
 
 /// The server's newer version wins over a live delete too.

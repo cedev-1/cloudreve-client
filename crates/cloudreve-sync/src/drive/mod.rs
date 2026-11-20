@@ -1,5 +1,6 @@
 pub mod commands;
 pub mod event_blocker;
+pub(crate) mod fs_watch;
 pub mod heartbeat;
 pub mod ignore;
 pub mod manager;

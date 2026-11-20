@@ -32,19 +32,18 @@
 //! - moved out of the drive (to the Trash, the Desktop) = deleted; moved
 //!   in = a new file, uploaded as before.
 //!
-//! On macOS, a file created less than ~30 s before it is renamed is
-//! reported as a creation of the new name only (FSEvents keeps its
-//! "created" flag, and the debouncer drops the old name as a file that
-//! came and went). That rename becomes a delete of the old name plus an
-//! upload of the new one: a new untracked file next to a tracked file that
-//! is gone is swept for right away (`vanished_files_in`), so the server
-//! never keeps both names. A file that appears and is deleted within the
-//! watcher's 2 s window (deleted right after it was downloaded) — on macOS
-//! within ~30 s, for the same FSEvents reason — is dropped by the debouncer
-//! as a file that came and went; a folder made and a file
-//! moved into it in that same window can race (on Linux, the new folder
-//! is not watched yet). Both are left to the next full sync (at most five
-//! minutes): a delete, or a delete plus an upload — never a lost file.
+//! On macOS, FSEvents keeps a file's "created" flag for ~30 s, and a
+//! delete or rename of a file synced that recently would reach the
+//! debouncer as a file that came and went — dropped without a trace.
+//! `drive::fs_watch` takes those stale creations out before the debouncer,
+//! so such a delete or rename goes through like any other. Should a rename
+//! still arrive as a new name only, a new untracked file next to a tracked
+//! one that is gone is swept for right away (`vanished_files_in`): the old
+//! name is deleted, the server never keeps both. What remains for the next
+//! full sync (at most five minutes; a delete, or a delete plus an upload —
+//! never a lost file): a file created and deleted within the debouncer's
+//! own 2 s window, and a file moved within that window into a folder made
+//! in it (on Linux, the new folder is not watched yet).
 //!
 //! **Offline** — whatever happened while the app was not running (or the
 //! watcher missed) is found by `full_sync`'s 3-way merge: tracked in the
@@ -342,13 +341,14 @@ impl Mount {
             }
         }
 
-        // macOS reports a rename of a file created in the last ~30 s as a
-        // creation of the new name only (FSEvents keeps the "created" flag,
-        // and the watcher's debouncer then drops the old name as a file
-        // that came and went). A new untracked file next to a tracked one
-        // that is gone is that signature: the vanished one is a delete —
-        // found now rather than at the next full sync, so the server does
-        // not keep both names meanwhile.
+        // The move uploads whatever changed in it once it is done; an
+        // upload racing it would create the destination first.
+        uploads.retain(|u| !moves.iter().any(|(_, to)| u == to || is_inside(to, u)));
+
+        // A rename that still arrives as a new name only (see the module
+        // doc): a new untracked file next to a tracked one that is gone is
+        // that signature, and the vanished one a delete — found now rather
+        // than at the next full sync, so the server does not keep both.
         let mut swept: HashSet<PathBuf> = HashSet::new();
         for upload in &uploads {
             let Some(parent) = upload.parent() else { continue };
@@ -362,9 +362,10 @@ impl Mount {
             deletions.extend(self.vanished_files_in(parent));
         }
 
-        // A queued move still has its rows at the old name: never also a
-        // delete of it.
-        let busy = busy_paths(self)?;
+        // A move, queued or about to be, still has its rows at the old
+        // name: never also a delete of it.
+        let mut busy = busy_paths(self)?;
+        busy.extend(moves.iter().map(|(from, _)| from.clone()));
         let mut planned = Vec::new();
         let mut count = 0;
         // A deleted folder's files can come in one batch and the folder in
@@ -401,9 +402,6 @@ impl Mount {
             tracing::debug!(target: "drive::propagate", from = %from.display(), to = %to.display(), "Enqueuing server move for a local rename");
             self.task_queue.enqueue(TaskPayload::moved(from, to)).await?;
         }
-        // The move uploads whatever changed in it once it is done; an
-        // upload racing it would create the destination first.
-        uploads.retain(|u| !moves.iter().any(|(_, to)| u == to || is_inside(to, u)));
         Ok(uploads)
     }
 }

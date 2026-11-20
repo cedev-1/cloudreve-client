@@ -118,9 +118,6 @@ fn local_changes_in_a_mirror_drive_reach_the_server() {
         std::fs::rename(app.local("renamed.txt"), app.local("deep/moved.txt")).unwrap();
         wait_remote(&app.remote, "deep/moved.txt", b"modified locally + appended").await;
         wait_remote_gone(&app.remote, "renamed.txt").await;
-        // Same macOS ~30 s "created" rule as for renames (`OLD_ENOUGH`):
-        // deleted sooner, they only leave the server at the next full sync.
-        tokio::time::sleep(OLD_ENOUGH).await;
         std::fs::remove_dir_all(app.local("deep/er")).unwrap();
         std::fs::remove_file(app.local("big.bin")).unwrap();
         wait_remote_gone(&app.remote, "deep/er").await;
@@ -133,11 +130,6 @@ fn local_changes_in_a_mirror_drive_reach_the_server() {
         app.cleanup().await;
     })
 }
-
-/// macOS reports a rename of a file created in the last ~30 s as a new
-/// file (see `drive::propagate`); files a user renames have usually been
-/// there for longer.
-const OLD_ENOUGH: Duration = Duration::from_secs(32);
 
 /// Longer than the fs watcher's 2 s debounce.
 const SETTLE: Duration = Duration::from_secs(4);
@@ -167,11 +159,9 @@ fn deleting_in_a_mirror_drive_moves_files_and_folders_to_the_server_trash() {
         wait_local(&app, "doc-del.txt", b"doc").await;
         wait_local(&app, "Folder-del/sub/b.txt", b"b").await;
         wait_local(&app, "keep.txt", b"keep").await;
-        // A file created and removed within the watcher's 2 s window — on
-        // macOS, within ~30 s, as FSEvents keeps reporting it "created" — is
-        // dropped by the debouncer as one that came and went; the next full
-        // sync catches it. Deleting a file just downloaded is not this test.
-        tokio::time::sleep(OLD_ENOUGH).await;
+        // Out of the watcher's 2 s window: a file that appears and goes
+        // within it is one that came and went for its debouncer.
+        tokio::time::sleep(SETTLE).await;
 
         std::fs::remove_file(app.local("doc-del.txt")).unwrap();
         wait_remote_gone(&app.remote, "doc-del.txt").await;
@@ -206,7 +196,7 @@ fn a_mirror_drive_switched_off_keeps_the_server_untouched_until_switched_on() {
         wait_local(&app, "kept.txt", b"kept").await;
         wait_local(&app, "old-name.txt", b"renamed").await;
         wait_local(&app, "later.txt", b"later").await;
-        tokio::time::sleep(OLD_ENOUGH).await;
+        tokio::time::sleep(SETTLE).await;
 
         std::fs::remove_file(app.local("kept.txt")).unwrap();
         std::fs::rename(app.local("old-name.txt"), app.local("new-name.txt")).unwrap();
@@ -238,7 +228,7 @@ fn renaming_and_moving_in_a_mirror_drive_renames_and_moves_on_the_server() {
         };
         wait_local(&app, "old.txt", b"old").await;
         wait_local(&app, "Docs/sub/b.txt", b"b").await;
-        tokio::time::sleep(OLD_ENOUGH).await;
+        tokio::time::sleep(SETTLE).await;
         let file_id = remote_id(&app, "old.txt").await;
         let folder_id = remote_id(&app, "Docs").await;
 
@@ -251,8 +241,6 @@ fn renaming_and_moving_in_a_mirror_drive_renames_and_moves_on_the_server() {
         assert_eq!(remote_id(&app, "Papers").await, folder_id, "folder renamed by a re-upload");
         assert_eq!(app.remote.read("Papers/sub/b.txt").await.unwrap(), b"b");
 
-        // `new.txt` only just got its name: same ~30 s rule on macOS.
-        tokio::time::sleep(OLD_ENOUGH).await;
         // An empty server folder is not mirrored: the user makes one here.
         std::fs::create_dir_all(app.local("dst")).unwrap();
         // The new folder's own watcher batch first, as when a person
@@ -292,7 +280,7 @@ fn a_mirror_delete_and_rename_made_offline_reach_the_server_on_reconnect() {
         };
         wait_local(&app, "off.txt", b"off").await;
         wait_local(&app, "ren.txt", b"ren").await;
-        tokio::time::sleep(OLD_ENOUGH).await;
+        tokio::time::sleep(SETTLE).await;
         let id = remote_id(&app, "ren.txt").await;
 
         app.proxy().set_down(true);

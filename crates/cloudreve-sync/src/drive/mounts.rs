@@ -16,7 +16,8 @@ use cloudreve_api::{Client, ClientConfig, models::user::Token};
 use cloudreve_vfs::mount::MountedVfs;
 use cloudreve_vfs::vfs::{Vfs, VfsEvent};
 use notify_debouncer_full::notify::{RecommendedWatcher, RecursiveMode};
-use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer};
+use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer_opt};
+use crate::drive::fs_watch::StaleCreateFilter;
 use std::time::Duration;
 use std::{
     collections::HashMap,
@@ -175,7 +176,9 @@ impl MountStatusFlags {
     }
 }
 
-type FsWatcher = Debouncer<RecommendedWatcher, RecommendedCache>;
+/// `StaleCreateFilter`: see `drive::fs_watch` — without it, a file deleted
+/// or renamed within ~30 s of being synced never reached the server on macOS.
+type FsWatcher = Debouncer<StaleCreateFilter<RecommendedWatcher>, RecommendedCache>;
 
 pub struct Mount {
     pub config: Arc<RwLock<DriveConfig>>,
@@ -686,7 +689,7 @@ impl Mount {
         let configured = sync_path.clone();
         let resolved = std::fs::canonicalize(sync_path).ok().filter(|r| r != sync_path);
 
-        let watcher = new_debouncer(
+        let watcher = new_debouncer_opt::<_, StaleCreateFilter<RecommendedWatcher>, RecommendedCache>(
             Duration::from_secs(2),
             None,
             move |result: DebounceEventResult| {
@@ -722,6 +725,8 @@ impl Mount {
                     }
                 }
             },
+            RecommendedCache::new(),
+            notify_debouncer_full::notify::Config::default(),
         )?;
 
         let mut watcher = watcher;
