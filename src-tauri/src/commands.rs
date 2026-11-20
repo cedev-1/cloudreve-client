@@ -504,6 +504,7 @@ pub async fn get_general_settings() -> CommandResult<GeneralSettings> {
         heartbeat_interval: config.heartbeat_interval_secs,
         check_updates_on_startup: config.check_updates_on_startup,
         auto_install_updates: config.auto_install_updates,
+        package_managed: crate::packaging::package_managed(),
     })
 }
 
@@ -520,6 +521,9 @@ pub struct GeneralSettings {
     pub heartbeat_interval: u64,
     pub check_updates_on_startup: bool,
     pub auto_install_updates: bool,
+    /// Built for a package manager: the UI hides the updater and the
+    /// autostart toggle, both owned by the package (see `packaging`).
+    pub package_managed: bool,
 }
 
 #[tauri::command]

@@ -10,6 +10,7 @@ import {
 } from "@mui/material";
 import { useTranslation } from "react-i18next";
 import { getVersion } from "@tauri-apps/api/app";
+import { invoke } from "@tauri-apps/api/core";
 import GitHubIcon from "@mui/icons-material/GitHub";
 import BugReportIcon from "@mui/icons-material/BugReportRounded";
 import ForumIcon from "@mui/icons-material/ForumRounded";
@@ -38,9 +39,14 @@ export default function AboutSection() {
   const [version, setVersion] = useState("");
   const isPreview = version ? isPreviewVersion(version) : false;
   const [updateState, setUpdateState] = useState<UpdateState>({ status: "idle" });
+  // Package-managed builds (Nix...) are updated by their package manager, see packaging.rs
+  const [packageManaged, setPackageManaged] = useState(true);
 
   useEffect(() => {
     getVersion().then(setVersion);
+    invoke<{ package_managed: boolean }>("get_general_settings")
+      .then((s) => setPackageManaged(s.package_managed))
+      .catch(() => setPackageManaged(false));
   }, []);
 
   const links = [
@@ -197,21 +203,23 @@ export default function AboutSection() {
         </Box>
       </Stack>
 
-      <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 2 }}>
-        <Button
-          variant="outlined"
-          size="small"
-          startIcon={<UpdateIcon />}
-          onClick={handleCheckUpdate}
-          disabled={
-            updateState.status === "checking" ||
-            updateState.status === "downloading" ||
-            updateState.status === "installing"
-          }
-        >
-          {t("about.checkForUpdates")}
-        </Button>
-      </Stack>
+      {!packageManaged && (
+        <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 2 }}>
+          <Button
+            variant="outlined"
+            size="small"
+            startIcon={<UpdateIcon />}
+            onClick={handleCheckUpdate}
+            disabled={
+              updateState.status === "checking" ||
+              updateState.status === "downloading" ||
+              updateState.status === "installing"
+            }
+          >
+            {t("about.checkForUpdates")}
+          </Button>
+        </Stack>
+      )}
 
       {updateState.status !== "idle" && (
         <Box sx={{ mb: 2 }}>{renderUpdateStatus()}</Box>
