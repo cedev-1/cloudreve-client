@@ -31,6 +31,9 @@ const S = {
     newDrive: "New Drive",
     finderSidebar: "Show in Finder sidebar",
     fileManagerSidebar: "Show in file manager sidebar",
+    propagate: "Delete and rename in the cloud too",
+    propagateDescription:
+      "Deleting or renaming a file in this folder does the same in your cloud (deleted files go to the cloud's trash). When off, your cloud keeps everything you delete here.",
     noDrives: "No drives configured. Add a drive to get started.",
     deleteOnDemandUnsynced:
       "\"Work\" has 3 file(s) with changes that are not uploaded yet. If you remove the drive now, these changes will be lost. Remove it anyway?",
@@ -83,6 +86,9 @@ const S = {
     newDrive: "Nouveau disque",
     finderSidebar: "Afficher dans la barre latérale du Finder",
     fileManagerSidebar: "Afficher dans la barre latérale du gestionnaire de fichiers",
+    propagate: "Supprimer et renommer aussi dans le cloud",
+    propagateDescription:
+      "Supprimer ou renommer un fichier dans ce dossier fait de même dans votre cloud (les fichiers supprimés vont dans la corbeille du cloud). Désactivé, votre cloud garde tout ce que vous supprimez ici.",
     noDrives: "Aucun disque configuré. Ajoutez un disque pour commencer.",
     deleteOnDemandUnsynced:
       "« Work » a 3 fichier(s) dont les modifications ne sont pas encore envoyées. Si vous retirez le disque maintenant, ces modifications seront perdues. Le retirer quand même ?",
@@ -130,6 +136,8 @@ describe.each(LANGUAGES)("settings (%s)", (lng) => {
     mockCommands({
       get_drives_info: () => [mirrorDriveInfo, onDemandDriveInfo, expiredDriveInfo],
       get_drive_sidebar: (args) => sidebar[args!.driveId as string],
+      // Photos was added with the switch on, Archive predates it.
+      get_drive_propagate_deletes: (args) => args!.driveId === mirrorDriveInfo.id,
       ...extra,
     });
   }
@@ -208,6 +216,38 @@ describe.each(LANGUAGES)("settings (%s)", (lng) => {
     await user.click(photosSwitch);
     expect(await within(card("Photos")).findByText("Could not update the Finder sidebar: permission denied.")).toBeInTheDocument();
     expect(photosSwitch).toBeChecked();
+  });
+
+  it("switches whether a mirror drive deletes and renames in the cloud", async () => {
+    let fail = false;
+    drivesCommands(
+      { [mirrorDriveInfo.id]: true, [onDemandDriveInfo.id]: true, [expiredDriveInfo.id]: true },
+      {
+        set_drive_propagate_deletes: () => {
+          if (fail) throw "Drive not found: drive-photos";
+          return null;
+        },
+      }
+    );
+    const { user } = await renderApp("/settings", lng);
+    await screen.findByText("Photos", { selector: "p" });
+
+    const photos = within(card("Photos")).getByRole("switch", { name: s.propagate });
+    const archive = within(card("Archive")).getByRole("switch", { name: s.propagate });
+    await waitFor(() => expect(photos).toBeChecked());
+    expect(archive).not.toBeChecked();
+    expect(within(card("Photos")).getByText(s.propagateDescription)).toBeInTheDocument();
+    // Files on demand always deletes and renames in the cloud: no switch.
+    expect(within(card("Work")).queryByRole("switch", { name: s.propagate })).not.toBeInTheDocument();
+
+    await user.click(archive);
+    expect(archive).toBeChecked();
+    expect(callsTo("set_drive_propagate_deletes")).toEqual([{ driveId: expiredDriveInfo.id, enabled: true }]);
+
+    fail = true;
+    await user.click(photos);
+    expect(await within(card("Photos")).findByText("Drive not found: drive-photos")).toBeInTheDocument();
+    expect(photos).toBeChecked();
   });
 
   it("names the file manager sidebar on Linux", async () => {

@@ -22,6 +22,9 @@
       "onDemandHint": "Your files show up in the folder right away but use no disk space until you open them.",
       "onDemandDetails": "Opening a file for the first time needs an internet connection; files you opened recently stay available.",
       "fixedNote": "This choice can't be changed later. To switch, remove the drive and add it again.",
+      "propagateDeletes": "Delete and rename in the cloud too",
+      "propagateDeletesHint": "Deleting or renaming a file here does the same in your cloud. Deleted files go to the cloud's trash.",
+      "propagateDeletesDetails": "When off, files you delete here stay in your cloud, and a renamed file is uploaded again under its new name. Deleting many files at once is never sent: you get a notification instead. You can change this later in the drive's settings.",
       "beta": "Beta",
       "betaWarning": "Beta: may have bugs. Keep a backup of important files.",
       "macNote": "The first time, macOS may ask whether Cloudreve can access files on a network volume: click Allow.",
@@ -140,6 +143,8 @@
     "showInFinderSidebar": "Show in Finder sidebar",
     "showInFileManagerSidebar": "Show in file manager sidebar",
     "showInSidebarDescription": "Adds this drive's folder to the sidebar with the Cloudreve icon, so you can open it in one click.",
+    "propagateDeletes": "Delete and rename in the cloud too",
+    "propagateDeletesDescription": "Deleting or renaming a file in this folder does the same in your cloud (deleted files go to the cloud's trash). When off, your cloud keeps everything you delete here.",
     "save": "Save",
     "cancel": "Cancel",
     "driveStatus": {

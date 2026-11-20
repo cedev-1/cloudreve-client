@@ -75,6 +75,9 @@ export default function DrivesSection() {
   const [sidebarShown, setSidebarShown] = useState<Record<string, boolean>>({});
   // Already localized by the backend (`sidebarUpdateFailed`).
   const [sidebarErrors, setSidebarErrors] = useState<Record<string, string>>({});
+  // Mirror drives: whether a local delete or rename is sent to the server.
+  const [propagate, setPropagate] = useState<Record<string, boolean>>({});
+  const [propagateErrors, setPropagateErrors] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
   const [patternsError, setPatternsError] = useState<string | null>(null);
   const [defaultPatterns, setDefaultPatterns] = useState<string[]>([]);
@@ -116,6 +119,35 @@ export default function DrivesSection() {
       setSidebarShown((prev) => ({ ...prev, ...Object.fromEntries(entries) }))
     );
   }, [drives, sidebarShown]);
+
+  useEffect(() => {
+    const unknown = drives.filter((d) => d.mode !== "on_demand" && !(d.id in propagate));
+    if (unknown.length === 0) return;
+    Promise.all(
+      unknown.map((d) =>
+        invoke<boolean>("get_drive_propagate_deletes", { driveId: d.id })
+          .catch(() => false)
+          .then((on) => [d.id, on] as const)
+      )
+    ).then((entries) =>
+      setPropagate((prev) => ({ ...prev, ...Object.fromEntries(entries) }))
+    );
+  }, [drives, propagate]);
+
+  const handleTogglePropagate = async (driveId: string, enabled: boolean) => {
+    setPropagate((prev) => ({ ...prev, [driveId]: enabled }));
+    setPropagateErrors((prev) => {
+      const rest = { ...prev };
+      delete rest[driveId];
+      return rest;
+    });
+    try {
+      await invoke("set_drive_propagate_deletes", { driveId, enabled });
+    } catch (error) {
+      setPropagate((prev) => ({ ...prev, [driveId]: !enabled }));
+      setPropagateErrors((prev) => ({ ...prev, [driveId]: String(error) }));
+    }
+  };
 
   const handleToggleSidebar = async (driveId: string, enabled: boolean) => {
     setSidebarShown((prev) => ({ ...prev, [driveId]: enabled }));
@@ -566,6 +598,34 @@ export default function DrivesSection() {
                     </Alert>
                   )}
                 </Box>
+
+                {/* Mirror only: send local deletes and renames to the server */}
+                {drive.mode !== "on_demand" && (
+                  <Box sx={{ mt: 1.5 }}>
+                    <FormControlLabel
+                      control={
+                        <Switch
+                          size="small"
+                          checked={propagate[drive.id] ?? false}
+                          onChange={(e) => handleTogglePropagate(drive.id, e.target.checked)}
+                        />
+                      }
+                      label={
+                        <Typography variant="body2">
+                          {t("settings.propagateDeletes")}
+                        </Typography>
+                      }
+                    />
+                    <Typography variant="caption" color="text.secondary" component="div">
+                      {t("settings.propagateDeletesDescription")}
+                    </Typography>
+                    {propagateErrors[drive.id] && (
+                      <Alert severity="error" sx={{ mt: 1 }}>
+                        {propagateErrors[drive.id]}
+                      </Alert>
+                    )}
+                  </Box>
+                )}
 
                 {/* Action Footer */}
                 <Divider sx={{ my: 2, mx: -2 }} />

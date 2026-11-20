@@ -1,4 +1,4 @@
-import { Alert, Box, Button, Chip, CircularProgress, Collapse, Container, IconButton, InputAdornment, Snackbar, ToggleButton, ToggleButtonGroup, Tooltip, Typography } from "@mui/material";
+import { Alert, Box, Button, Chip, CircularProgress, Collapse, Container, FormControlLabel, IconButton, InputAdornment, Snackbar, Switch, ToggleButton, ToggleButtonGroup, Tooltip, Typography } from "@mui/material";
 import CloseIcon from "@mui/icons-material/Close";
 import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -109,6 +109,9 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
   const [localPath, setLocalPath] = useState("");
   const [folderNotEmpty, setFolderNotEmpty] = useState(false);
   const [driveMode, setDriveMode] = useState<DriveModeChoice>("full_mirror");
+  // Mirror drives only: send local deletes and renames to the server. On
+  // by default for a new drive; changeable later in Settings › Drives.
+  const [propagateDeletes, setPropagateDeletes] = useState(true);
   const [driveName, setDriveName] = useState(driveNameQuery ? decodeURIComponent(driveNameQuery) : "");
   const lastFetchedUrl = useRef<string>("");
   const currentIconUrl = useRef<string | undefined>(undefined);
@@ -366,6 +369,7 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
           user_id: pkceSessionRef.current!.callbackData!.user_id || "",
           drive_id: isReauthorize ? driveId : undefined,
           mode: driveMode,
+          propagate_deletes: driveMode === "full_mirror" && propagateDeletes,
         }
       });
       // Success - switch to success state
@@ -578,6 +582,27 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
                           </IconButton>
                         </Tooltip>
                       </Box>
+                      {driveMode === "full_mirror" && (
+                        <Box sx={{ mt: 1 }}>
+                          <FormControlLabel
+                            control={
+                              <Switch
+                                size="small"
+                                checked={propagateDeletes}
+                                onChange={(e) => setPropagateDeletes(e.target.checked)}
+                              />
+                            }
+                            label={
+                              <Typography variant="body2">
+                                {t("addDrive.modeChoice.propagateDeletes")}
+                              </Typography>
+                            }
+                          />
+                          <Typography variant="caption" color="text.secondary" component="div">
+                            {t("addDrive.modeChoice.propagateDeletesHint")}
+                          </Typography>
+                        </Box>
+                      )}
                       {driveMode === "on_demand" && (
                         <Typography
                           variant="caption"
@@ -597,6 +622,15 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
                             ? t("addDrive.modeChoice.onDemandDetails")
                             : t("addDrive.modeChoice.mirrorDetails")}
                         </Typography>
+                        {driveMode === "full_mirror" && (
+                          <Typography
+                            variant="caption"
+                            color="text.secondary"
+                            sx={{ mt: 0.5, display: "block" }}
+                          >
+                            {t("addDrive.modeChoice.propagateDeletesDetails")}
+                          </Typography>
+                        )}
                         {driveMode === "on_demand" && (os === "macos" || os === "linux") && (
                           <Typography
                             variant="caption"

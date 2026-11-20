@@ -30,6 +30,10 @@ const S = {
       "The first time, macOS may ask whether Cloudreve can access files on a network volume: click Allow.",
     linuxNote: "Needs FUSE (the \"fuse3\" package, already installed on most Linux systems).",
     fixedNote: "This choice can't be changed later. To switch, remove the drive and add it again.",
+    propagate: "Delete and rename in the cloud too",
+    propagateHint: "Deleting or renaming a file here does the same in your cloud. Deleted files go to the cloud's trash.",
+    propagateDetails:
+      "When off, files you delete here stay in your cloud, and a renamed file is uploaded again under its new name. Deleting many files at once is never sent: you get a notification instead. You can change this later in the drive's settings.",
     localPath: "Local Path",
     browse: "Browse",
     notEmpty: "The selected folder is not empty. Please choose an empty folder.",
@@ -67,6 +71,11 @@ const S = {
       "La première fois, macOS peut demander si Cloudreve peut accéder aux fichiers d'un volume réseau : cliquez sur Autoriser.",
     linuxNote: "Nécessite FUSE (le paquet « fuse3 », déjà installé sur la plupart des systèmes Linux).",
     fixedNote: "Ce choix ne peut pas être modifié ensuite. Pour changer, supprimez le disque puis ajoutez-le à nouveau.",
+    propagate: "Supprimer et renommer aussi dans le cloud",
+    propagateHint:
+      "Supprimer ou renommer un fichier ici fait de même dans votre cloud. Les fichiers supprimés vont dans la corbeille du cloud.",
+    propagateDetails:
+      "Désactivé, les fichiers supprimés ici restent dans votre cloud, et un fichier renommé est envoyé à nouveau sous son nouveau nom. Une suppression de nombreux fichiers d'un coup n'est jamais envoyée : vous recevez une notification à la place. Modifiable plus tard dans les réglages du disque.",
     localPath: "Chemin local",
     browse: "Parcourir",
     notEmpty: "Le dossier sélectionné n'est pas vide. Veuillez choisir un dossier vide.",
@@ -184,6 +193,7 @@ describe.each(LANGUAGES)("add drive (%s)", (lng) => {
           user_id: "u1",
           drive_id: undefined,
           mode: "on_demand",
+          propagate_deletes: false,
         },
       },
     ]);
@@ -191,6 +201,36 @@ describe.each(LANGUAGES)("add drive (%s)", (lng) => {
     expect(callsTo("open_folder_and_close_window")).toEqual([
       { path: "/Users/alice/My Cloud", label: "add-drive" },
     ]);
+  });
+
+  it("adds a mirror drive that deletes and renames in the cloud unless switched off", async () => {
+    cloudreveServer();
+    mockCommands({ is_dir_empty: () => true, add_drive: () => null });
+    dialog.open.mockResolvedValueOnce("/Users/alice/Mirror");
+    const { user } = await reachFinalStep(lng);
+
+    // Download everything is the default mode: the switch shows, on.
+    const propagate = screen.getByRole("switch", { name: s.propagate });
+    expect(propagate).toBeChecked();
+    expect(screen.getByText(s.propagateHint)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: s.learnMore }));
+    const details = screen.getByText(s.propagateDetails).closest(".MuiCollapse-root")!;
+    await waitFor(() => expect(details).toHaveClass("MuiCollapse-entered"));
+
+    // Files on demand has no such choice.
+    await user.click(screen.getByRole("button", { name: `${s.onDemand} ${s.beta}` }));
+    expect(screen.queryByRole("switch", { name: s.propagate })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: s.mirror }));
+
+    await user.click(screen.getByRole("switch", { name: s.propagate }));
+    expect(screen.getByRole("switch", { name: s.propagate })).not.toBeChecked();
+    await user.click(screen.getByRole("button", { name: s.browse }));
+    await user.click(screen.getByRole("button", { name: s.finish }));
+
+    expect(await screen.findByText(s.success)).toBeInTheDocument();
+    expect(callsTo("add_drive")[0]).toMatchObject({
+      config: { local_path: "/Users/alice/Mirror", mode: "full_mirror", propagate_deletes: false },
+    });
   });
 
   it("refuses a folder that is not empty", async () => {

@@ -22,6 +22,9 @@
       "onDemandHint": "Vos fichiers apparaissent tout de suite dans le dossier mais n'occupent aucun espace disque tant que vous ne les ouvrez pas.",
       "onDemandDetails": "Ouvrir un fichier pour la première fois demande une connexion internet ; les fichiers ouverts récemment restent disponibles.",
       "fixedNote": "Ce choix ne peut pas être modifié ensuite. Pour changer, supprimez le disque puis ajoutez-le à nouveau.",
+      "propagateDeletes": "Supprimer et renommer aussi dans le cloud",
+      "propagateDeletesHint": "Supprimer ou renommer un fichier ici fait de même dans votre cloud. Les fichiers supprimés vont dans la corbeille du cloud.",
+      "propagateDeletesDetails": "Désactivé, les fichiers supprimés ici restent dans votre cloud, et un fichier renommé est envoyé à nouveau sous son nouveau nom. Une suppression de nombreux fichiers d'un coup n'est jamais envoyée : vous recevez une notification à la place. Modifiable plus tard dans les réglages du disque.",
       "beta": "Bêta",
       "betaWarning": "Bêta : peut contenir des bugs. Gardez une sauvegarde de vos fichiers importants.",
       "macNote": "La première fois, macOS peut demander si Cloudreve peut accéder aux fichiers d'un volume réseau : cliquez sur Autoriser.",
@@ -140,6 +143,8 @@
     "showInFinderSidebar": "Afficher dans la barre latérale du Finder",
     "showInFileManagerSidebar": "Afficher dans la barre latérale du gestionnaire de fichiers",
     "showInSidebarDescription": "Ajoute le dossier de ce disque à la barre latérale, avec l'icône Cloudreve, pour l'ouvrir en un clic.",
+    "propagateDeletes": "Supprimer et renommer aussi dans le cloud",
+    "propagateDeletesDescription": "Supprimer ou renommer un fichier dans ce dossier fait de même dans votre cloud (les fichiers supprimés vont dans la corbeille du cloud). Désactivé, votre cloud garde tout ce que vous supprimez ici.",
     "save": "Enregistrer",
     "cancel": "Annuler",
     "driveStatus": {
