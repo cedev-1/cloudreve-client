@@ -50,11 +50,15 @@ where
     Some(app)
 }
 
+/// What a folder lists, minus the mount root's own AppleDouble sidecar
+/// `._.` that macOS keeps there (it holds the drive's folder icon and is
+/// listed on purpose, see `cloudreve_vfs::appledouble`); never uploaded.
 async fn names(path: PathBuf) -> Vec<String> {
     fs(move || {
         let mut v: Vec<String> = std::fs::read_dir(&path)
             .unwrap_or_else(|e| panic!("read_dir {}: {e}", path.display()))
             .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|n| n != "._.")
             .collect();
         v.sort();
         v
