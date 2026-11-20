@@ -4,6 +4,7 @@ pub mod heartbeat;
 pub mod ignore;
 pub mod manager;
 pub mod mounts;
+pub mod propagate;
 pub mod remote_events;
 pub mod sync;
 pub mod upload_health;

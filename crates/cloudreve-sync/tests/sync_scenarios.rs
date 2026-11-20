@@ -2,8 +2,9 @@
 //!
 //! Each test describes a real user situation and asserts the *outcome the
 //! user cares about*: no silent data loss, conflicts surfaced instead of
-//! overwritten, deletions never propagated to the server, transfers enqueued
-//! only when needed.
+//! overwritten, remote deletions never destroying local data, transfers
+//! enqueued only when needed. Local deletes reaching the server are covered
+//! by `mirror_local_removals.rs`.
 //!
 //! Setup: real `Mount`, real SQLite inventory, real files on disk, and a
 //! mock HTTP server standing in for the Cloudreve API.
@@ -199,39 +200,8 @@ async fn conflicted_file_stays_frozen_across_syncs() {
 }
 
 // ---------------------------------------------------------------------------
-// Deletions: destructive operations must never propagate to the server
+// Deletions
 // ---------------------------------------------------------------------------
-
-/// The user deletes a synced file locally. The server copy must NOT be
-/// deleted — the client only forgets the file.
-#[tokio::test]
-async fn local_deletion_is_never_propagated_to_server() {
-    let env = TestEnv::new().await;
-    env.write_local("important.zip", b"data");
-    env.track_synced("important.zip", "etag-v1");
-    std::fs::remove_file(env.local_path("important.zip")).unwrap();
-    env.set_remote_files(vec![remote_file("important.zip", 4, "etag-v1")])
-        .await;
-
-    env.full_sync().await.unwrap();
-
-    // No write/delete request may ever reach the server.
-    let requests = env.server.received_requests().await.unwrap();
-    for req in &requests {
-        assert_eq!(
-            req.method.as_str(),
-            "GET",
-            "sync must be read-only towards the server here, got {} {}",
-            req.method,
-            req.url.path()
-        );
-    }
-    assert!(env.all_tasks().is_empty(), "no transfer tasks");
-    assert!(
-        env.db_entry("important.zip").is_none(),
-        "tracking must be forgotten"
-    );
-}
 
 /// The file was deleted on the server. The local copy must be preserved —
 /// remote deletions must not destroy local data.

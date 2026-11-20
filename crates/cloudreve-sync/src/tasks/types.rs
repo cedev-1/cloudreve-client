@@ -6,6 +6,12 @@ use std::path::PathBuf;
 pub enum TaskKind {
     Upload,
     Download,
+    /// Delete `local_path` on the server (into its trash): it was deleted
+    /// here. See `drive::propagate`.
+    Delete,
+    /// Move/rename on the server to `local_path`, from the path in
+    /// `custom_state["from"]`. See `drive::propagate`.
+    Move,
 }
 
 impl TaskKind {
@@ -13,6 +19,8 @@ impl TaskKind {
         match self {
             TaskKind::Upload => "upload",
             TaskKind::Download => "download",
+            TaskKind::Delete => "delete",
+            TaskKind::Move => "move",
         }
     }
 
@@ -20,9 +28,19 @@ impl TaskKind {
         match value {
             "upload" => Some(TaskKind::Upload),
             "download" => Some(TaskKind::Download),
+            "delete" => Some(TaskKind::Delete),
+            "move" => Some(TaskKind::Move),
             _ => None,
         }
     }
+}
+
+/// `custom_state` key holding a `Move` task's source path.
+pub const MOVE_FROM_KEY: &str = "from";
+
+/// The source path stored in a `Move` task's `custom_state`.
+pub fn move_from_state(state: Option<&Value>) -> Option<PathBuf> {
+    state?.get(MOVE_FROM_KEY)?.as_str().map(PathBuf::from)
 }
 
 #[derive(Debug, Clone)]
@@ -59,6 +77,24 @@ impl TaskPayload {
 
     pub fn download(local_path: impl Into<PathBuf>) -> Self {
         Self::new(TaskKind::Download, local_path)
+    }
+
+    pub fn delete(local_path: impl Into<PathBuf>) -> Self {
+        Self::new(TaskKind::Delete, local_path)
+    }
+
+    /// Moves `from` to `to` on the server. `to` is the task's path (what
+    /// path-based cancellation and the ignore filter see); `from` rides in
+    /// `custom_state`, which every replay path keeps.
+    pub fn moved(from: impl Into<PathBuf>, to: impl Into<PathBuf>) -> Self {
+        let from: PathBuf = from.into();
+        Self::new(TaskKind::Move, to)
+            .with_custom_state(serde_json::json!({ MOVE_FROM_KEY: from.to_string_lossy() }))
+    }
+
+    /// A `Move` task's source, `None` for any other kind.
+    pub fn move_from(&self) -> Option<PathBuf> {
+        move_from_state(self.custom_state.as_ref())
     }
 
     pub fn with_task_id(mut self, id: impl Into<String>) -> Self {

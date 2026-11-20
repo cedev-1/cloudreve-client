@@ -120,11 +120,14 @@ impl InventoryDb {
                         )
                         .execute(tx_conn)? as i64;
 
-                        let prefix = format!("{}/%", path);
-                        total += diesel::delete(
-                            file_metadata_dsl::file_metadata
-                                .filter(file_metadata_dsl::local_path.like(&prefix)),
+                        // Not `LIKE`: `_` and `%` in a folder name are
+                        // wildcards there, and took look-alike siblings.
+                        let prefix = format!("{}/", path);
+                        total += diesel::sql_query(
+                            "DELETE FROM file_metadata WHERE substr(local_path, 1, length(?)) = ?",
                         )
+                        .bind::<Text, _>(&prefix)
+                        .bind::<Text, _>(&prefix)
                         .execute(tx_conn)? as i64;
                     }
                     Ok(total)
@@ -135,6 +138,38 @@ impl InventoryDb {
         // Delete upload sessions - now safe to acquire a new connection
         self.batch_delete_upload_session_by_path(&paths)?;
         Ok(affected > 0)
+    }
+
+    /// The row at `path` and every row below it (`path` being a folder):
+    /// what a delete or a move of `path` carries along. Prefix-matched
+    /// exactly: `LIKE` only narrows the scan — its `_` and `%` are
+    /// wildcards, and it ignores ASCII case — then the prefix is checked.
+    pub fn query_under(&self, path: &str) -> Result<Vec<FileMetadata>> {
+        let mut conn = self.connection()?;
+        let prefix = format!("{}{}", path, std::path::MAIN_SEPARATOR);
+        let rows = file_metadata_dsl::file_metadata
+            .filter(
+                file_metadata_dsl::local_path
+                    .eq(path)
+                    .or(file_metadata_dsl::local_path.like(format!("{prefix}%"))),
+            )
+            .load::<FileMetadataRow>(&mut conn)
+            .context("Failed to query inventory metadata under a path")?;
+        rows.into_iter()
+            .filter(|r| r.local_path == path || r.local_path.starts_with(&prefix))
+            .map(FileMetadata::try_from)
+            .collect()
+    }
+
+    /// How many files (not folders) a drive tracks.
+    pub fn count_files_for_drive(&self, drive_id: &str) -> Result<i64> {
+        let mut conn = self.connection()?;
+        file_metadata_dsl::file_metadata
+            .filter(file_metadata_dsl::drive_id.eq(drive_id))
+            .filter(file_metadata_dsl::is_folder.eq(false))
+            .count()
+            .get_result(&mut conn)
+            .context("Failed to count the files of a drive")
     }
 
     /// Query all file metadata entries for a specific drive
@@ -178,7 +213,6 @@ impl InventoryDb {
         let mut conn = self.connection()?;
         let old_prefix = format!("{}{}", old_path, std::path::MAIN_SEPARATOR);
         let new_prefix = format!("{}{}", new_path, std::path::MAIN_SEPARATOR);
-        let descendant_like = format!("{}%", old_prefix);
 
         let total = (&mut *conn)
             .transaction::<usize, diesel::result::Error, _>(|tx_conn| {
@@ -192,11 +226,12 @@ impl InventoryDb {
                 let descendants = diesel::sql_query(
                     "UPDATE file_metadata \
                      SET local_path = ? || substr(local_path, length(?) + 1) \
-                     WHERE local_path LIKE ?",
+                     WHERE substr(local_path, 1, length(?)) = ?",
                 )
                 .bind::<Text, _>(&new_prefix)
                 .bind::<Text, _>(&old_prefix)
-                .bind::<Text, _>(&descendant_like)
+                .bind::<Text, _>(&old_prefix)
+                .bind::<Text, _>(&old_prefix)
                 .execute(tx_conn)?;
 
                 Ok(exact + descendants)
@@ -456,6 +491,55 @@ mod tests {
         db.mark_as_conflicted("/sync/a.txt", Some(ConflictState::Override)).unwrap();
 
         assert!(db.query_conflicts(None).unwrap().is_empty());
+    }
+
+    /// What a folder delete or move carries along: the folder's own row
+    /// and everything below it — not a sibling whose name merely starts
+    /// the same, nor one that only matches as a SQL `LIKE` pattern (`_`
+    /// is a wildcard there).
+    #[test]
+    fn rows_under_a_folder_are_exactly_its_own() {
+        let (_dir, db) = test_db();
+        let drive = Uuid::new_v4();
+        for p in ["/s/my_docs/a.txt", "/s/my_docs/sub/b.txt", "/s/myXdocs/c.txt", "/s/my_docs2/d.txt", "/s/other.txt"] {
+            db.upsert(&entry(drive, p, "e")).unwrap();
+        }
+
+        let mut under: Vec<String> = db.query_under("/s/my_docs").unwrap().into_iter().map(|m| m.local_path).collect();
+        under.sort();
+
+        assert_eq!(under, vec!["/s/my_docs/a.txt", "/s/my_docs/sub/b.txt"]);
+        assert_eq!(db.query_under("/s/other.txt").unwrap().len(), 1, "a file is under itself");
+    }
+
+    /// Renaming a folder moves its rows only; a `LIKE` prefix also took a
+    /// sibling's rows along when the name held a `_`.
+    #[test]
+    fn renaming_a_folder_leaves_look_alike_siblings_alone() {
+        let (_dir, db) = test_db();
+        let drive = Uuid::new_v4();
+        db.upsert(&entry(drive, "/s/my_docs/a.txt", "e-a")).unwrap();
+        db.upsert(&entry(drive, "/s/myXdocs/c.txt", "e-c")).unwrap();
+
+        db.rename_path("/s/my_docs", "/s/papers").unwrap();
+
+        assert_eq!(db.query_by_path("/s/papers/a.txt").unwrap().map(|m| m.etag), Some("e-a".into()));
+        assert!(db.query_by_path("/s/myXdocs/c.txt").unwrap().is_some(), "a sibling was renamed too");
+    }
+
+    /// The size of a drive, as the mass-deletion guard sees it: its files,
+    /// not its folders, and not another drive's.
+    #[test]
+    fn a_drive_counts_its_own_files_only() {
+        let (_dir, db) = test_db();
+        let drive = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        db.upsert(&entry(drive, "/s/a.txt", "e")).unwrap();
+        db.upsert(&entry(drive, "/s/b.txt", "e")).unwrap();
+        db.upsert(&MetadataEntry::new(drive, "/s/dir", true)).unwrap();
+        db.upsert(&entry(other, "/t/c.txt", "e")).unwrap();
+
+        assert_eq!(db.count_files_for_drive(&drive.to_string()).unwrap(), 2);
     }
 
     /// Marking a path that is not tracked must not invent an entry.

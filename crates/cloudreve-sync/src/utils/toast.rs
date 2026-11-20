@@ -27,6 +27,11 @@ static SMALL_VFS_CACHE_THROTTLE: LazyLock<Throttle> =
 static UPLOAD_PROBLEM_THROTTLE: LazyLock<Throttle> =
     LazyLock::new(|| Throttle::new(Duration::from_secs(3600)));
 
+/// A held mass deletion is found again by every sync (every five minutes)
+/// until the user acts: once an hour per drive.
+static MASS_DELETE_THROTTLE: LazyLock<Throttle> =
+    LazyLock::new(|| Throttle::new(Duration::from_secs(3600)));
+
 /// Rate limiter keyed by an arbitrary string (a drive id, in practice).
 /// Keeps a bulk operation from producing one notification per file.
 struct Throttle {
@@ -140,6 +145,20 @@ pub fn send_low_disk_space_toast(drive_id: &str, drive_name: &str, required: u64
         "Low disk space notification"
     );
     push_notification(t!("lowDiskSpaceTitle"), message);
+}
+
+/// Tell the user that `count` files deleted at once in `drive_name` were
+/// not deleted on the server (see `drive::propagate`). At most once an hour
+/// per drive.
+pub fn send_mass_delete_held_toast(drive_id: &str, drive_name: &str, count: usize) {
+    if !MASS_DELETE_THROTTLE.allow(drive_id) {
+        return;
+    }
+    tracing::warn!(target: "toast", drive_id, count, "Mass deletion held notification");
+    push_notification(
+        t!("massDeleteHeldTitle"),
+        t!("massDeleteHeldMessage", drive = drive_name, count = count.to_string()),
+    );
 }
 
 /// Tell the user why a drive's uploads keep failing (`message`, already
