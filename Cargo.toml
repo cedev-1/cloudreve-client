@@ -15,6 +15,7 @@ exclude = ["vendor"]
 # a crate left behind quietly reports the wrong client version.
 [workspace.package]
 version = "0.3.0"
+license = "MIT"
 
 # vendor/nfs3_server is a fork of nfs3_server 0.11.0 (BSD-3-Clause) — see
 # vendor/nfs3_server/CLOUDREVE-FORK.md for what changed and why. Kept out of
