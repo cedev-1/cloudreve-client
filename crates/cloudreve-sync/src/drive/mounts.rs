@@ -883,11 +883,17 @@ impl Mount {
                         expanded.push(path);
                     }
                 }
+                // A folder of the batch can hold a file a queued move is
+                // about to take there (see `propagate::moving_paths`).
+                let moving = crate::drive::propagate::moving_paths(self)?;
                 for path in expanded {
                     if !path.exists() || path.is_dir() {
                         continue;
                     }
                     if self.is_ignored(&path).await {
+                        continue;
+                    }
+                    if crate::drive::propagate::is_busy(&moving, &path) {
                         continue;
                     }
                     // Check file size against drive limit before uploading

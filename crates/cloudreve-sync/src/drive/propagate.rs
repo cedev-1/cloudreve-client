@@ -108,13 +108,26 @@ pub(crate) fn is_mass_deletion(deleting: usize, tracked: usize) -> bool {
 /// Paths a queued delete or move is about to act on (its own path, and a
 /// move's source): `full_sync` must not plan anything else for them.
 pub(crate) fn busy_paths(mount: &Mount) -> Result<Vec<PathBuf>> {
+    queued_paths(mount, true)
+}
+
+/// Paths a queued move is about to act on. An upload of anything there
+/// would race the move: uploading the destination first makes the server
+/// refuse the move (the upload session locks it), and the move becomes a
+/// delete plus a second upload. The move uploads what changed in it once
+/// it is done.
+pub(crate) fn moving_paths(mount: &Mount) -> Result<Vec<PathBuf>> {
+    queued_paths(mount, false)
+}
+
+fn queued_paths(mount: &Mount, with_deletes: bool) -> Result<Vec<PathBuf>> {
     let tasks = mount
         .inventory
         .list_tasks(Some(&mount.id), Some(&[TaskStatus::Pending, TaskStatus::Running]))?;
     let mut paths = Vec::new();
     for task in tasks {
         match TaskKind::from_str(&task.task_type) {
-            Some(TaskKind::Delete) => paths.push(PathBuf::from(&task.local_path)),
+            Some(TaskKind::Delete) if with_deletes => paths.push(PathBuf::from(&task.local_path)),
             Some(TaskKind::Move) => {
                 paths.push(PathBuf::from(&task.local_path));
                 paths.extend(move_from_state(task.custom_state.as_ref()));

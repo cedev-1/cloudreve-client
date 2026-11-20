@@ -587,6 +587,26 @@ async fn moving_a_file_into_another_folder_moves_it_on_the_server() {
     assert!(env.db_entry("Archive/a.txt").is_some());
 }
 
+/// Into a folder made just for it: the new folder's own event must not
+/// upload the file the move is taking there — on a real server, that
+/// upload locks the destination and the move is refused (found by the
+/// real-server suite).
+#[tokio::test(flavor = "multi_thread")]
+async fn moving_a_file_into_a_new_folder_is_one_move_and_no_upload() {
+    let (_t, env) = live_env_aged(&[("a.txt", b"aaa", "e-a"), ("k.txt", b"k", "e-k")], OLD_ENOUGH).await;
+    env.set_remote_files(vec![]).await;
+    mock_info(&env.server, "a.txt", remote_file("a.txt", 3, "e-a")).await;
+    accept_writes(&env.server).await;
+
+    std::fs::create_dir_all(env.local_path("New")).unwrap();
+    std::fs::rename(env.local_path("a.txt"), env.local_path("New/a.txt")).unwrap();
+
+    wait_for("the move request", || async { !requests(&env.server, "POST", "/api/v4/file/move").await.is_empty() }).await;
+    settle().await;
+    assert!(requests(&env.server, "PUT", "/api/v4/file/upload").await.is_empty(), "the moved file was also uploaded");
+    assert_eq!(requests(&env.server, "POST", "/api/v4/file/move").await[0]["dst"], json!(uri("New")));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn renaming_a_folder_renames_it_once_on_the_server() {
     let (_t, env) = live_env_aged(&[("Docs/a.txt", b"a", "e-a"), ("Docs/sub/b.txt", b"b", "e-b"), ("x.txt", b"x", "e-x")], OLD_ENOUGH).await;
