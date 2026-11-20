@@ -302,15 +302,24 @@ in
   # (a session or service started without them): the system's PATH must still
   # come first, then /run/wrappers/bin, and the unprivileged copy last.
   fusermount-lookup =
-    pkgs.runCommand "cloudreve-client-fusermount-lookup" { }
+    pkgs.runCommand "cloudreve-client-fusermount-lookup" { nativeBuildInputs = [ pkgs.makeBinaryWrapper ]; }
       ''
         set -euo pipefail
         fail() { echo "FAIL: $*" >&2; exit 1; }
         wrapper=${package}/bin/cloudreve-desktop
-        grep -q '^exec ' "$wrapper" || fail "$wrapper is not a shell wrapper"
-        # Same wrapper, printing the PATH it would hand to the app.
-        sed -E 's|^exec .*|printf "%s\\n" "$PATH"|' "$wrapper" > probe
-        path=$(PATH=/system/bin ${pkgs.bash}/bin/bash probe)
+        # wrapGAppsHook3 makes a binary wrapper, which embeds the makeCWrapper
+        # command it was generated from. The same command around a probe
+        # instead of the app gives the PATH the app would get.
+        cmd=$(tr '\0' '\n' < "$wrapper" | sed -n '/^makeCWrapper /,/^$/p')
+        [ -n "$cmd" ] || fail "$wrapper is not a binary wrapper"
+        eval "set -- ''${cmd#makeCWrapper }"
+        shift
+        printf '#!%s\nprintf "%%s\\n" "$PATH"\n' ${pkgs.runtimeShell} > print-path
+        chmod +x print-path
+        echo "$cmd"
+        # The hook's functions are not `set -u` clean.
+        set +u; makeBinaryWrapper "$PWD/print-path" probe "$@"; set -u
+        path=$(PATH=/system/bin ./probe)
         echo "PATH seen by the app: $path"
         pos() { printf '%s\n' "$path" | tr ':' '\n' | grep -n -x -m1 -- "$1" | cut -d: -f1; }
         sys=$(pos /system/bin); wrappers=$(pos /run/wrappers/bin)
