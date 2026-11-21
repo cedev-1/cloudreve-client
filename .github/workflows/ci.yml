@@ -306,7 +306,7 @@ jobs:
           if plutil -extract CFBundleIcons raw $APP/Contents/Info.plist; then echo "::error::the main app got CFBundleIcons"; exit 1; fi
           codesign --verify --deep --strict --verbose=2 $APP
           # Kept through the outer signing: PlugInKit refuses an unsandboxed extension.
-          codesign -d --entitlements - --xml $APPEX | plutil -p - | grep -F '"com.apple.security.app-sandbox" => true'
+          codesign -d --entitlements :- $APPEX | plutil -p - | grep -F '"com.apple.security.app-sandbox" => true'
           spctl --assess --type execute --verbose=4 $APP || true
 
       - name: The dmg carries the same, intact (as release.yml checks it)
@@ -317,7 +317,7 @@ jobs:
           trap 'hdiutil detach "$MNT"' EXIT
           APP="$MNT/Cloudreve.app"
           codesign --verify --deep --strict --verbose=2 "$APP"
-          codesign -d --entitlements - --xml "$APP/Contents/Helpers/CloudreveSidebar.app/Contents/PlugIns/CloudreveFinderSync.appex" \
+          codesign -d --entitlements :- "$APP/Contents/Helpers/CloudreveSidebar.app/Contents/PlugIns/CloudreveFinderSync.appex" \
             | plutil -p - | grep -F '"com.apple.security.app-sandbox" => true'
 
       - name: The app registers the extension and feeds it the drive folder

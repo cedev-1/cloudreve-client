@@ -190,7 +190,7 @@ jobs:
           trap 'hdiutil detach "$MNT"' EXIT
           APP="$MNT/Cloudreve.app"
           codesign --verify --deep --strict --verbose=2 "$APP"
-          codesign -d --entitlements - --xml "$APP/Contents/Helpers/CloudreveSidebar.app/Contents/PlugIns/CloudreveFinderSync.appex" \
+          codesign -d --entitlements :- "$APP/Contents/Helpers/CloudreveSidebar.app/Contents/PlugIns/CloudreveFinderSync.appex" \
             | plutil -p - | grep -F '"com.apple.security.app-sandbox" => true'
 
   # Only reached when every build succeeded, so the release becomes visible with
