@@ -10,7 +10,7 @@ import { CloseRounded } from "@mui/icons-material";
 import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useTranslation } from "react-i18next";
-import { PersonOutline } from "@mui/icons-material";
+import { PersonOutlined } from "@mui/icons-material";
 import CloudreveLogo from "../../common/CloudreveLogo";
 import DrivesSection from "./DrivesSection";
 import GeneralSection from "./GeneralSection";
@@ -29,7 +29,7 @@ export default function Settings() {
   const sections = [
     { id: "drives" as const, icon: <HardDrive />, label: t("settings.drives") },
     { id: "general" as const, icon: <SettingsIcon />, label: t("settings.general") },
-    { id: "profile" as const, icon: <PersonOutline />, label: t("settings.profile") },
+    { id: "profile" as const, icon: <PersonOutlined />, label: t("settings.profile") },
     { id: "about" as const, icon: <Info />, label: t("settings.about") },
   ];
 

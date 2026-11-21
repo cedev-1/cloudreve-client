@@ -22,13 +22,25 @@
       }
     ],
     "security": {
-      "csp": null,
+      "csp": {
+        "default-src": "'self'",
+        "script-src": "'self'",
+        "style-src": "'self' 'unsafe-inline'",
+        "img-src": "'self' asset: http://asset.localhost data: blob: https: http:",
+        "font-src": "'self' data:",
+        "connect-src": "'self' ipc: http://ipc.localhost",
+        "object-src": "'none'",
+        "frame-src": "'none'",
+        "base-uri": "'self'",
+        "form-action": "'none'"
+      },
+      "devCsp": null,
       "assetProtocol": {
         "enable": true,
         "scope": {
           "requireLiteralLeadingDot": false,
           "allow": [
-            "**/*"
+            "$HOME/.cloudreve/icos/**"
           ]
         }
       }
@@ -52,6 +64,18 @@
       "frameworks": [],
       "providerShortName": null,
       "signingIdentity": null
+    },
+    "linux": {
+      "deb": {
+        "recommends": [
+          "fuse3"
+        ]
+      },
+      "rpm": {
+        "recommends": [
+          "fuse3"
+        ]
+      }
     }
   },
   "plugins": {

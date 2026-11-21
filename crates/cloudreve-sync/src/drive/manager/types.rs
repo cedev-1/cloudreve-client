@@ -1,18 +1,53 @@
-use crate::drive::mounts::DriveConfig;
+use crate::drive::mounts::{DriveConfig, DriveMode};
 use crate::inventory::TaskRecord;
 use crate::tasks::TaskProgress;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DriveState {
     pub drives: Vec<DriveConfig>,
 }
 
+/// What the UI is told about a drive: a `DriveConfig` without its OAuth
+/// tokens (and the other fields no window shows). The webviews never need
+/// the tokens, and whatever reaches a web page is one injected script away
+/// from leaving the machine. `DriveConfig` itself keeps serializing them:
+/// drives.json must.
+#[derive(Debug, Clone, Serialize)]
+pub struct DriveSummary {
+    pub id: String,
+    pub name: String,
+    pub instance_url: String,
+    pub remote_path: String,
+    pub sync_path: std::path::PathBuf,
+    pub icon_path: Option<String>,
+    pub raw_icon_path: Option<String>,
+    pub user_id: String,
+    pub mode: DriveMode,
+}
+
+impl From<&DriveConfig> for DriveSummary {
+    fn from(c: &DriveConfig) -> Self {
+        Self {
+            id: c.id.clone(),
+            name: c.name.clone(),
+            instance_url: c.instance_url.clone(),
+            remote_path: c.remote_path.clone(),
+            sync_path: c.sync_path.clone(),
+            icon_path: c.icon_path.clone(),
+            raw_icon_path: c.raw_icon_path.clone(),
+            user_id: c.user_id.clone(),
+            mode: c.mode,
+        }
+    }
+}
+
 /// Summary of the current status including drives and recent tasks
 #[derive(Debug, Clone, Serialize)]
 pub struct StatusSummary {
     /// All configured drives (unfiltered)
-    pub drives: Vec<DriveConfig>,
+    pub drives: Vec<DriveSummary>,
     /// Active tasks (pending/running) with optional live progress info
     pub active_tasks: Vec<TaskWithProgress>,
     /// Recently finished tasks (completed/failed/cancelled)
@@ -23,6 +58,24 @@ pub struct StatusSummary {
     pub conflicts: Vec<ConflictInfo>,
     /// Drive IDs that are currently paused
     pub paused_drives: Vec<String>,
+    /// D7: pending on-demand upload count per drive id, keyed for every
+    /// `DriveMode::OnDemand` drive (a `FullMirror` drive is simply absent —
+    /// its pending count is tracked by `active_tasks` instead). Present
+    /// even while the drive is paused: the vfs event pump keeps running
+    /// across a pause/resume cycle (see `Mount::spawn_vfs_event_pump`'s
+    /// doc), so this is its last-known count, not necessarily "right now".
+    /// Mirrors `Mount::vfs_pending_uploads`; see that field's doc for the
+    /// counting rules.
+    #[serde(default)]
+    pub pending_uploads: HashMap<String, u64>,
+    /// On-demand drives whose folder is not mounted, by drive id: the
+    /// plain-language reason and what to do (`Mount::mount_problem`).
+    #[serde(default)]
+    pub mount_errors: HashMap<String, String>,
+    /// On-demand drives whose uploads keep failing, by drive id: why, in
+    /// plain language (`Mount::upload_problem`).
+    #[serde(default)]
+    pub upload_problems: HashMap<String, String>,
 }
 
 /// A file conflict awaiting user resolution
@@ -136,6 +189,16 @@ pub struct DriveInfo {
     pub status: DriveInfoStatus,
     /// Capacity summary (None if not available)
     pub capacity: Option<CapacitySummary>,
+    /// Full mirror vs. on-demand (D1)
+    pub mode: DriveMode,
+    /// On-demand only: why the drive folder is not mounted, in plain
+    /// language (what happened and what to do), when `status` is
+    /// `MountFailed`.
+    pub mount_error: Option<String>,
+    /// On-demand only: files with changes not on the server yet (being
+    /// edited, waiting, uploading, or parked after failed attempts) — what
+    /// removing the drive now would lose.
+    pub unsynced_files: u64,
 }
 
 /// Drive status for the settings UI
@@ -150,6 +213,9 @@ pub enum DriveInfoStatus {
     CredentialExpired,
     /// Network connection is offline
     Offline,
+    /// On-demand drive whose folder could not be mounted: see
+    /// `DriveInfo::mount_error` for the explanation shown to the user.
+    MountFailed,
 }
 
 /// Format bytes into a human-readable string (e.g., "1.5 GB")

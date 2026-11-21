@@ -3,6 +3,7 @@ use crate::drive::ignore::IgnoreMatcher;
 use crate::events::SummaryNotifier;
 use crate::inventory::{InventoryDb, NewTaskRecord, TaskRecord, TaskStatus, TaskUpdate};
 use crate::tasks::download::DownloadTask;
+use crate::tasks::remote_ops::RemoteOps;
 use crate::tasks::types::{TaskKind, TaskPayload, TaskProgress};
 use crate::tasks::upload::UploadTask;
 use anyhow::{Context, Result, anyhow};
@@ -33,7 +34,31 @@ impl Default for TaskQueueConfig {
 
 const MAX_NETWORK_RETRIES: u32 = 5;
 
-fn is_network_error(err: &anyhow::Error) -> bool {
+/// What a parked task keeps of its `custom_state` when it is replayed: all
+/// of it but the offline bookkeeping. Clearing the whole state used to be
+/// harmless (only that bookkeeping lived there); a `Move` task's source and
+/// a download's expected etag live there too, and a rename replayed without
+/// its source could only become an upload of a second copy.
+fn without_offline_flags(state: Option<&Value>) -> Option<Value> {
+    let mut state = state?.clone();
+    if let Some(map) = state.as_object_mut() {
+        map.remove("offline_waiting");
+        map.remove("network_retries");
+        if map.is_empty() {
+            return None;
+        }
+    }
+    Some(state)
+}
+
+/// Whether a replayed task touches an ignored path: its own, or the source
+/// of a move.
+fn task_is_ignored(record: &TaskRecord, ignore: &IgnoreMatcher) -> bool {
+    ignore.is_match(&record.local_path)
+        || crate::tasks::move_from_state(record.custom_state.as_ref()).is_some_and(|from| ignore.is_match(&from))
+}
+
+pub(crate) fn is_network_error(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         cause.downcast_ref::<reqwest::Error>().is_some()
             || cause.downcast_ref::<std::io::Error>().is_some_and(|e| {
@@ -70,9 +95,27 @@ pub struct TaskQueue {
     task_handles: DashMap<String, JoinHandle<()>>,
     /// Maps task_id to local_path for running tasks, used for path-based cancellation
     task_paths: DashMap<String, String>,
+    /// The drive's ignore rules, kept in step by `Mount::update_ignore_patterns`:
+    /// a move's follow-up uploads (`RemoteOps::move_to`) must skip junk files
+    /// like every other upload.
+    ignore: std::sync::RwLock<IgnoreMatcher>,
+    /// The drive's "delete and rename in the cloud too" switch, kept in step
+    /// by `Mount::set_propagate_deletes`. Read by every delete or move when
+    /// it runs, so one queued while it was on, then replayed after it was
+    /// turned off (reconnection, next launch), touches nothing.
+    propagate_deletes: AtomicBool,
 }
 
 impl TaskQueue {
+    /// `resume_on_start`: whether to replay Pending/Running tasks left in
+    /// the inventory from a previous run (`resume_incomplete_tasks`).
+    /// `false` for an on-demand drive (phase 4, D2) — the least-invasive
+    /// seam for that: this is the queue's only constructor and its only
+    /// caller (`Mount::new`), so a plain bool threaded straight through
+    /// avoids a second constructor or a wrapper type just to skip one
+    /// internal call. There is no local mirror for a stale on-demand task
+    /// to apply to, and the queue otherwise stays inert for that mode (no
+    /// fs watcher, no full sync ever enqueues into it either).
     pub async fn new(
         drive_id: impl Into<String>,
         cr_client: Arc<Client>,
@@ -84,6 +127,8 @@ impl TaskQueue {
         max_file_size_mb: u64,
         notifier: Arc<SummaryNotifier>,
         ignore: &IgnoreMatcher,
+        resume_on_start: bool,
+        propagate_deletes: bool,
     ) -> Arc<Self> {
         let drive_id = drive_id.into();
         let max_concurrent = config.max_concurrent.max(1);
@@ -110,18 +155,54 @@ impl TaskQueue {
             notifier,
             task_handles: DashMap::new(),
             task_paths: DashMap::new(),
+            ignore: std::sync::RwLock::new(ignore.clone()),
+            propagate_deletes: AtomicBool::new(propagate_deletes),
         });
 
         queue.spawn_dispatcher(command_rx).await;
-        if let Err(err) = queue.resume_incomplete_tasks(ignore).await {
+        if resume_on_start
+            && let Err(err) = queue.resume_incomplete_tasks(ignore).await
+        {
             warn!(
                 target: "tasks::queue",
                 drive = %queue.drive_id,
-                error = %err,
+                error = %format_args!("{err:#}"),
                 "Failed to resume pending tasks from inventory"
             );
         }
         queue
+    }
+
+    /// See the `ignore` field.
+    /// See the `propagate_deletes` field. Turning it off also drops the
+    /// deletes and moves still queued: they would only be skipped when
+    /// they run, and the next full sync handles those paths the old way.
+    pub fn set_propagate_deletes(&self, enabled: bool) {
+        self.propagate_deletes.store(enabled, Ordering::SeqCst);
+        if enabled {
+            return;
+        }
+        let active = match self.inventory.list_tasks(Some(&self.drive_id), Some(&[TaskStatus::Pending, TaskStatus::Running])) {
+            Ok(active) => active,
+            Err(err) => {
+                warn!(target: "tasks::queue", drive = %self.drive_id, error = %format_args!("{err:#}"), "Failed to list queued deletes and moves");
+                return;
+            }
+        };
+        for task in active {
+            if !matches!(TaskKind::from_str(&task.task_type), Some(TaskKind::Delete | TaskKind::Move)) {
+                continue;
+            }
+            let update = TaskUpdate { status: Some(TaskStatus::Cancelled), ..Default::default() };
+            if let Err(err) = self.inventory.update_task(&task.id, update) {
+                warn!(target: "tasks::queue", drive = %self.drive_id, task_id = %task.id, error = %format_args!("{err:#}"), "Failed to drop a queued delete or move");
+            }
+        }
+        self.notifier.notify();
+    }
+
+    pub fn set_ignore_matcher(&self, matcher: IgnoreMatcher) {
+        *self.ignore.write().expect("TaskQueue ignore lock poisoned") = matcher;
     }
 
     pub fn max_concurrent(&self) -> usize {
@@ -280,7 +361,7 @@ impl TaskQueue {
         self.cancel_requested.store(true, Ordering::SeqCst);
 
         if let Err(err) = self.command_tx.send(QueueCommand::Shutdown) {
-            warn!(target: "tasks::queue", error = %err, "Task queue dispatcher already closed");
+            warn!(target: "tasks::queue", error = %format_args!("{err:#}"), "Task queue dispatcher already closed");
         }
 
         if let Some(handle) = self.dispatcher_handle.lock().await.take() {
@@ -319,7 +400,7 @@ impl TaskQueue {
                 continue;
             }
 
-            if ignore.is_match(&record.local_path) {
+            if task_is_ignored(&record, ignore) {
                 info!(
                     target: "tasks::queue",
                     drive = %self.drive_id,
@@ -357,7 +438,7 @@ impl TaskQueue {
             if let Err(err) = self.inventory.update_task(
                 &record.id,
                 TaskUpdate {
-                    custom_state: Some(None),
+                    custom_state: Some(without_offline_flags(record.custom_state.as_ref())),
                     ..Default::default()
                 },
             ) {
@@ -374,7 +455,7 @@ impl TaskQueue {
             let payload = match Self::payload_from_record(&record) {
                 Ok(p) => p,
                 Err(err) => {
-                    warn!(target: "tasks::queue", task_id = %record.id, error = %err, "Failed to build payload");
+                    warn!(target: "tasks::queue", task_id = %record.id, error = %format_args!("{err:#}"), "Failed to build payload");
                     continue;
                 }
             };
@@ -528,7 +609,7 @@ impl TaskQueue {
 
         // Cancel pending tasks in the DB
         if let Err(e) = self.inventory.cancel_all_active_tasks(&self.drive_id) {
-            warn!(target: "tasks::queue", error = %e, "Failed to cancel active tasks in inventory");
+            warn!(target: "tasks::queue", error = %format_args!("{e:#}"), "Failed to cancel active tasks in inventory");
         }
 
         self.notifier.notify();
@@ -581,7 +662,7 @@ impl TaskQueue {
                 error!(
                     target: "tasks::queue",
                     drive = %self.drive_id,
-                    error = %err,
+                    error = %format_args!("{err:#}"),
                     "Failed to acquire semaphore permit"
                 );
                 if let Err(update_err) = self.inventory.update_task(
@@ -680,7 +761,7 @@ impl TaskQueue {
                     target: "tasks::queue",
                     drive = %self.drive_id,
                     task_id = %task.task_id,
-                    error = %err,
+                    error = %format_args!("{err:#}"),
                     "Failed to check task status, proceeding with execution"
                 );
             }
@@ -698,7 +779,7 @@ impl TaskQueue {
                 target: "tasks::queue",
                 drive = %self.drive_id,
                 task_id = %task.task_id,
-                error = %err,
+                error = %format_args!("{err:#}"),
                 "Failed to mark task as running"
             );
             return;
@@ -724,7 +805,7 @@ impl TaskQueue {
                         target: "tasks::queue",
                         drive = %self.drive_id,
                         task_id = %task.task_id,
-                        error = %err,
+                        error = %format_args!("{err:#}"),
                         "Failed to mark task as completed"
                     );
                 }
@@ -742,7 +823,7 @@ impl TaskQueue {
                         target: "tasks::queue",
                         drive = %self.drive_id,
                         task_id = %task.task_id,
-                        error = %err,
+                        error = %format_args!("{err:#}"),
                         "Failed to mark task as cancelled"
                     );
                 }
@@ -778,10 +859,16 @@ impl TaskQueue {
                             &task.task_id,
                             TaskUpdate {
                                 status: Some(TaskStatus::Pending),
-                                custom_state: Some(Some(serde_json::json!({
-                                    "network_retries": retry_count + 1,
-                                    "offline_waiting": true
-                                }))),
+                                // Merged, not replaced: a move's source
+                                // must survive being parked.
+                                custom_state: Some(Some({
+                                    let mut state = task.payload.custom_state.clone()
+                                        .filter(Value::is_object)
+                                        .unwrap_or_else(|| serde_json::json!({}));
+                                    state["network_retries"] = serde_json::json!(retry_count + 1);
+                                    state["offline_waiting"] = serde_json::json!(true);
+                                    state
+                                })),
                                 ..Default::default()
                             },
                         ) {
@@ -859,11 +946,32 @@ impl TaskQueue {
                     self.remote_base.clone(),
                     Arc::clone(&self.progress),
                     Arc::clone(&self.notifier),
-                    self.event_blocker.clone(),
                     self.max_file_size_mb,
                 );
 
                 task_executor.execute().await?;
+            }
+            TaskKind::Delete | TaskKind::Move => {
+                let ops = RemoteOps {
+                    inventory: self.inventory.clone(),
+                    cr_client: self.cr_client.clone(),
+                    drive_id: self.drive_id.as_str(),
+                    sync_path: self.sync_path.clone(),
+                    remote_base: self.remote_base.clone(),
+                    ignore: self.ignore.read().expect("TaskQueue ignore lock poisoned").clone(),
+                    max_file_size_mb: self.max_file_size_mb,
+                    propagate: self.propagate_deletes.load(Ordering::SeqCst),
+                };
+                let follow_ups = match task.payload.kind {
+                    TaskKind::Delete => ops.delete(&task.payload.local_path).await?,
+                    _ => {
+                        let from = task.payload.move_from().context("move task without a source")?;
+                        ops.move_to(&from, &task.payload.local_path).await?
+                    }
+                };
+                for follow_up in follow_ups {
+                    self.enqueue(follow_up).await?;
+                }
             }
         }
 
@@ -897,7 +1005,7 @@ impl TaskQueue {
         //             target: "tasks::queue",
         //             drive = %self.drive_id,
         //             task_id = %task.task_id,
-        //             error = %err,
+        //             error = %format_args!("{err:#}"),
         //             "Failed to persist placeholder progress"
         //         );
         //     }
@@ -950,7 +1058,7 @@ impl TaskQueue {
 
         let mut resumed = 0usize;
         for record in records {
-            if ignore.is_match(&record.local_path) {
+            if task_is_ignored(&record, ignore) {
                 info!(
                     target: "tasks::queue",
                     drive = %self.drive_id,
@@ -1003,7 +1111,7 @@ impl TaskQueue {
                         target: "tasks::queue",
                         drive = %self.drive_id,
                         task_id = %record.id,
-                        error = %err,
+                        error = %format_args!("{err:#}"),
                         "Failed to build payload for resumed task"
                     );
                     continue;

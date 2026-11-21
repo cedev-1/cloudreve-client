@@ -1,9 +1,13 @@
 pub mod commands;
 pub mod event_blocker;
+pub(crate) mod fs_watch;
 pub mod heartbeat;
 pub mod ignore;
 pub mod manager;
 pub mod mounts;
+pub mod propagate;
 pub mod remote_events;
 pub mod sync;
+pub mod upload_health;
 pub mod utils;
+pub mod vfs_mode;

@@ -99,7 +99,7 @@ in
           "info"
           "warn"
           "error"
-        ]) "debug" "Log verbosity.";
+        ]) "info" "Log verbosity.";
 
         log_max_files = managed types.ints.positive "5" "Number of rotated log files kept.";
       };

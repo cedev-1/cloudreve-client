@@ -1,5 +1,7 @@
 import {
+  Alert,
   Box,
+  Button,
   IconButton,
   List,
   Typography,
@@ -11,8 +13,8 @@ import {
   Refresh as RefreshIcon,
   CloudOff as CloudOffIcon,
   Sync as SyncIcon,
-  PauseCircleOutline as PauseIcon,
-  PlayCircleOutline as PlayIcon,
+  PauseCircleOutlined as PauseIcon,
+  PlayCircleOutlined as PlayIcon,
   PauseCircle as PausedStatusIcon,
 } from "@mui/icons-material";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -79,21 +81,18 @@ export default function Popup() {
     }
 
     isFetchingRef.current = true;
-    try {
-      const result = await invoke<StatusSummary>("get_status_summary", {
+    // Loop instead of calling itself again: a callback that refers to itself
+    // defeats the React Compiler's memoization.
+    do {
+      refetchQueuedRef.current = false;
+      await invoke<StatusSummary>("get_status_summary", {
         driveId: selectedDrive,
+      }).then(setSummary, (error) => {
+        console.error("Failed to fetch status summary:", error);
       });
-      setSummary(result);
-    } catch (error) {
-      console.error("Failed to fetch status summary:", error);
-    } finally {
-      isFetchingRef.current = false;
       setLoading(false);
-      if (refetchQueuedRef.current) {
-        refetchQueuedRef.current = false;
-        fetchSummary();
-      }
-    }
+    } while (refetchQueuedRef.current);
+    isFetchingRef.current = false;
   }, [selectedDrive]);
 
   // Initial fetch, then refetch whenever the backend signals a change
@@ -224,7 +223,59 @@ export default function Popup() {
           selectedDrive={selectedDrive}
           onDriveSelect={handleDriveSelect}
           onAddDrive={handleAddDrive}
+          pendingUploads={summary?.pending_uploads}
         />
+
+        {/* On-demand drives whose folder could not be mounted: the reason and
+            a Retry, right where the user looks first. */}
+        {Object.entries(summary?.mount_errors ?? {}).map(([driveId, message]) => {
+          const name = summary?.drives.find((d) => d.id === driveId)?.name ?? "";
+          return (
+            <Alert
+              key={driveId}
+              severity="error"
+              sx={{ mt: 1, py: 0, "& .MuiAlert-message": { fontSize: 12 } }}
+              action={
+                <Button
+                  color="inherit"
+                  size="small"
+                  onClick={async () => {
+                    try {
+                      await invoke("resume_sync", { driveId });
+                    } catch (error) {
+                      console.error("Retry mount failed:", error);
+                    }
+                    fetchSummary();
+                  }}
+                >
+                  {t("popup.retry")}
+                </Button>
+              }
+            >
+              <strong>{t("popup.mountFailed", { name })}</strong>
+              <br />
+              {message}
+            </Alert>
+          );
+        })}
+
+        {/* Uploads the server keeps refusing (full account, file too large,
+            no write access, or failing again and again): why, in words the
+            user can act on. The changes are safe on this computer. */}
+        {Object.entries(summary?.upload_problems ?? {}).map(([driveId, message]) => {
+          const name = summary?.drives.find((d) => d.id === driveId)?.name ?? "";
+          return (
+            <Alert
+              key={`upload-${driveId}`}
+              severity="warning"
+              sx={{ mt: 1, py: 0, "& .MuiAlert-message": { fontSize: 12 } }}
+            >
+              <strong>{t("popup.uploadProblem", { name })}</strong>
+              <br />
+              {message}
+            </Alert>
+          );
+        })}
       </Box>
 
       {/* Task List */}

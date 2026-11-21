@@ -68,7 +68,8 @@ impl HeartbeatManager {
                     read_guard.values().cloned().collect()
                 };
 
-                tracing::debug!(
+                // Every 15 s: trace, or it buries everything else at debug.
+                tracing::trace!(
                     target: "heartbeat",
                     drive_count = mounts_to_ping.len(),
                     "Heartbeat tick"
@@ -91,7 +92,7 @@ impl HeartbeatManager {
                             tracing::debug!(
                                 target: "heartbeat",
                                 drive_id = %mount.id,
-                                error = %e,
+                                error = %format_args!("{e:#}"),
                                 "Ping request failed"
                             );
                         }
@@ -118,7 +119,7 @@ impl HeartbeatManager {
                                 tracing::warn!(
                                     target: "heartbeat",
                                     drive_id = %mount.id,
-                                    error = %e,
+                                    error = %format_args!("{e:#}"),
                                     "Failed to re-enqueue offline tasks"
                                 );
                             }
@@ -144,7 +145,7 @@ impl HeartbeatManager {
                                     tracing::warn!(
                                         target: "heartbeat",
                                         drive_id = %mount.id,
-                                        error = %e,
+                                        error = %format_args!("{e:#}"),
                                         "Failed to force offline waiting"
                                     );
                                 }

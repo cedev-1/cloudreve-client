@@ -1,6 +1,7 @@
 [package]
 name = "cloudreve-desktop"
 version.workspace = true
+license.workspace = true
 description = "Cloudreve Desktop Sync Client (macOS/Linux)"
 authors = ["cloudreve"]
 edition = "2021"

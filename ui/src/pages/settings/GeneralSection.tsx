@@ -413,7 +413,7 @@ export default function GeneralSection() {
   const handleHeartbeatIntervalChange = async (value: string) => {
     const numValue = parseInt(value, 10);
     if (isNaN(numValue)) return;
-    const clamped = Math.max(5, Math.min(120, numValue));
+    const clamped = Math.max(10, Math.min(120, numValue));
     const previousValue = heartbeatInterval;
     setHeartbeatInterval(clamped);
     try {
@@ -529,7 +529,7 @@ export default function GeneralSection() {
             size="small"
             value={heartbeatInterval}
             onChange={(e) => handleHeartbeatIntervalChange(e.target.value)}
-            inputProps={{ min: 5, max: 120 }}
+            slotProps={{ htmlInput: { min: 10, max: 120 } }}
             sx={{ width: 80 }}
             disabled={loading}
           />

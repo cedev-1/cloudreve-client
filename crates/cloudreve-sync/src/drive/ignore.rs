@@ -26,6 +26,12 @@ const DEFAULT_FILE_PATTERNS: &[&str] = &[
     ".DS_Store",
     "._*",
     ".localized",
+    // A folder's custom icon, e.g. the Cloudreve logo `crate::sidebar` puts
+    // on the drive folder itself (the name ends in a carriage return).
+    "Icon\r",
+    // A volume's custom icon: `crate::sidebar` puts one at the root of an
+    // on-demand volume, and a folder copied off one into a mirror brings it.
+    ".VolumeIcon.icns",
     // Linux desktops
     ".directory",
     ".nfs*",
@@ -171,7 +177,7 @@ impl IgnoreMatcher {
                     tracing::warn!(
                         target: "drive::ignore",
                         pattern = %pattern,
-                        error = %e,
+                        error = %format_args!("{e:#}"),
                         "Skipping invalid ignore pattern"
                     );
                     continue;
@@ -371,6 +377,12 @@ mod tests {
         ".DS_Store",
         "._report.pdf",
         ".localized",
+        // A folder's custom icon (the drive folder's Cloudreve logo): the
+        // name ends in a carriage return.
+        "Icon\r",
+        // A volume's custom icon, at the root of a disk image or of a
+        // folder copied off an on-demand drive.
+        ".VolumeIcon.icns",
         ".Spotlight-V100/Store-V2/abc/0.indexHead",
         ".Trashes/501/deleted.txt",
         ".fseventsd/0000000000123456",
@@ -427,6 +439,8 @@ mod tests {
         for kept in [
             "report.pdf",
             "DS_Store.txt",
+            "Icon",
+            "Icon.png",
             "my.desktop.ini.backup",
             "Trashes.md",
             "directory.json",

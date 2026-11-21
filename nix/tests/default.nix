@@ -126,7 +126,7 @@ in
         cloudreve-client-merge-config managed.json
         cfg=$HOME/.cloudreve/config.json
         [ "$(jq -r .language "$cfg")" = fr ] || fail "language not written to a new config"
-        [ "$(jq -r 'keys | join(",")' "$cfg")" = "language,log_level" ] || fail "new config has extra keys: $(cat "$cfg")"
+        [ "$(jq -r 'keys | join(",")' "$cfg")" = "defaults_version,language,log_level" ] || fail "new config has extra keys: $(cat "$cfg")"
         [ "$(stat -c %a "$cfg")" = 600 ] || fail "config mode is $(stat -c %a "$cfg"), expected 600"
         [ "$(stat -c %a "$HOME/.cloudreve")" = 700 ] || fail "config dir mode is $(stat -c %a "$HOME/.cloudreve")"
 
@@ -154,6 +154,23 @@ in
         echo '{"language":null}' > managed-null.json
         cloudreve-client-merge-config managed-null.json "$cfg"
         [ "$(jq -c .language "$cfg")" = null ] || fail "language null not written"
+
+        # 6. a managed log level survives the app's one-time debug -> info
+        #    migration (migrate_defaults in crates/cloudreve-sync/src/config.rs
+        #    runs on files without defaults_version), without undoing a later one
+        echo '{"log_level":"debug"}' > managed-debug.json
+        echo '{"language":"de","log_level":"info"}' > "$cfg"
+        cloudreve-client-merge-config managed-debug.json "$cfg"
+        jq -e '.log_level == "debug" and .defaults_version == 1' "$cfg" \
+          || fail "managed debug left to the migration: $(cat "$cfg")"
+        echo '{"log_level":"info","defaults_version":3}' > "$cfg"
+        cloudreve-client-merge-config managed-debug.json "$cfg"
+        jq -e '.log_level == "debug" and .defaults_version == 3' "$cfg" \
+          || fail "defaults_version went backwards: $(cat "$cfg")"
+        echo '{"language":"de"}' > "$cfg"
+        cloudreve-client-merge-config managed-null.json "$cfg"
+        jq -e 'has("defaults_version") | not' "$cfg" \
+          || fail "defaults_version written without a managed log level: $(cat "$cfg")"
 
         touch $out
       '';
@@ -280,6 +297,39 @@ in
   );
 }
 // lib.optionalAttrs isLinux {
+  # fuser runs the first `fusermount3` in PATH and only a setuid one can
+  # mount. The real wrapper, run with a PATH that lacks the NixOS wrappers
+  # (a session or service started without them): the system's PATH must still
+  # come first, then /run/wrappers/bin, and the unprivileged copy last.
+  fusermount-lookup =
+    pkgs.runCommand "cloudreve-client-fusermount-lookup" { nativeBuildInputs = [ pkgs.makeBinaryWrapper ]; }
+      ''
+        set -euo pipefail
+        fail() { echo "FAIL: $*" >&2; exit 1; }
+        wrapper=${package}/bin/cloudreve-desktop
+        # wrapGAppsHook3 makes a binary wrapper, which embeds the makeCWrapper
+        # command it was generated from. The same command around a probe
+        # instead of the app gives the PATH the app would get.
+        cmd=$(tr '\0' '\n' < "$wrapper" | sed -n '/^makeCWrapper /,/^$/p')
+        [ -n "$cmd" ] || fail "$wrapper is not a binary wrapper"
+        eval "set -- ''${cmd#makeCWrapper }"
+        shift
+        printf '#!%s\nprintf "%%s\\n" "$PATH"\n' ${pkgs.runtimeShell} > print-path
+        chmod +x print-path
+        echo "$cmd"
+        # The hook's functions are not `set -u` clean.
+        set +u; makeBinaryWrapper "$PWD/print-path" probe "$@"; set -u
+        path=$(PATH=/system/bin ./probe)
+        echo "PATH seen by the app: $path"
+        pos() { printf '%s\n' "$path" | tr ':' '\n' | grep -n -x -m1 -- "$1" | cut -d: -f1; }
+        sys=$(pos /system/bin); wrappers=$(pos /run/wrappers/bin)
+        store=$(pos '${lib.getBin pkgs.fuse3}/bin')
+        [ -n "$sys" ] && [ -n "$wrappers" ] && [ -n "$store" ] || fail "missing PATH entries"
+        [ "$sys" -lt "$wrappers" ] || fail "/run/wrappers/bin shadows the system PATH"
+        [ "$wrappers" -lt "$store" ] || fail "the unprivileged fusermount3 shadows the setuid wrapper"
+        touch $out
+      '';
+
   nixos-module =
     let
       nixos =
@@ -362,6 +412,25 @@ in
   };
 }
 // lib.optionalAttrs isDarwin {
+  # PlugInKit ignores a Finder Sync extension that is not signed with its
+  # sandbox entitlements (release.yml checks the same on the dmg). Here the
+  # signature is made in postFixup: a later fixup step re-signing the binary
+  # would drop the entitlements without failing the build.
+  finder-sync-signature =
+    pkgs.runCommand "cloudreve-client-finder-sync-signature" { nativeBuildInputs = [ pkgs.rcodesign ]; }
+      ''
+        set -euo pipefail
+        fail() { echo "FAIL: $*" >&2; exit 1; }
+        appex=${package}/Applications/Cloudreve.app/Contents/Helpers/CloudreveSidebar.app/Contents/PlugIns/CloudreveFinderSync.appex
+        [ -d "$appex" ] || fail "no Finder Sync extension in the bundle"
+        info=$(rcodesign print-signature-info "$appex")
+        grep -q '<key>com.apple.security.app-sandbox</key>' <<<"$info" \
+          || fail "extension signed without its sandbox entitlement: $info"
+        grep -q 'CodeSignatureFlags(ADHOC | RUNTIME)' <<<"$info" \
+          || fail "extension not ad-hoc signed with the hardened runtime: $info"
+        touch $out
+      '';
+
   darwin-module =
     let
       darwin =

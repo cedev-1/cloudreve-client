@@ -1,0 +1,55 @@
+[package]
+name = "nfs3_server"
+version = "0.11.0"
+edition.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors = ["Vaiz", "Yucheng Low <ylow@xethub.com>"]
+description = "A Rust NFSv3 Server implementation"
+readme = "README.md"
+keywords = ["nfs", "nfs3"]
+license = "BSD-3-Clause"
+categories = ["network-programming", "filesystem"]
+publish = true
+include = ["src/**/*", "src/*", "Cargo.toml", "LICENSE", "README.md"]
+
+[lib]
+doctest = false
+
+[features]
+__test_reexports = [] # should not be used outside nfs3_tests crate
+fs_util = ["dep:filetime"]
+memfs = []
+
+[dependencies]
+nfs3_types.workspace = true
+
+tokio = { workspace = true, features = ["net", "io-util", "sync", "fs", "rt", "macros", "time"] }
+tracing.workspace = true
+anyhow.workspace = true
+filetime = { workspace = true, optional = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true, features = ["tracing-log"] }
+intaglio.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"], default-features = false }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true
+
+[[example]]
+name = "memfs"
+required-features = ["memfs"]
+
+[[example]]
+name = "ro_memfs"
+required-features = ["memfs"]
+
+[[example]]
+name = "mirrorfs"
+required-features = ["fs_util"]

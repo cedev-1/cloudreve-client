@@ -14,14 +14,13 @@ use anyhow::{Context, Result};
 use cloudreve_api::{Client, api::ExplorerApi, models::explorer::FileURLService};
 use dashmap::DashMap;
 use futures::StreamExt;
-use notify_debouncer_full::notify::event::{CreateKind, EventKind, ModifyKind};
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::{
-    drive::{event_blocker::EventBlocker, utils::local_path_to_cr_uri},
+    drive::utils::{is_inside, local_path_to_cr_uri},
     events::SummaryNotifier,
     inventory::{local_mtime_secs, ConflictState, FileMetadata, InventoryDb, MetadataEntry},
     tasks::queue::QueuedTask,
@@ -148,7 +147,6 @@ pub struct DownloadTask<'a> {
     cancel_token: CancellationToken,
     progress_map: Arc<DashMap<String, TaskProgress>>,
     notifier: Arc<SummaryNotifier>,
-    event_blocker: EventBlocker,
     max_file_size_mb: u64,
 }
 
@@ -162,7 +160,6 @@ impl<'a> DownloadTask<'a> {
         remote_base: String,
         progress_map: Arc<DashMap<String, TaskProgress>>,
         notifier: Arc<SummaryNotifier>,
-        event_blocker: EventBlocker,
         max_file_size_mb: u64,
     ) -> Self {
         Self {
@@ -177,7 +174,6 @@ impl<'a> DownloadTask<'a> {
             cancel_token: CancellationToken::new(),
             progress_map,
             notifier,
-            event_blocker,
             max_file_size_mb,
         }
     }
@@ -208,6 +204,14 @@ impl<'a> DownloadTask<'a> {
         let local_path = self.task.payload.local_path.clone();
         info!(target: "tasks::download", task_id = %self.task.task_id, path = %local_path.display(), "Starting download");
 
+        // Defense in depth, before anything below can write or remove a
+        // file: paths built from server data are already checked
+        // (`safe_relative_path`), but this is the one place every download
+        // passes through, whatever queued it.
+        if !is_inside(&self.sync_path, &local_path) {
+            anyhow::bail!("refusing to download outside the sync folder: {}", local_path.display());
+        }
+
         // Compute remote URI
         let uri = local_path_to_cr_uri(local_path.clone(), self.sync_path.clone(), self.remote_base.clone())
             .context("failed to compute remote URI")?
@@ -235,15 +239,44 @@ impl<'a> DownloadTask<'a> {
                     code = code,
                     "Remote file no longer exists, removing local file"
                 );
-                if local_path.exists() && !local_path.is_dir() {
+                // Only what the server had and this computer did not change
+                // since: a file added here and not uploaded yet, or edited
+                // here after the last sync, exists nowhere else — the
+                // server deleting its folder is no reason to destroy it.
+                let synced_copy = self
+                    .inventory_meta
+                    .as_ref()
+                    .is_some_and(|meta| !meta.is_locally_modified(&local_path));
+                if local_path.exists() && !local_path.is_dir() && !synced_copy {
+                    info!(target: "tasks::download", task_id = %self.task.task_id, path = %local_path.display(), "Keeping a local file the server never had in this state");
+                } else if local_path.exists() && !local_path.is_dir() {
                     if let Err(e) = std::fs::remove_file(&local_path) {
                         warn!(
                             target: "tasks::download",
                             task_id = %self.task.task_id,
                             path = %local_path.display(),
-                            error = %e,
+                            error = %format_args!("{e:#}"),
                             "Failed to remove local file mirroring remote deletion"
                         );
+                    } else {
+                        // Forgotten right away, well before the watcher's
+                        // event for this removal comes out of its debounce:
+                        // a removal with no inventory row is never sent to
+                        // the server as a local delete (`drive::propagate`).
+                        if let Err(e) = self.inventory.batch_delete_by_path(vec![local_path.to_str().unwrap_or_default()]) {
+                            warn!(target: "tasks::download", task_id = %self.task.task_id, error = %format_args!("{e:#}"), "Failed to forget a file deleted on the server");
+                        }
+                        // A folder deleted on the server goes file by file
+                        // (see `perform_sync`'s RemoteChanged arm): the last
+                        // file out takes the folders it emptied with it.
+                        // `remove_dir` only ever removes an empty folder.
+                        let mut dir = local_path.parent();
+                        while let Some(d) = dir {
+                            if d == self.sync_path || !is_inside(&self.sync_path, d) || std::fs::remove_dir(d).is_err() {
+                                break;
+                            }
+                            dir = d.parent();
+                        }
                     }
                 }
                 return Ok(());
@@ -300,7 +333,7 @@ impl<'a> DownloadTask<'a> {
                             warn!(target: "tasks::download", error = ?e, "Failed to mark conflict");
                         }
                     }
-                    send_conflict_toast(self.drive_id, &local_path, meta.id);
+                    send_conflict_toast(self.drive_id, &local_path, None);
                     return Ok(());
                 }
             }
@@ -341,7 +374,7 @@ impl<'a> DownloadTask<'a> {
             self.cr_client.rewrite_url_origin(&raw)
         };
 
-        debug!(target: "tasks::download", task_id = %self.task.task_id, url = %download_url, size = file_size, "Got download URL");
+        debug!(target: "tasks::download", task_id = %self.task.task_id, url = %cloudreve_api::redact::redact_url(&download_url), size = file_size, "Got download URL");
 
         // Create parent directory
         if let Some(parent) = local_path.parent() {
@@ -374,12 +407,12 @@ impl<'a> DownloadTask<'a> {
         match result {
             Ok(()) => {
                 reporter.on_progress(&tracker.create_update());
-                // Block FS events the rename will generate so we don't re-upload the file.
-                // macOS FSEvents can emit an unpredictable number of Create/Modify events
-                // per rename, so we use a time-based block (5 s) instead of a fixed count.
-                let block_duration = Duration::from_secs(5);
-                self.event_blocker.register_for_duration(&EventKind::Create(CreateKind::Any), local_path.clone(), block_duration);
-                self.event_blocker.register_for_duration(&EventKind::Modify(ModifyKind::Any), local_path.clone(), block_duration);
+                // No event blocking here: the watcher's events for this write
+                // reach `perform_sync`, whose inventory check (recorded just
+                // below, long before the watcher's 2 s debounce) recognises
+                // the file as just downloaded. The time-based block this
+                // used also dropped a user's save made within its 5 s, which
+                // then waited for the periodic full sync.
                 // Atomic move temp → final path
                 std::fs::rename(&temp_path, &local_path).context("failed to move downloaded file")?;
                 info!(target: "tasks::download", task_id = %self.task.task_id, path = %local_path.display(), "Download complete");
@@ -397,7 +430,7 @@ impl<'a> DownloadTask<'a> {
                             .with_size(file_info.size)
                             .with_local_mtime(local_mtime_secs(&local_path));
                         if let Err(e) = self.inventory.upsert(&entry) {
-                            warn!(target: "tasks::download", task_id = %self.task.task_id, error = %e, "Failed to update inventory after download");
+                            warn!(target: "tasks::download", task_id = %self.task.task_id, error = %format_args!("{e:#}"), "Failed to update inventory after download");
                         }
                     }
                 }
@@ -418,7 +451,7 @@ impl<'a> DownloadTask<'a> {
         reporter: &InMemoryDownloadProgressReporter,
     ) -> Result<()> {
         let client = reqwest::Client::new();
-        let response = client.get(url).send().await.context("download request failed")?;
+        let response = client.get(url).send().await.map_err(|e| e.without_url()).context("download request failed")?;
 
         if !response.status().is_success() {
             anyhow::bail!("Download failed with status: {}", response.status());
@@ -433,7 +466,7 @@ impl<'a> DownloadTask<'a> {
             if self.cancel_token.is_cancelled() {
                 anyhow::bail!("Download cancelled");
             }
-            let chunk = chunk_result.context("failed to read download chunk")?;
+            let chunk = chunk_result.map_err(|e| e.without_url()).context("failed to read download chunk")?;
             file.write_all(&chunk).await.context("failed to write chunk")?;
             tracker.add_bytes(chunk.len() as u64);
             if last_report.elapsed() >= REPORT_INTERVAL {

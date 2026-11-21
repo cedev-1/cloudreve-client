@@ -101,7 +101,7 @@ export default function ProfileSection() {
       />
 
       <Box sx={{ textAlign: "center" }}>
-        <Typography variant="h6" fontWeight={600}>
+        <Typography variant="h6" sx={{ fontWeight: 600 }}>
           {user.nickname}
         </Typography>
         {user.email && (

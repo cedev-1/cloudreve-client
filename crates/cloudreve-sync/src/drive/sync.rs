@@ -1,4 +1,5 @@
-use crate::drive::mounts::Mount;
+use crate::drive::mounts::{DriveMode, Mount};
+use crate::drive::propagate;
 use crate::drive::utils::{is_partial_download, remote_path_to_local_relative_path};
 use crate::inventory::{MetadataEntry, FileMetadata};
 use crate::tasks::TaskPayload;
@@ -35,6 +36,10 @@ pub enum SyncMode {
 pub struct GroupedFsEvents {
     pub changed: Vec<PathBuf>,
     pub deleted: Vec<PathBuf>,
+    /// `(from, to)`: renames and moves inside the watched folder that the
+    /// watcher could pair up (`Modify(Name(Both))`). One it could not pair
+    /// arrives as a change or a removal of each path on its own.
+    pub renamed: Vec<(PathBuf, PathBuf)>,
 }
 
 impl GroupedFsEvents {
@@ -48,10 +53,32 @@ impl GroupedFsEvents {
 /// Reduce a list of debounced FS events into changed/deleted path sets
 pub fn group_fs_events(events: Vec<DebouncedEvent>) -> GroupedFsEvents {
     use notify_debouncer_full::notify::event::EventKind;
+    use notify_debouncer_full::notify::event::{ModifyKind, RenameMode};
     let mut changed = HashSet::new();
     let mut deleted = HashSet::new();
+    let mut renamed: Vec<(PathBuf, PathBuf)> = Vec::new();
 
     for event in events {
+        if let (EventKind::Modify(ModifyKind::Name(RenameMode::Both)), [from, to]) = (&event.kind, event.paths.as_slice()) {
+            if is_partial_download(from) || is_partial_download(to) {
+                // Our own download landing (`.cloudreve-part-…` → name):
+                // a change of `to`, never a rename to send to the server.
+                if !is_partial_download(to) {
+                    deleted.remove(to);
+                    changed.insert(to.clone());
+                }
+                continue;
+            }
+            // A rename chain in one batch (a → b, then b → c) is one move.
+            if let Some(prev) = renamed.iter_mut().find(|(_, t)| t == from) {
+                prev.1 = to.clone();
+            } else {
+                renamed.push((from.clone(), to.clone()));
+            }
+            deleted.remove(to);
+            changed.remove(from);
+            continue;
+        }
         for path in &event.paths {
             // Our own partial downloads live in the sync folder; reacting to
             // them would upload a half-written file back to the server.
@@ -59,7 +86,7 @@ pub fn group_fs_events(events: Vec<DebouncedEvent>) -> GroupedFsEvents {
                 continue;
             }
             match event.kind {
-                EventKind::Remove(_) => {
+                EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
                     changed.remove(path);
                     deleted.insert(path.clone());
                 }
@@ -75,24 +102,19 @@ pub fn group_fs_events(events: Vec<DebouncedEvent>) -> GroupedFsEvents {
     GroupedFsEvents {
         changed: changed.into_iter().collect(),
         deleted: deleted.into_iter().collect(),
+        renamed,
     }
 }
 
-/// Perform a full bidirectional sync between local and remote using 3-way comparison.
-///
-/// State sources:
-/// - **DB** : last known synced state (populated after each upload/download)
-/// - **Local** : current local filesystem state
-/// - **Remote** : current remote server state
-///
-/// Decision table (DB | Local | Remote):
-/// - `(true, false, true)` : deleted locally → delete from server
-/// - `(true, true, false)` : deleted from server → delete locally
-/// - `(true, false, false)` : deleted from both → clean DB entry
-/// - `(false, true, false)` : new local file → upload
-/// - `(false, false, true)` : new remote file → download
-/// - `(false, true, true)` : exists on both sides, not yet tracked → mark as synced in DB
-/// - `(true, true, true)` : already in sync, SSE handles live changes
+/// A download of `remote` to `local`, pinned to the version listed.
+fn download_payload(local: PathBuf, remote: &FileResponse) -> TaskPayload {
+    let mut payload = TaskPayload::download(local).with_totals(0, remote.size);
+    if let Some(etag) = &remote.primary_entity {
+        payload = payload.with_custom_state(serde_json::json!({ "remote_etag": etag }));
+    }
+    payload
+}
+
 /// Total size of the remote files that have no local copy yet — the bytes a
 /// sync would have to write to disk. Saturates rather than wrapping so an
 /// absurd remote size can never look small.
@@ -121,14 +143,51 @@ async fn warn_if_sync_will_not_fit(mount: &Mount, local_root: &PathBuf, needed: 
             tracing::warn!(
                 target: "drive::sync",
                 id = %mount.id,
-                error = %e,
+                error = %format_args!("{e:#}"),
                 "Failed to query available disk space"
             );
         }
     }
 }
 
+/// Perform a full bidirectional sync between local and remote using 3-way comparison.
+///
+/// State sources:
+/// - **DB** : last known synced state (populated after each upload/download)
+/// - **Local** : current local filesystem state
+/// - **Remote** : current remote server state
+///
+/// Decision table (DB | Local | Remote):
+/// - `(true, false, true)` : deleted locally → delete on the server (into its
+///   trash) if the server copy is still the synced one, else download the
+///   server's newer version back; a folder gone with all its known content
+///   goes as one item; nothing is deleted when it is a mass deletion (see
+///   `drive::propagate`). A local rename made offline shows up as this plus
+///   `(false, true, false)` for the new name: offline renames are not paired.
+/// - `(true, true, false)` : deleted from server → keep the local copy, forget tracking
+/// - `(true, false, false)` : deleted from both → clean DB entry
+/// - `(false, true, false)` : new local file → upload
+/// - `(false, false, true)` : new remote file → download
+/// - `(false, true, true)` : exists on both sides, not yet tracked → mark as synced in DB
+/// - `(true, true, true)` : already in sync, SSE handles live changes
+///
+/// Paths a queued delete or move is about to act on are left alone.
 pub async fn full_sync(mount: &Mount, local_root: &PathBuf, remote_path: &str) -> Result<()> {
+    // Unreachable guard (D2): an on-demand drive never triggers a full sync
+    // — no fs watcher event enqueues `SyncMode::Full`, and `DriveManager`
+    // skips both the initial and periodic `FullSync` command for it. This
+    // is the single choke point every full-sync path (`perform_sync`'s
+    // `SyncMode::Full` branch and `perform_full_sync`) funnels through, so
+    // one guard here covers both call sites documented in the plan.
+    if mount.get_config().await.mode == DriveMode::OnDemand {
+        tracing::warn!(
+            target: "drive::sync",
+            id = %mount.id,
+            "full_sync called for an on-demand drive — this should be unreachable; on-demand \
+             drives never trigger a full sync"
+        );
+        return Ok(());
+    }
     if mount.is_paused() {
         tracing::info!(target: "drive::sync", id = %mount.id, "Sync skipped: drive is paused");
         return Ok(());
@@ -138,14 +197,19 @@ pub async fn full_sync(mount: &Mount, local_root: &PathBuf, remote_path: &str) -
     let remote_base = CrUri::new(remote_path)?;
 
     // 1. Remote state: relative_path → FileResponse
-    let remote_files = list_remote_recursive(mount, &remote_base).await?;
+    let remote_files = list_remote_recursive(&mount.cr_client, &remote_base).await?;
     let remote_map: HashMap<PathBuf, &FileResponse> = remote_files
         .iter()
         .filter(|f| f.file_type != file_type::FOLDER)
         .filter_map(|f| {
             let uri = CrUri::new(&f.path).ok()?;
-            let rel = remote_path_to_local_relative_path(&uri, &remote_base).ok()?;
-            Some((rel, f))
+            match remote_path_to_local_relative_path(&uri, &remote_base) {
+                Ok(rel) => Some((rel, f)),
+                Err(e) => {
+                    tracing::warn!(target: "drive::sync", id = %mount.id, error = %format_args!("{e:#}"), "Skipping a listed entry with an unsafe path");
+                    None
+                }
+            }
         })
         .collect();
 
@@ -193,6 +257,21 @@ pub async fn full_sync(mount: &Mount, local_root: &PathBuf, remote_path: &str) -
         .cloned()
         .collect();
 
+    // Remote folders, for deleting a folder gone locally as one item.
+    let remote_folders: HashSet<PathBuf> = remote_files
+        .iter()
+        .filter(|f| f.file_type == file_type::FOLDER)
+        .filter_map(|f| remote_path_to_local_relative_path(&CrUri::new(&f.path).ok()?, &remote_base).ok())
+        .collect();
+    // Paths a queued delete or move is about to act on: planning anything
+    // else for them now would turn a rename into a delete plus an upload.
+    let busy = propagate::busy_paths(mount)?;
+    // The drive's "delete and rename in the cloud too" switch, read once
+    // for the whole merge.
+    let propagate_deletes = mount.propagates_deletes().await;
+    // Files deleted locally whose server copy is still the synced one.
+    let mut delete_candidates: Vec<PathBuf> = Vec::new();
+
     let drive_uuid = Uuid::parse_str(&mount.id).ok();
 
     // One snapshot for the whole merge: a Settings save landing mid-loop must
@@ -229,14 +308,43 @@ pub async fn full_sync(mount: &Mount, local_root: &PathBuf, remote_path: &str) -
         if ignore.is_match(&local_path) {
             continue;
         }
+        if propagate::is_busy(&busy, &local_path) {
+            continue;
+        }
 
         match (in_db, in_local, in_remote) {
-            // Deleted locally (still on server) → forget it, don't re-download, don't touch server
+            // Deleted locally (still on server) → delete it there too, unless
+            // the server changed it since: its change wins, it comes back.
             (true, false, true) => {
-                mount
-                    .inventory
-                    .batch_delete_by_path(vec![&path_str])
-                    .context("Failed to forget locally-deleted file in inventory")?;
+                if !propagate_deletes {
+                    // Switched off: forget it, don't re-download, don't
+                    // touch the server.
+                    mount
+                        .inventory
+                        .batch_delete_by_path(vec![&path_str])
+                        .context("Failed to forget locally-deleted file in inventory")?;
+                    continue;
+                }
+                if let (Some(db_entry), Some(rf)) = (db_map.get(rel), remote_map.get(rel)) {
+                    let remote_etag = rf.primary_entity.clone().unwrap_or_default();
+                    let unchanged = db_entry.conflict_state.is_none()
+                        && !is_uploading(rf)
+                        && !db_entry.etag.is_empty()
+                        && remote_etag == db_entry.etag;
+                    if unchanged {
+                        delete_candidates.push(rel.clone());
+                        continue;
+                    }
+                    if is_uploading(rf) || !mount.is_file_size_allowed(rf.size as u64).await {
+                        continue;
+                    }
+                    tracing::info!(
+                        target: "drive::sync",
+                        path = %rel.display(),
+                        "Deleted locally but changed on the server since the last sync, downloading it back"
+                    );
+                    mount.task_queue.enqueue(download_payload(local_path, rf)).await?;
+                }
             }
             // Deleted from server (still local) → keep local copy, forget tracking
             (true, true, false) => {
@@ -353,7 +461,7 @@ pub async fn full_sync(mount: &Mount, local_root: &PathBuf, remote_path: &str) -
                         crate::utils::toast::send_conflict_toast(
                             &mount.id,
                             &local_path,
-                            db_entry.id,
+                            None,
                         );
                         mount.task_queue.notifier().notify();
                         continue;
@@ -420,6 +528,23 @@ pub async fn full_sync(mount: &Mount, local_root: &PathBuf, remote_path: &str) -
         }
     }
 
+    if !delete_candidates.is_empty() {
+        if propagate::is_mass_deletion(delete_candidates.len(), db_set.len()) {
+            mount.hold_mass_deletion(delete_candidates.len()).await;
+        } else {
+            let units = propagate::deletion_units(
+                &delete_candidates,
+                remote_map.keys(),
+                &remote_folders,
+                |rel| local_root.join(rel).exists(),
+                |rel| !ignore.is_match(local_root.join(rel)),
+            );
+            for unit in units {
+                mount.task_queue.enqueue(TaskPayload::delete(local_root.join(unit))).await?;
+            }
+        }
+    }
+
     tracing::info!(target: "drive::sync", id = %mount.id, "Full sync complete");
     Ok(())
 }
@@ -436,7 +561,7 @@ const INITIAL_PAGE_SIZE: i32 = 100;
 /// both and reports whether more remains. Stopping early would not just miss
 /// files: an already-synced file that fell past the boundary would look deleted
 /// from the server, lose its inventory row, and get re-uploaded on the next pass.
-async fn list_remote_recursive(mount: &Mount, base: &CrUri) -> Result<Vec<FileResponse>> {
+pub(crate) async fn list_remote_recursive(client: &cloudreve_api::Client, base: &CrUri) -> Result<Vec<FileResponse>> {
     let mut all = Vec::new();
     let mut dirs = vec![base.clone()];
     // Learned from the first response, then reused for every later directory.
@@ -451,8 +576,7 @@ async fn list_remote_recursive(mount: &Mount, base: &CrUri) -> Result<Vec<FileRe
         let mut last_position: Option<(i32, Option<String>)> = None;
 
         loop {
-            let mut response = mount
-                .cr_client
+            let mut response = client
                 .list_files_all(previous.as_ref(), &uri, page_size)
                 .await
                 .context("Failed to list remote directory")?;
@@ -518,7 +642,7 @@ async fn load_db_entries(
 /// syscall, and on a large sync folder the walk takes long enough that doing it
 /// on a runtime thread stalls every other task on that thread — downloads,
 /// uploads and the UI's status polling included.
-async fn walk_local(root: PathBuf) -> Result<Vec<PathBuf>> {
+pub(crate) async fn walk_local(root: PathBuf) -> Result<Vec<PathBuf>> {
     tokio::task::spawn_blocking(move || {
         if !root.is_dir() {
             anyhow::bail!(
@@ -527,14 +651,26 @@ async fn walk_local(root: PathBuf) -> Result<Vec<PathBuf>> {
             );
         }
         let mut files = Vec::new();
-        walk_dir_recursive(&root, &mut files)?;
+        let device = device_of(&root);
+        walk_dir_recursive(&root, device, &mut files)?;
         Ok(files)
     })
     .await
     .context("Local walk panicked")?
 }
 
-fn walk_dir_recursive(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+/// The device (`st_dev`) `path` lives on, `None` when it cannot be read.
+fn device_of(path: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| m.dev())
+}
+
+/// `device`: the sync folder's. A directory on another device is a volume
+/// mounted inside the folder (an external disk, a network share, another
+/// drive's on-demand mount): not part of this drive. Walking into it would
+/// upload all of it, and unmounting it would then look like the user
+/// deleting every file.
+fn walk_dir_recursive(dir: &Path, device: Option<u64>, files: &mut Vec<PathBuf>) -> Result<()> {
     // Only the root is a hard requirement; a subdirectory removed mid-walk is
     // ordinary churn, not a reason to abort the whole sync.
     if !dir.is_dir() {
@@ -544,7 +680,11 @@ fn walk_dir_recursive(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
         let entry = entry?;
         let path = entry.path();
         if path.is_dir() {
-            walk_dir_recursive(&path, files)?;
+            if device.is_some() && device_of(&path) != device {
+                tracing::debug!(target: "drive::sync", path = %path.display(), "Not scanning a volume mounted inside the sync folder");
+                continue;
+            }
+            walk_dir_recursive(&path, device, files)?;
         } else if !is_partial_download(&path) {
             // A download in flight is not a local file the user created.
             files.push(path);
@@ -652,6 +792,57 @@ mod tests {
 
         assert!(grouped.changed.is_empty());
         assert_eq!(grouped.deleted, vec![PathBuf::from("/sync/tmp.bin")]);
+    }
+
+    fn rename(from: &str, to: &str) -> DebouncedEvent {
+        use notify_debouncer_full::notify::event::RenameMode;
+        DebouncedEvent::new(
+            Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+                .add_path(PathBuf::from(from))
+                .add_path(PathBuf::from(to)),
+            Instant::now(),
+        )
+    }
+
+    /// A rename the watcher paired up must reach the server as a rename,
+    /// not as an upload of the new name: neither path is a "change".
+    #[test]
+    fn a_paired_rename_is_a_rename_not_a_change() {
+        let grouped = group_fs_events(vec![rename("/sync/draft.txt", "/sync/final.txt")]);
+
+        assert_eq!(grouped.renamed, vec![(PathBuf::from("/sync/draft.txt"), PathBuf::from("/sync/final.txt"))]);
+        assert!(grouped.changed.is_empty(), "{:?}", grouped.changed);
+        assert!(grouped.deleted.is_empty());
+    }
+
+    /// Our own download lands with a rename from its partial file: that is
+    /// a new local file, never a rename to send to the server.
+    #[test]
+    fn a_download_landing_is_not_a_rename() {
+        let grouped = group_fs_events(vec![rename("/sync/.cloudreve-part-abc", "/sync/photo.jpg")]);
+
+        assert!(grouped.renamed.is_empty());
+        assert_eq!(grouped.changed, vec![PathBuf::from("/sync/photo.jpg")]);
+    }
+
+    /// Moved out of the watched folder (to the Trash, to the Desktop): the
+    /// watcher only sees it leave — a deletion.
+    #[test]
+    fn a_move_out_of_the_folder_is_a_deletion() {
+        use notify_debouncer_full::notify::event::RenameMode;
+        let grouped = group_fs_events(vec![ev(EventKind::Modify(ModifyKind::Name(RenameMode::From)), "/sync/old.txt")]);
+
+        assert_eq!(grouped.deleted, vec![PathBuf::from("/sync/old.txt")]);
+        assert!(grouped.changed.is_empty());
+    }
+
+    /// Renamed twice before the batch went out: one move, first name to
+    /// last.
+    #[test]
+    fn a_rename_chain_is_one_move() {
+        let grouped = group_fs_events(vec![rename("/sync/a.txt", "/sync/b.txt"), rename("/sync/b.txt", "/sync/c.txt")]);
+
+        assert_eq!(grouped.renamed, vec![(PathBuf::from("/sync/a.txt"), PathBuf::from("/sync/c.txt"))]);
     }
 
     /// Repeated modifications of the same file collapse into a single change.

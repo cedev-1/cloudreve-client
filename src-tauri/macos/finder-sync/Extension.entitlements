@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  PlugInKit refuses an unsandboxed Finder Sync extension. The one read
+  exception is the folder list the app writes (cloudreve_finder_sync::
+  FOLDERS_FILE) - not the rest of ~/.cloudreve, which holds the drive
+  credentials. An app group would need a provisioning profile, which an
+  ad-hoc signed app cannot have.
+-->
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.app-sandbox</key>
+	<true/>
+	<key>com.apple.security.temporary-exception.files.home-relative-path.read-only</key>
+	<array>
+		<string>/.cloudreve/finder-sync/</string>
+	</array>
+</dict>
+</plist>

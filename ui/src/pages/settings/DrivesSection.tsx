@@ -4,6 +4,7 @@ import {
   Button,
   Card,
   CardContent,
+  Chip,
   Dialog,
   DialogActions,
   DialogContent,
@@ -15,6 +16,8 @@ import {
   Tooltip,
   Link,
   Divider,
+  FormControlLabel,
+  Switch,
 } from "@mui/material";
 import {
   FolderOpen as FolderOpenIcon,
@@ -24,15 +27,18 @@ import {
   DeleteOutlineRounded,
   RefreshRounded,
   FilterListRounded,
+  SyncRounded,
+  CloudQueueRounded,
 } from "@mui/icons-material";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import type { DriveInfo } from "./types";
+import type { DriveInfo, DriveMode } from "./types";
 import {  SecondaryButton, SecondaryErrorButton } from "../../common/StyledComponent";
 import { ask } from '@tauri-apps/plugin-dialog';
+import { platform } from "@tauri-apps/plugin-os";
 
 interface DriveInfoResponse {
   id: string;
@@ -50,6 +56,9 @@ interface DriveInfoResponse {
     used: number;
     label: string;
   };
+  mode: DriveMode;
+  mount_error?: string | null;
+  unsynced_files?: number;
 }
 
 export default function DrivesSection() {
@@ -60,6 +69,15 @@ export default function DrivesSection() {
   const [editingDriveId, setEditingDriveId] = useState<string | null>(null);
   const [patternsText, setPatternsText] = useState("");
   const [maxFileSize, setMaxFileSize] = useState<number>(3072);
+  // Drive folder in the Finder / file manager sidebar, per drive: a switch
+  // on each drive card, for mirror and on-demand drives alike (the drive
+  // settings dialog only exists for mirror drives).
+  const [sidebarShown, setSidebarShown] = useState<Record<string, boolean>>({});
+  // Already localized by the backend (`sidebarUpdateFailed`).
+  const [sidebarErrors, setSidebarErrors] = useState<Record<string, string>>({});
+  // Mirror drives: whether a local delete or rename is sent to the server.
+  const [propagate, setPropagate] = useState<Record<string, boolean>>({});
+  const [propagateErrors, setPropagateErrors] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
   const [patternsError, setPatternsError] = useState<string | null>(null);
   const [defaultPatterns, setDefaultPatterns] = useState<string[]>([]);
@@ -88,8 +106,75 @@ export default function DrivesSection() {
     fetchDrives();
   }, [fetchDrives]);
 
-  const handleDelete = async (driveId: string, driveName: string) => {
-    const confirmed = await ask(t("settings.deleteDriveConfirm", { name: driveName }), {
+  useEffect(() => {
+    const unknown = drives.filter((d) => !(d.id in sidebarShown));
+    if (unknown.length === 0) return;
+    Promise.all(
+      unknown.map((d) =>
+        invoke<boolean>("get_drive_sidebar", { driveId: d.id })
+          .catch(() => true)
+          .then((shown) => [d.id, shown] as const)
+      )
+    ).then((entries) =>
+      setSidebarShown((prev) => ({ ...prev, ...Object.fromEntries(entries) }))
+    );
+  }, [drives, sidebarShown]);
+
+  useEffect(() => {
+    const unknown = drives.filter((d) => d.mode !== "on_demand" && !(d.id in propagate));
+    if (unknown.length === 0) return;
+    Promise.all(
+      unknown.map((d) =>
+        invoke<boolean>("get_drive_propagate_deletes", { driveId: d.id })
+          .catch(() => false)
+          .then((on) => [d.id, on] as const)
+      )
+    ).then((entries) =>
+      setPropagate((prev) => ({ ...prev, ...Object.fromEntries(entries) }))
+    );
+  }, [drives, propagate]);
+
+  const handleTogglePropagate = async (driveId: string, enabled: boolean) => {
+    setPropagate((prev) => ({ ...prev, [driveId]: enabled }));
+    setPropagateErrors((prev) => {
+      const rest = { ...prev };
+      delete rest[driveId];
+      return rest;
+    });
+    try {
+      await invoke("set_drive_propagate_deletes", { driveId, enabled });
+    } catch (error) {
+      setPropagate((prev) => ({ ...prev, [driveId]: !enabled }));
+      setPropagateErrors((prev) => ({ ...prev, [driveId]: String(error) }));
+    }
+  };
+
+  const handleToggleSidebar = async (driveId: string, enabled: boolean) => {
+    setSidebarShown((prev) => ({ ...prev, [driveId]: enabled }));
+    setSidebarErrors((prev) => {
+      const rest = { ...prev };
+      delete rest[driveId];
+      return rest;
+    });
+    try {
+      await invoke("set_drive_sidebar", { driveId, enabled });
+    } catch (error) {
+      setSidebarShown((prev) => ({ ...prev, [driveId]: !enabled }));
+      setSidebarErrors((prev) => ({ ...prev, [driveId]: String(error) }));
+    }
+  };
+
+  const handleDelete = async (drive: DriveInfo) => {
+    const unsynced = drive.unsynced_files ?? 0;
+    // On-demand: say what happens to the files (they stay in the cloud, the
+    // folder empties) and warn loudly about changes not uploaded yet.
+    const message =
+      drive.mode !== "on_demand"
+        ? t("settings.deleteDriveConfirm", { name: drive.name })
+        : unsynced > 0
+          ? t("settings.deleteOnDemandDriveUnsynced", { name: drive.name, count: unsynced })
+          : t("settings.deleteOnDemandDriveConfirm", { name: drive.name });
+    const confirmed = await ask(message, {
       title: t("settings.deleteDrive"),
       kind: "warning",
     });
@@ -97,10 +182,25 @@ export default function DrivesSection() {
     if (!confirmed) return;
 
     try {
-      await invoke("remove_drive", { driveId });
+      await invoke("remove_drive", { driveId: drive.id });
       await fetchDrives();
     } catch (error) {
       console.error("Failed to delete drive:", error);
+    }
+  };
+
+  // "Retry" for an on-demand drive that could not be mounted. The backend
+  // answers with the same plain-language explanation when it fails again.
+  const [retrying, setRetrying] = useState<string | null>(null);
+  const handleRetryMount = async (driveId: string) => {
+    setRetrying(driveId);
+    try {
+      await invoke("resume_sync", { driveId });
+    } catch (error) {
+      console.error("Retry mount failed:", error);
+    } finally {
+      setRetrying(null);
+      await fetchDrives();
     }
   };
 
@@ -203,6 +303,8 @@ export default function DrivesSection() {
         return "#ff9800"; // orange
       case "credential_expired":
         return "#f44336"; // red
+      case "mount_failed":
+        return "#f44336"; // red
       default:
         return "#9e9e9e"; // grey
     }
@@ -212,6 +314,11 @@ export default function DrivesSection() {
     const parts = path.replace(/\\/g, "/").split("/");
     return parts[parts.length - 1] || path;
   };
+
+  const getModeLabel = (mode: DriveMode) =>
+    mode === "on_demand"
+      ? t("settings.driveMode.onDemand")
+      : t("settings.driveMode.mirror");
 
   const getStatusLabel = (status: DriveInfo["status"]) => {
     switch (status) {
@@ -223,6 +330,8 @@ export default function DrivesSection() {
         return t("settings.driveStatus.offline");
       case "credential_expired":
         return t("settings.driveStatus.credentialExpired");
+      case "mount_failed":
+        return t("settings.driveStatus.mountFailed");
       default:
         return status;
     }
@@ -290,7 +399,7 @@ export default function DrivesSection() {
                         mb: 1,
                       }}
                     >
-                      <Typography variant="body1" fontWeight={600} noWrap>
+                      <Typography variant="body1" noWrap sx={{ fontWeight: 600 }}>
                         {drive.name}
                       </Typography>
                       <Box
@@ -379,6 +488,57 @@ export default function DrivesSection() {
                       </Box>
                     </Tooltip>
 
+                    {/* Sync Mode */}
+                    <Box
+                      sx={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 0.75,
+                        mb: 1.5,
+                      }}
+                    >
+                      {drive.mode === "on_demand" ? (
+                        <CloudQueueRounded sx={{ fontSize: 16, color: "text.secondary" }} />
+                      ) : (
+                        <SyncRounded sx={{ fontSize: 16, color: "text.secondary" }} />
+                      )}
+                      <Typography variant="caption" color="text.secondary">
+                        {getModeLabel(drive.mode)}
+                        {" · "}
+                        {drive.mode === "on_demand"
+                          ? t("settings.driveMode.onDemandHint")
+                          : t("settings.driveMode.mirrorHint")}
+                      </Typography>
+                      {drive.mode === "on_demand" && (
+                        <Chip
+                          label={t("settings.driveMode.beta")}
+                          size="small"
+                          color="warning"
+                          variant="outlined"
+                          sx={{ height: 18, fontSize: 10 }}
+                        />
+                      )}
+                    </Box>
+
+                    {drive.mount_error && (
+                      <Alert
+                        severity="error"
+                        sx={{ mb: 1.5 }}
+                        action={
+                          <Button
+                            color="inherit"
+                            size="small"
+                            disabled={retrying === drive.id}
+                            onClick={() => handleRetryMount(drive.id)}
+                          >
+                            {t("settings.retryMount")}
+                          </Button>
+                        }
+                      >
+                        {drive.mount_error}
+                      </Alert>
+                    )}
+
                     {/* Storage Usage */}
                     {drive.capacity && (
                       <Box sx={{ mb: 1 }}>
@@ -411,6 +571,62 @@ export default function DrivesSection() {
                   </Box>
                 </Box>
 
+                {/* Show in the Finder / file manager sidebar */}
+                <Box sx={{ mt: 1.5 }}>
+                  <FormControlLabel
+                    control={
+                      <Switch
+                        size="small"
+                        checked={sidebarShown[drive.id] ?? true}
+                        onChange={(e) => handleToggleSidebar(drive.id, e.target.checked)}
+                      />
+                    }
+                    label={
+                      <Typography variant="body2">
+                        {platform() === "macos"
+                          ? t("settings.showInFinderSidebar", "Show in Finder sidebar")
+                          : t("settings.showInFileManagerSidebar", "Show in file manager sidebar")}
+                      </Typography>
+                    }
+                  />
+                  <Typography variant="caption" color="text.secondary" component="div">
+                    {t("settings.showInSidebarDescription")}
+                  </Typography>
+                  {sidebarErrors[drive.id] && (
+                    <Alert severity="error" sx={{ mt: 1 }}>
+                      {sidebarErrors[drive.id]}
+                    </Alert>
+                  )}
+                </Box>
+
+                {/* Mirror only: send local deletes and renames to the server */}
+                {drive.mode !== "on_demand" && (
+                  <Box sx={{ mt: 1.5 }}>
+                    <FormControlLabel
+                      control={
+                        <Switch
+                          size="small"
+                          checked={propagate[drive.id] ?? false}
+                          onChange={(e) => handleTogglePropagate(drive.id, e.target.checked)}
+                        />
+                      }
+                      label={
+                        <Typography variant="body2">
+                          {t("settings.propagateDeletes")}
+                        </Typography>
+                      }
+                    />
+                    <Typography variant="caption" color="text.secondary" component="div">
+                      {t("settings.propagateDeletesDescription")}
+                    </Typography>
+                    {propagateErrors[drive.id] && (
+                      <Alert severity="error" sx={{ mt: 1 }}>
+                        {propagateErrors[drive.id]}
+                      </Alert>
+                    )}
+                  </Box>
+                )}
+
                 {/* Action Footer */}
                 <Divider sx={{ my: 2, mx: -2 }} />
                 <Box
@@ -430,13 +646,15 @@ export default function DrivesSection() {
                     </SecondaryButton>
                   )}
 
-                  <SecondaryButton
-                    size="small"
-                    startIcon={<FilterListRounded />}
-                    onClick={() => handleEditIgnorePatterns(drive.id)}
-                  >
-                    {t("settings.ignorePatterns")}
-                  </SecondaryButton>
+                  {drive.mode !== "on_demand" && (
+                    <SecondaryButton
+                      size="small"
+                      startIcon={<FilterListRounded />}
+                      onClick={() => handleEditIgnorePatterns(drive.id)}
+                    >
+                      {t("settings.ignorePatterns")}
+                    </SecondaryButton>
+                  )}
 
                   <Box sx={{ flex: 1 }} />
 
@@ -444,7 +662,7 @@ export default function DrivesSection() {
                     size="small"
                     color="error"
                     startIcon={<DeleteOutlineRounded />}
-                    onClick={() => handleDelete(drive.id, drive.name)}
+                    onClick={() => handleDelete(drive)}
                   >
                     {t("settings.deleteDrive")}
                   </SecondaryErrorButton>
@@ -529,9 +747,7 @@ export default function DrivesSection() {
             helperText={t("settings.maxFileSizeDescription", "0 = unlimited. Files larger than this will not be synced.")}
             variant="outlined"
             slotProps={{
-              input: {
-                inputProps: { min: 0 },
-              },
+              htmlInput: { min: 0 },
             }}
           />
         </DialogContent>

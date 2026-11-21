@@ -68,7 +68,7 @@ cargo test -p cloudreve-sync --lib
 cargo test -p cloudreve-sync both_sides_modified
 ```
 
-Tests are **behavior-driven**: they describe real user situations (edits on both sides, deletions, same-size edits...) and assert the outcome the user cares about — no silent data loss, conflicts surfaced instead of overwritten, deletions never propagated to the server.
+Tests are **behavior-driven**: they describe real user situations (edits on both sides, deletions, same-size edits...) and assert the outcome the user cares about — no silent data loss, conflicts surfaced instead of overwritten, a local deletion never taking a version the server changed since (and never a mass deletion).
 
 The integration tests in `crates/cloudreve-sync/tests/` run against a real `Mount`, a real SQLite inventory, and real files on disk; only the Cloudreve API is faked with a [wiremock](https://docs.rs/wiremock) HTTP server (see the `TestEnv` harness in `tests/common/mod.rs`). No network access or real server is needed.
 
