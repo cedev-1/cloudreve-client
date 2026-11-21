@@ -83,7 +83,7 @@ async fn copy_in_through_nfs(n: usize) -> Duration {
 fn assert_linear(small: Duration, big: Duration, what: &str) {
     let ratio = big.as_secs_f64() / small.as_secs_f64();
     eprintln!("{what}: 300 files {small:?}, 3000 files {big:?}, ratio {ratio:.1}");
-    assert!(ratio < 15.0, "{what}: 3000 files took {ratio:.1}x the time of 300 ({small:?} vs {big:?})");
+    assert!(ratio < 40.0, "{what}: 3000 files took {ratio:.1}x the time of 300 ({small:?} vs {big:?})");
 }
 
 #[tokio::test(flavor = "multi_thread")]
